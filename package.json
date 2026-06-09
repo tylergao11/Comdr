@@ -1,0 +1,24 @@
+{
+  "name": "comdr",
+  "version": "0.1.0",
+  "private": true,
+  "description": "通用 Coding Agent — TypeScript 编排层 + Rust 执行层",
+  "scripts": {
+    "build": "tsc -b packages/core packages/llm packages/tools packages/engine packages/ui",
+    "build:tools": "cd crates/comdr-tools && cargo build --release && napi artifacts",
+    "clean": "tsc -b --clean",
+    "typecheck": "tsc -b",
+    "lint": "eslint packages/ --ext .ts",
+    "setup": "pnpm build && cd packages/ui && pnpm link --global"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
+    "prettier": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "@comdr/ui",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Agent 5 — 交互层（TUI + MCP Server + HTTP Server）",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "comdr": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "postbuild": "node -e \"var f=require('fs');var p='dist/cli.js';if(f.existsSync(p)){var c=f.readFileSync(p,'utf8');if(!c.startsWith('#!/')) f.writeFileSync(p,'#!/usr/bin/env node\\n'+c)}\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@comdr/core": "workspace:*",
+    "@comdr/engine": "workspace:*",
+    "@comdr/llm": "workspace:*",
+    "@types/react": "^19.2.17",
+    "ink": "^7.0.5",
+    "react": "^19",
+    "react-reconciler": "^0.32.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

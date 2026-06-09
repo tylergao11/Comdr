@@ -1,0 +1,27 @@
+{
+  "name": "@comdr/engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent 4 — 编排核心（主循环 + prompt + context + memory + planner + reflection + progress + skills）",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@comdr/core": "workspace:*",
+    "@comdr/llm": "workspace:*",
+    "@comdr/tools": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

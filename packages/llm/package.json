@@ -1,0 +1,25 @@
+{
+  "name": "@comdr/llm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent 2 — DeepSeek API 客户端",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@comdr/core": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.node
+*.tsbuildinfo
+temp/
+.comdr/
+.claude/plans/
+*.log
+.DS_Store
+Thumbs.db
+# Rust build artifacts
+crates/comdr-tools/target/
+# Rust lockfile (generated)
+Cargo.lock

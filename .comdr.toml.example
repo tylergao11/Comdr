@@ -1,0 +1,73 @@
+# Comdr 配置模板
+# 复制此文件为 .comdr.toml 并填入你的配置
+# 优先级: 环境变量 > ./.comdr.toml > ~/.comdr/config.toml > 默认值
+
+[llm]
+api_key = "sk-your-deepseek-api-key"
+# base_url = "https://api.deepseek.com"   # 默认值
+model = "deepseek-v4-pro"
+max_tokens = 4096
+
+[llm.thinking]
+# type = "enabled" | "disabled"
+type = "enabled"
+# effort = "high" | "max"  (仅 type="enabled" 时有效)
+effort = "high"
+
+[agent]
+max_turns = 50
+token_budget = 200000
+# permission_mode = "auto_approve_all" | "confirm_destructive" | "strict"
+permission_mode = "confirm_destructive"
+
+[project]
+skills_dir = "skills"
+
+# ===== MCP Server 配置 =====
+# Comdr 通过 MCP 协议连接外部 Agent。LLM 可自动发现并调用其工具。
+# 工具名格式: mcp__<server_name>__<tool_name>
+# hint 字段: 帮助 LLM 理解何时使用、延迟预期、外部依赖。
+#   示例: "生图耗时30-120s，需ComfyUI运行中"
+
+# ---- comdr-art: AI 美术 Agent ----
+# 依赖: ComfyUI + LLM (Ollama / OpenAI / 豆包)，见 Comdr-Art/README.md
+# 启动前确保:
+#   1. ComfyUI 已运行: python ~/ComfyUI/main.py
+#   2. SDXL checkpoint 在 ComfyUI/models/checkpoints/ 下
+#   3. LLM 服务可达 (Ollama 本地或 OpenAI API)
+#   4. cd Comdr-Art && npm install && npm run build
+# 世界模型: 部署 world-models/comdr-art.md 到 ~/.comdr/world-models/
+
+[[project.mcp_servers]]
+name = "comdr-art"
+command = "node"
+args = ["C:/Ai/Comdr-Art/dist/server.js"]
+hint = "生图30-120s，需ComfyUI+LLM，用于风格化游戏UI/角色/图标"
+# 可选: 覆盖默认环境变量
+# env = { COMDR_ART_LLM_BASE_URL = "http://localhost:11434", COMDR_ART_LLM_MODEL = "llama3.2-vision", COMDR_ART_COMFYUI_URL = "http://127.0.0.1:8188" }
+
+# ---- comdr-engine: Cocos 编辑器操作 Agent ----
+# 依赖: Cocos Creator + Bridge 扩展，见 Comdr-Engine/README.md
+# 启动前确保:
+#   1. Cocos Creator 已打开目标项目
+#   2. comdr-cocos-bridge 扩展已启用 (项目级 > 全局级)
+#   3. cd Comdr-Engine && npm install && npm run build
+#   4. npm run sync-bridge:project (部署 Bridge 到 Cocos 项目)
+# 世界模型: 部署 world-models/cocos.md 到 ~/.comdr/world-models/
+
+[[project.mcp_servers]]
+name = "comdr-engine"
+command = "node"
+args = ["C:/Ai/Comdr-Engine/packages/mcp-server/dist/server.js"]
+hint = "操作Cocos编辑器，创建/编辑prefab场景挂脚本设属性，需编辑器运行中"
+
+# ===== World Models（自动注入 prompt 的项目知识） =====
+# Comdr 启动时自动从以下位置发现并合并项目知识:
+#   1. ~/.comdr/comdr.md              — 用户全局编码偏好
+#   2. ~/.comdr/world-models/*.md     — 外部 Agent 世界模型
+#   3. {projectPath}/comdr.md          — 项目专属指令
+# 合并后内容注入到每轮 prompt 的 System Prompt 之后。
+# 部署世界模型:
+#   mkdir -p ~/.comdr/world-models/
+#   cp world-models/cocos.md ~/.comdr/world-models/
+#   cp world-models/comdr-art.md ~/.comdr/world-models/
