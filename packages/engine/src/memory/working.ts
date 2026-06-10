@@ -24,11 +24,10 @@ import type {
   ToolResult,
   ImportanceLevel,
 } from '@comdr/core/types';
-import { SYSTEM, ERROR_CATEGORY } from '@comdr/core';
+import { SYSTEM } from '@comdr/core';
 import { safeParseArgs } from '../utils.js';
 import {
   deriveStableKey,
-  summarizeToolOutput,
   extractIntent,
 } from '../smart-truncate.js';
 
@@ -110,66 +109,80 @@ export class WorkingMemory {
   // State Window
   // --------------------------------------------------------------------------
 
+  /** 单文件最多追踪的操作数，超出则压缩尾部 */
+  private static readonly MAX_OPS_PER_FILE = 5;
+
   /**
-   * State Window 更新规则:
-   *   - 同 key 覆盖 + 晋升为最近（delete + set）
-   *   - 超过 MAX 时，淘汰最旧的（Map 第一个 key）
-   *   - O(1) 所有操作
+   * ★ State Window — 按文件组织，同文件追加合并。
+   *
+   * key = 文件路径（同文件的不同工具操作合并到一条）
+   * text = 操作链: "read@1 → edit❌@3 → edit✅@5 → test✅@7"
+   *
+   * 同类型连续操作合并（连续 edit 只保留最新 turn）。
+   * 超过 MAX_OPS_PER_FILE 时尾部压缩为 "…(+N)"。
    */
   updateStateWindow(result: ToolResult, call: ToolCall, turn: number): void {
     const key = this.deriveKey(call);
-    const text = this.summarizeResult(result);
+    const verb = this.opVerb(call.function.name);
+    const ok = result.ok ? '' : '❌';
+    const op = `${ok}${verb}@${turn}`;
     const importance = scoreImportance(call, result);
 
-    const entry: StateEntry = { key, text, turn, importance };
-
-    // ★ 同 key → 删除旧条目（随后 set 到末尾 = LRU 晋升）
-    if (this.stateMap.has(key)) {
+    const existing = this.stateMap.get(key);
+    if (existing) {
+      existing.text = this.mergeOps(existing.text, op);
+      existing.turn = turn;
+      existing.importance = importance;
+      // LRU 晋升到末尾
       this.stateMap.delete(key);
-    } else if (this.stateMap.size >= SYSTEM.MAX_STATE_WINDOW_SIZE) {
-      // ★ 重要性加权淘汰：扫所有 entry，淘汰分数最低的
-      this.evictLowestScore();
+      this.stateMap.set(key, existing);
+    } else {
+      if (this.stateMap.size >= SYSTEM.MAX_STATE_WINDOW_SIZE) {
+        this.evictLowestScore();
+      }
+      this.stateMap.set(key, { key, text: op, turn, importance });
     }
-
-    this.stateMap.set(key, entry);
   }
 
-  /**
-   * ★ 重要性加权淘汰——找到 score 最低的 entry 并删除。
-   *
-   * scan O(n), n ≤ MAX_STATE_WINDOW_SIZE (5) → 可忽略
-   */
   private evictLowestScore(): void {
     const worst = this.findWorstScoredEntry(this.stateMap);
     if (worst !== null) this.stateMap.delete(worst);
   }
 
-  /**
-   * 从 tool call 中派生稳定的 key。
-   *
-   * ★ 委托给 smart-truncate 的 deriveStableKey():
-   *   - path-based: 完整路径（天然唯一）
-   *   - cmd-based: 命令名 + 关键参数 + fnv1a hash（防碰撞）
-   *   - fallback: fnv1a(toolName + sortedArgs) → 永远不碰撞
-   */
+  /** 追加合并操作链。同类型连续操作替换最后一个，超出上限压缩尾部。 */
+  private mergeOps(existing: string, newOp: string): string {
+    const parts = existing.split(' → ');
+    if (parts.length > 0) {
+      const last = parts[parts.length - 1]!;
+      const lastVerb = last.replace(/^❌/, '').replace(/@\d+/, '').trim();
+      const newVerb = newOp.replace(/^❌/, '').replace(/@\d+/, '').trim();
+      if (lastVerb === newVerb) {
+        parts[parts.length - 1] = newOp;
+        return parts.join(' → ');
+      }
+    }
+    parts.push(newOp);
+    if (parts.length > WorkingMemory.MAX_OPS_PER_FILE) {
+      const shown = parts.slice(-WorkingMemory.MAX_OPS_PER_FILE);
+      const skipped = parts.length - WorkingMemory.MAX_OPS_PER_FILE;
+      return shown.join(' → ') + `…(+${skipped})`;
+    }
+    return parts.join(' → ');
+  }
+
   private deriveKey(call: ToolCall): string {
     return deriveStableKey(call);
   }
 
-  /**
-   * 将 ToolResult 智能压缩为一句话摘要。
-   *
-   * ★ 委托给 smart-truncate 的 summarizeToolOutput():
-   *   提取错误/测试结果/有意义的摘要，而非盲取首行截断。
-   */
-  private summarizeResult(result: ToolResult): string {
-    if (!result.ok) {
-      return `❌ ${result.toolName}: ${result.errorCategory ?? ERROR_CATEGORY.EXECUTION_ERROR}`;
-    }
-    if (result.diffSummary) {
-      return result.diffSummary;
-    }
-    return summarizeToolOutput(result.content, result.toolName, SYSTEM.WORKING_TEXT_MAX_LENGTH);
+  private opVerb(toolName: string): string {
+    const map: Record<string, string> = {
+      file_read: 'read', file_write: 'write', file_edit: 'edit',
+      file_delete: 'del', file_glob: 'glob', file_grep: 'grep',
+      file_ls: 'ls', shell_bash: 'run', shell_test: 'test',
+      git_diff: 'diff', git_status: 'st', git_log: 'log',
+      git_add: 'add', git_commit: 'commit', git_revert: 'revert',
+    };
+    return map[toolName] ?? toolName.replace(/_/g, '');
   }
 
   // --------------------------------------------------------------------------

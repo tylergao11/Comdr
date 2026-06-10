@@ -381,9 +381,9 @@ export function deriveStableKey(
   const path = typeof args.path === 'string' ? args.path : undefined;
   const cmd = typeof args.command === 'string' ? args.command : undefined;
 
-  // 策略 1: path-based — 完整路径
+  // 策略 1: path-based — 纯文件路径（同文件的不同操作自动合并）
   if (path) {
-    return `${name}:${path}`;
+    return path;
   }
 
   // 策略 2: cmd-based — 命令名 + 第一个实质性参数

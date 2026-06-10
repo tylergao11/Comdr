@@ -753,8 +753,9 @@ suite4.test('WorkingMemory: State Window 同 key 覆盖', () => {
   );
 
   const sw = wm.getStateWindow();
-  assert(sw.length === 1, `同 key 应覆盖, got ${sw.length} entries`);
-  assertContains(sw[0]!.text, 'second write', 'should keep latest entry');
+  assert(sw.length === 1, `同 key 应合并, got ${sw.length} entries`);
+  // ★ 同类型操作合并: 第二个 write 替换第一个，保留最新 turn
+  assert(sw[0]!.text === 'write@2', `same verb should replace, got: ${sw[0]!.text}`);
 });
 
 suite4.test('WorkingMemory: State Window LRU 淘汰', () => {
@@ -772,7 +773,7 @@ suite4.test('WorkingMemory: State Window LRU 淘汰', () => {
   assert(sw.length <= 5, `should cap at 5, got ${sw.length}`);
   // 最旧的应该被淘汰 —— entry 1 不应该存在
   const keys = sw.map((e) => e.key);
-  assert(!keys.includes('file_write:src/f1.ts'), 'oldest entry should be evicted');
+  assert(!keys.includes('src/f1.ts'), 'oldest entry should be evicted');
 });
 
 suite4.test('WorkingMemory: Intent Window 关联 State key', () => {
@@ -788,7 +789,7 @@ suite4.test('WorkingMemory: Intent Window 关联 State key', () => {
 
   const iw = wm.getIntentWindow();
   assert(iw.length === 1, `expected 1 intent entry, got ${iw.length}`);
-  assert(iw[0]!.key === 'file_write:src/auth.ts', 'intent key should match state key');
+  assert(iw[0]!.key === 'src/auth.ts', 'intent key should match state key (file-based)');
 });
 
 // --- 4f. persistence ---
