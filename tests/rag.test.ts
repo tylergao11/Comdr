@@ -671,7 +671,7 @@ s7.test('L1.x worldModelContext 在静态区', () => {
 
   const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, mockRoute(), emptyAnchor());
   const worldModelMsg = messages.find(
-    (m) => m.role === 'system' && m.content?.includes('<world_model_context>'),
+    (m) => m.role === 'system' && m.content?.includes('<world>'),
   );
   assert(worldModelMsg !== undefined, 'should have world_model_context message');
   assertContains(worldModelMsg!.content!, 'relevant world model content', 'should contain injected text');
@@ -679,10 +679,10 @@ s7.test('L1.x worldModelContext 在静态区', () => {
 
 s7.test('L1.x 不设置时不注入', () => {
   const pc = new PromptConstructor();
-  // 不调 setWorldModelContext——应该没有 <world_model_context>
+  // 不调 setWorldModelContext——应该没有 <world>
   const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, mockRoute(), emptyAnchor());
   const worldModelMsg = messages.find(
-    (m) => m.content?.includes('<world_model_context>'),
+    (m) => m.content?.includes('<world>'),
   );
   assert(worldModelMsg === undefined, 'should NOT have world_model_context when not set');
 });
@@ -693,7 +693,7 @@ s7.test('L4.5 entityContext 在动态区', () => {
 
   const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, mockRoute(), emptyAnchor());
   const entityMsg = messages.find(
-    (m) => m.content?.includes('<relevant_entities>'),
+    (m) => m.content?.includes('<e>'),
   );
   assert(entityMsg !== undefined, 'should have relevant_entities');
 });
@@ -704,7 +704,7 @@ s7.test('L4.5 compactSummary 在动态区', () => {
 
   const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, mockRoute(), emptyAnchor());
   const summaryMsg = messages.find(
-    (m) => m.content?.includes('<compacted_summary>'),
+    (m) => m.content?.includes('<c>'),
   );
   assert(summaryMsg !== undefined, 'should have compacted_summary');
 });
@@ -723,9 +723,10 @@ s7.test('静态区在 build 间不变，动态区变', () => {
   pc.setCompactSummary('new summary');
   const msgs2 = pc.build(session, MINIMAL_TOOLS, route1, emptyAnchor());
 
-  // 静态区应该相同（前几条 system messages）
-  const static1 = msgs1.slice(0, 4).map(m => m.content);
-  const static2 = msgs2.slice(0, 4).map(m => m.content);
+  // ★ 静态区已合并为 2 条消息（L1 System Prompt + L2 merged context）
+  // entity/compact 现在注入到 L7 用户消息，不影响静态区
+  const static1 = msgs1.slice(0, 2).map(m => m.content);
+  const static2 = msgs2.slice(0, 2).map(m => m.content);
   for (let i = 0; i < static1.length; i++) {
     assertEq(static1[i], static2[i], `static zone message ${i} unchanged`);
   }
