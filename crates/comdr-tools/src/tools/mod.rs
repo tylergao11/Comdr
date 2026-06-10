@@ -97,6 +97,15 @@ impl ToolOutput {
         }
         Self { ok: false, content: Some(s), error_code: Some(error_code.to_string()) }
     }
+
+    /// ★ Blueprint error: structured diagnostic with type, location, cause, hint
+    pub fn blueprint_err(tool: &str, error_code: &str, location: &str, cause: &str, hint: &str) -> Self {
+        let s = format!(
+            "[ERR] {} error={} location={} cause={} hint={}",
+            tool, error_code, location, cause, hint
+        );
+        Self { ok: false, content: Some(s), error_code: Some(error_code.to_string()) }
+    }
 }
 
 // ============================================================================

@@ -547,18 +547,22 @@ export class ContextManager {
    */
   private buildCompactPrompt(session: SessionState): string {
     return [
-      'You are a context compressor. Summarize the following coding session.',
-      'Output as JSON: {"summary": "compact summary of all key actions, decisions, and current state"}',
+      'You are a context compressor. Summarize the coding session as structured JSON blueprint.',
+      'Output ONLY valid JSON (no other text):',
+      '{',
+      '  "goal": "original task",',
+      '  "state": "current progress — what is done vs remaining",',
+      '  "files": ["path: what was changed"],',
+      '  "decisions": ["what was decided and why"],',
+      '  "failures": ["any errors encountered"],',
+      '  "next": ["immediate next steps"]',
+      '}',
       '',
       `Task: ${session.currentInput}`,
-      `Turns: ${session.turn}`,
-      `Files modified: ${session.stateWindow.length}`,
-      session.stateWindow.length > 0
-        ? `Recent: ${session.stateWindow.map((e) => `${e.key}: ${e.text}`).join('; ')}`
-        : '',
-    ]
-      .filter(Boolean)
-      .join('\n');
+      `Completed turns: ${session.turn}`,
+      `State (done): ${session.stateWindow.map(e => `${e.key}: ${e.text}`).join('; ')}`,
+      `Intent (why):   ${session.intentWindow.map(e => `${e.key}: ${e.why}`).join('; ')}`,
+    ].join('\n');
   }
 
   /**
