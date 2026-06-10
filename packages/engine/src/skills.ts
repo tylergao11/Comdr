@@ -601,7 +601,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
   {
     name: 'file_read',
     description:
-      'Read a file. Modes: "full" (default, supports offset/limit), "summary" (structured symbol list — functions, classes, imports), "selector" (specific symbol definition with context). Use summary for large files to save context, selector to jump directly to a function/class.',
+      'Read a file. Modes: "full" (default, offset/limit), "blueprint" (AOCI-style structured overview: imports, public API, internals, dependencies — ~300 tokens for any file), "summary" (symbol list), "selector" (specific symbol with context). Use blueprint for unfamiliar files — it gives the full picture without blowing context.',
     parameters: {
       type: 'object',
       properties: {

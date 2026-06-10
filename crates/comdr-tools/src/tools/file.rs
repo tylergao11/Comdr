@@ -52,8 +52,8 @@ impl Tool for FileReadTool {
                 },
                 "mode": {
                     "type": "string",
-                    "description": "Read mode: 'full' (default), 'summary' (structured symbol list), 'selector' (symbol definition with context)",
-                    "enum": ["full", "summary", "selector"],
+                    "description": "Read mode: 'full' (default), 'summary' (symbol list), 'selector' (specific symbol), 'blueprint' (AOCI-style structured overview: imports, exports, dependencies)",
+                    "enum": ["full", "summary", "selector", "blueprint"],
                     "default": "full"
                 },
                 "symbol": {
@@ -90,6 +90,7 @@ impl Tool for FileReadTool {
         let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("full");
 
         match mode {
+            "blueprint" => exec_blueprint(&path),
             "summary" => exec_summary(&path),
             "selector" => {
                 let symbol = match args.get("symbol").and_then(|v| v.as_str()) {
@@ -243,6 +244,100 @@ fn exec_selector(path: &str, symbol_name: &str) -> ToolOutput {
         path, symbol_name, line_num, start + 1, end, total,
     );
     ToolOutput::ok("file_read", &[("path", path), ("mode", "selector"), ("symbol", symbol_name)], Some(&output))
+}
+
+// ============================================================================
+// Blueprint mode — AOCI-style structured overview
+// ============================================================================
+
+/// Blueprint mode — returns a structured symbolic-semantic overview of a file.
+/// Shows imports, exported API, internal symbols, and dependency relationships.
+/// ~300 tokens for an 800-line file (vs ~6000 for full read).
+fn exec_blueprint(path: &str) -> ToolOutput {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return ToolOutput::err("file_read", "EXECUTION_FAILED", &[("path", path)], Some(&e.to_string())),
+    };
+
+    let lang = match language_from_ext(path) {
+        Some(l) => l,
+        None => {
+            // Unsupported → fall back to summary
+            let total = content.lines().count();
+            let preview: String = content.lines().take(30).collect::<Vec<_>>().join("\n");
+            return ToolOutput::ok("file_read", &[("path", path), ("mode", "blueprint"), ("lines", &total.to_string())], Some(&preview));
+        }
+    };
+
+    let (symbols, references) = extract_symbols(path, &content, lang);
+    let total_lines = content.lines().count();
+    let total = symbols.len();
+
+    let mut out = format!("## Blueprint: {} ({} lines, {} symbols)\n", path, total_lines, total);
+
+    // ── Imports (references from this file) ──
+    let imports: Vec<&crate::tools::file::FileReference> = references.iter()
+        .filter(|r| r.to_file.as_ref().map_or(false, |f| !f.starts_with("(external)")))
+        .collect();
+    if !imports.is_empty() {
+        out.push_str("\n📦 Imports:\n");
+        for r in &imports {
+            let target = r.to_file.as_deref().unwrap_or("?");
+            out.push_str(&format!("  - {} from {}\n", r.from_name, target));
+        }
+    }
+
+    // ── Public API (exported) ──
+    let exported: Vec<_> = symbols.iter().filter(|s| s.exported).collect();
+    if !exported.is_empty() {
+        out.push_str("\n📤 Public API:\n");
+        for s in &exported {
+            let loc = s.location.as_ref().map(|l| format!(" @{}", l.split(':').last().unwrap_or("?"))).unwrap_or_default();
+            out.push_str(&format!("  - {}{}{}\n", s.name, kind_tag(&s.kind), loc));
+        }
+    }
+
+    // ── Internals (non-exported) ──
+    let internal: Vec<_> = symbols.iter().filter(|s| !s.exported && s.kind != "variable").collect();
+    if !internal.is_empty() {
+        out.push_str("\n🔒 Internals:\n");
+        for s in &internal {
+            let loc = s.location.as_ref().map(|l| format!(" @{}", l.split(':').last().unwrap_or("?"))).unwrap_or_default();
+            out.push_str(&format!("  - {}{}{}\n", s.name, kind_tag(&s.kind), loc));
+        }
+    }
+
+    // ── Variables ──
+    let vars: Vec<_> = symbols.iter().filter(|s| s.kind == "variable").collect();
+    if !vars.is_empty() {
+        out.push_str("\n📌 Constants/Variables:\n");
+        for v in &vars.iter().take(5) {
+            out.push_str(&format!("  - {}\n", v.name));
+        }
+    }
+
+    // ── Dependencies (this file imports from) ──
+    let project_refs: Vec<_> = references.iter()
+        .filter(|r| r.to_file.as_ref().map_or(false, |f| f.starts_with('.') || f.starts_with('/') || f.contains('/')))
+        .collect();
+    if !project_refs.is_empty() {
+        out.push_str("\n⬆️ Depends on:\n");
+        for r in &project_refs.iter().take(5) {
+            out.push_str(&format!("  - {}\n", r.to_file.as_deref().unwrap_or("?")));
+        }
+    }
+
+    ToolOutput::ok("file_read", &[("path", path), ("mode", "blueprint"), ("symbols", &total.to_string())], Some(&out))
+}
+
+fn kind_tag(kind: &str) -> &str {
+    match kind {
+        "function" => "()",
+        "class" => " (class)",
+        "interface" => " (interface)",
+        "module" => " (module)",
+        _ => "",
+    }
 }
 
 // ============================================================================
