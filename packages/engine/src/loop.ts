@@ -358,10 +358,13 @@ export class Engine implements IEngine {
         // ★ 行为指令注入静态区——同 route 不变 = 缓存友好
         this.prompt.setTaskBehavior(route);
 
-        // ★ L4.5 — Semantic Memory Graph RAG（每轮动态更新）
-        const entityContext = this.semanticMemory.retrieveRelevantEntities(
-          session.currentInput,
-        );
+        // ★ L4.5 — KARMA-style State-Enriched Graph RAG
+        //   用 State Window 的活跃文件路径作为精确检索种子
+        const statePaths = session.stateWindow.map(e => e.key); // 纯文件路径
+        const enrichedQuery = statePaths.length > 0
+          ? `${session.currentInput} ${statePaths.join(' ')}`
+          : session.currentInput;
+        const entityContext = this.semanticMemory.retrieveRelevantEntities(enrichedQuery);
         this.prompt.setEntityContext(entityContext);
 
         // ★ L4.5 — Context Anchor 压缩摘要（每轮更新）
