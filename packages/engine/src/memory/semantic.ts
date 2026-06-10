@@ -561,12 +561,64 @@ export class SemanticMemory {
   }
 
   // --------------------------------------------------------------------------
+  // 持久化
+  // --------------------------------------------------------------------------
+
+  /** 序列化四张图为 JSON（用于持久化到磁盘） */
+  serialize(): string {
+    const data = {
+      semantic: {
+        nodes: [...this.semanticGraph.nodes.values()],
+        edges: this.semanticGraph.edges,
+      },
+      entity: {
+        nodes: [...this.entityGraph.nodes.values()],
+        edges: this.entityGraph.edges,
+      },
+      temporal: this.temporalGraph,
+      causal: this.causalGraph,
+    };
+    return JSON.stringify(data, null, 2);
+  }
+
+  /**
+   * 从 JSON 反序列化——增量合并到现有数据。
+   * 新会话的 Bootstrap 数据会追加到已有节点/边中，不覆盖。
+   */
+  deserialize(data: string): void {
+    try {
+      const d = JSON.parse(data) as {
+        semantic: { nodes: SemanticNode[]; edges: SemanticEdge[] };
+        entity: { nodes: SemanticNode[]; edges: SemanticEdge[] };
+        temporal: TemporalEntry[];
+        causal: CausalLink[];
+      };
+      // Merge semantic graph
+      for (const n of d.semantic?.nodes ?? []) {
+        this.upsertNode(this.semanticGraph, n.id, n.type, n.name, n.path, n.location);
+      }
+      for (const e of d.semantic?.edges ?? []) {
+        this.addEdge(this.semanticGraph, e.from, e.to, e.type);
+      }
+      // Merge entity graph
+      for (const n of d.entity?.nodes ?? []) {
+        this.upsertNode(this.entityGraph, n.id, n.type, n.name, n.path, n.location);
+      }
+      for (const e of d.entity?.edges ?? []) {
+        this.addEdge(this.entityGraph, e.from, e.to, e.type);
+      }
+      // Append temporal + causal
+      this.temporalGraph.push(...(d.temporal ?? []));
+      this.causalGraph.push(...(d.causal ?? []));
+    } catch {
+      // 数据损坏 → 静默跳过
+    }
+  }
+
+  // --------------------------------------------------------------------------
   // 生命周期
   // --------------------------------------------------------------------------
 
-  /**
-   * 清空所有图（新会话）
-   */
   clear(): void {
     this.semanticGraph = { nodes: new Map(), edges: [] };
     this.temporalGraph = [];

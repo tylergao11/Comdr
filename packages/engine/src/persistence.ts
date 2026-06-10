@@ -240,6 +240,26 @@ export class SessionStore {
     }
   }
 
+  // --------------------------------------------------------------------------
+  // Semantic Memory 持久化
+  // --------------------------------------------------------------------------
+
+  /** Semantic Memory 文件路径 */
+  getSemanticPath(): string {
+    return join(this.sessionsDir, 'semantic.json');
+  }
+
+  loadSemantic(): string | null {
+    const p = this.getSemanticPath();
+    if (!existsSync(p)) return null;
+    try { return readFileSync(p, 'utf-8'); } catch { return null; }
+  }
+
+  saveSemantic(data: string): void {
+    this.ensureDir();
+    try { writeFileSync(this.getSemanticPath(), data, 'utf-8'); } catch { /* 静默降级 */ }
+  }
+
   /**
    * 会话 ID → 文件路径
    */

@@ -140,9 +140,11 @@ export class Engine implements IEngine {
     this.skillsLoader = new SkillsLoader();
     this.sessionStore = new SessionStore(config.project.projectPath);
 
-    // ★ 从磁盘恢复跨会话情景记忆（不存在/损坏 → 静默降级）
+    // ★ 从磁盘恢复跨会话记忆（不存在/损坏 → 静默降级）
     const epData = this.sessionStore.loadEpisodic();
     if (epData) this.episodicMemory.deserialize(epData.episodes, epData.reflections);
+    const semData = this.sessionStore.loadSemantic();
+    if (semData) this.semanticMemory.deserialize(semData);
 
     // MCP 客户端——有配置的 server 才初始化
     this.mcpClient =
@@ -885,6 +887,7 @@ export class Engine implements IEngine {
       }
 
       this.sessionStore.saveEpisodic(this.episodicMemory.serialize());
+      this.sessionStore.saveSemantic(this.semanticMemory.serialize());
     }
 
     // ★ 持久化保存
