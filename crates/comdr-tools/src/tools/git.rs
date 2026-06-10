@@ -42,7 +42,7 @@ impl Tool for GitDiffTool {
     }
 
     fn description(&self) -> &str {
-        "Show changes in the working directory (unified diff format)."
+        "Show changes in the working directory. Modes: 'blueprint' (default, summary: files/hunks/added/removed counts), 'full' (unified diff text)."
     }
 
     fn parameters(&self) -> Value {
@@ -57,6 +57,12 @@ impl Tool for GitDiffTool {
                     "type": "boolean",
                     "description": "Show staged changes instead of working directory changes",
                     "default": false
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "'blueprint' (default) = summary counts, 'full' = unified diff text",
+                    "enum": ["blueprint", "full"],
+                    "default": "blueprint"
                 }
             },
             "required": []
@@ -78,6 +84,7 @@ impl Tool for GitDiffTool {
         };
 
         let staged = args.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("blueprint");
 
         // Get the diff
         let mut diff_opts = git2::DiffOptions::new();
@@ -135,9 +142,17 @@ impl Tool for GitDiffTool {
         }
 
         if output.trim().is_empty() {
-            ToolOutput::ok("git_diff", &[("changed", "0")], None)
+            ToolOutput::ok("git_diff", &[("files", "0")], None)
+        } else if mode == "blueprint" {
+            let files = output.matches("diff --git").count().max(1);
+            let added = output.matches("
++").count();
+            let removed = output.matches("
+-").count();
+            let summary = format!("{} files, +{}/-{} lines", files, added, removed);
+            ToolOutput::ok("git_diff", &[("files", &files.to_string()), ("added", &added.to_string()), ("removed", &removed.to_string())], Some(&summary))
         } else {
-            ToolOutput::ok("git_diff", &[("changed", "1")], Some(&output))
+            ToolOutput::ok("git_diff", &[("files", "1")], Some(&output))
         }
     }
 }
@@ -154,7 +169,7 @@ impl Tool for GitStatusTool {
     }
 
     fn description(&self) -> &str {
-        "Show the working tree status (porcelain format)."
+        "Show working tree status. Modes: "blueprint" (default, file count summary), "full" (porcelain format)."
     }
 
     fn parameters(&self) -> Value {
@@ -181,9 +196,10 @@ impl Tool for GitStatusTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let repo = match open_repo(&ctx.project_path) {
             Ok(r) => r,
-            Err(e) => return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e)),
+            Err(e) => return ToolOutput::err("git_status", "EXECUTION_FAILED", &[], Some(&e)),
         };
 
+        let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("blueprint");
         let mut status_opts = git2::StatusOptions::new();
         status_opts
             .include_untracked(true)
@@ -198,7 +214,7 @@ impl Tool for GitStatusTool {
         };
 
         if statuses.is_empty() {
-            return ToolOutput::ok("git_status", &[("dirty", "0")], None);
+            return ToolOutput::ok("git_status", &[("files", "0")], None);
         }
 
         let mut output = String::new();
@@ -208,7 +224,12 @@ impl Tool for GitStatusTool {
             output.push_str(&format!("{} {}\n", status_code, path));
         }
 
-        ToolOutput::ok("git_diff", &[("changed", "1")], Some(&output))
+        if mode == "blueprint" {
+            let cnt = statuses.len();
+            ToolOutput::ok("git_status", &[("files", &cnt.to_string())], Some(&format!("{} files", cnt)))
+        } else {
+            ToolOutput::ok("git_status", &[("files", &statuses.len().to_string())], Some(&output))
+        }
     }
 }
 
@@ -322,7 +343,12 @@ impl Tool for GitLogTool {
         if output.is_empty() {
             ToolOutput::ok("git_log", &[("commits", "0")], None)
         } else {
-            ToolOutput::ok("git_diff", &[("changed", "1")], Some(&output))
+            if mode == "blueprint" {
+            let cnt = statuses.len();
+            ToolOutput::ok("git_status", &[("files", &cnt.to_string())], Some(&format!("{} files", cnt)))
+        } else {
+            ToolOutput::ok("git_status", &[("files", &statuses.len().to_string())], Some(&output))
+        }
         }
     }
 }
