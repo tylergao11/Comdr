@@ -59,6 +59,8 @@ export {
 export { WorkingMemory } from './memory/working.js';
 export { EpisodicMemory, createEpisodicMemory } from './memory/episodic.js';
 export { SemanticMemory, createSemanticMemory } from './memory/semantic.js';
+export { ProceduralMemory } from './memory/procedural.js';
+export type { ProceduralPattern } from './memory/procedural.js';
 
 // ===== 持久化 =====
 export { SessionStore, createSessionStore } from './persistence.js';

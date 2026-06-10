@@ -59,6 +59,7 @@ import { ContextManager } from './context.js';
 import { WorkingMemory } from './memory/working.js';
 import { EpisodicMemory } from './memory/episodic.js';
 import { SemanticMemory } from './memory/semantic.js';
+import { ProceduralMemory } from './memory/procedural.js';
 import { TaskPlanner } from './planner.js';
 import { ReflectionEngine } from './reflection.js';
 import { ProgressMeter } from './progress.js';
@@ -96,6 +97,7 @@ export class Engine implements IEngine {
   private readonly workingMemory: WorkingMemory;
   private readonly episodicMemory: EpisodicMemory;
   private readonly semanticMemory: SemanticMemory;
+  private readonly proceduralMemory: ProceduralMemory;
   private readonly planner: TaskPlanner;
   private readonly reflection: ReflectionEngine;
   private readonly progress: ProgressMeter;
@@ -134,6 +136,8 @@ export class Engine implements IEngine {
     this.workingMemory = new WorkingMemory();
     this.episodicMemory = new EpisodicMemory();
     this.semanticMemory = new SemanticMemory();
+    this.proceduralMemory = new ProceduralMemory();
+    this.proceduralMemory.load();
     this.planner = new TaskPlanner();
     this.reflection = new ReflectionEngine(llm);
     this.progress = new ProgressMeter();
@@ -379,11 +383,17 @@ export class Engine implements IEngine {
           .map((ep) => ep.structuredSummary?.sessionIntent ?? ep.task)
           .filter(Boolean);
         const reflections = this.episodicMemory.getReflections().map((r) => r.insight);
+        const allReflections = [...reflections];
+        // ★ 注入跨项目 confirmed 模式 (trust ≥ 0.7)
+        const patterns = this.proceduralMemory.getConfirmed();
+        if (patterns.length > 0) {
+          allReflections.push('Cross-project patterns:', ...patterns.map(p => `- ${p.pattern} (trust: ${p.trust.toFixed(2)})`));
+        }
         const anchor = anchorFromWindows(
           this.workingMemory.getStateWindow(),
           this.workingMemory.getIntentWindow(),
           relatedHistory,
-          reflections.length > 0 ? reflections : undefined,
+          allReflections.length > 0 ? allReflections : undefined,
         );
         const promptMessages = this.prompt.build(session, tools, route, anchor);
 
@@ -881,9 +891,9 @@ export class Engine implements IEngine {
       // ★ 跨会话反思——每 N 个会话触发一次（优先用 flash 模型）
       if (this.episodicMemory.shouldReflect()) {
         const reflectLLM = this.contextLLM ?? this.llm;
-        this.episodicMemory.reflect(reflectLLM).catch(() => {
-          // 反思失败 → 静默降级，下次再试
-        });
+        this.episodicMemory.reflect(reflectLLM).catch(() => {});
+        // ★ 跨项目模式提取——每 2 次反思触发一次（更稀有）
+        this.proceduralMemory.learn(reflectLLM).catch(() => {});
       }
 
       this.sessionStore.saveEpisodic(this.episodicMemory.serialize());
