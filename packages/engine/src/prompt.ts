@@ -22,6 +22,7 @@
  * @agent Agent 4 — 此文件由 Agent 4 维护
  */
 
+import { createHash } from 'node:crypto';
 import type {
   Message,
   ToolDefinition,
@@ -40,11 +41,7 @@ import { buildSystemPromptPrefix } from '@comdr/llm';
 /**
  * 最近历史保留轮数
  */
-const RECENT_HISTORY_TURNS = SYSTEM.PROMPT_RECENT_HISTORY_TURNS;
-
-/**
- * System Prompt（固定，不含时间戳）
- */
+/** System Prompt（完全静态——不含日期等动态内容，保证前缀缓存 100% 命中） */
 const SYSTEM_PROMPT = buildSystemPromptPrefix();
 
 // ============================================================================
@@ -53,17 +50,128 @@ const SYSTEM_PROMPT = buildSystemPromptPrefix();
 
 export class PromptConstructor {
   /**
-   * comdr.md 内容——项目专属指令，注入到 System Prompt 之后。
+   * COMDR.md 内容——项目专属指令，注入到 System Prompt 之后。
    * 同会话内不变 → DeepSeek 前缀缓存友好。
    * 空串 = 文件不存在或无内容，跳过注入。
    */
   private comdrMd: string = '';
 
   /**
+   * ★ L1.x — World Model 检索到的相关 chunk（格式化文本）。
+   * 同会话内不变（查询依据 = session.currentInput）。
+   */
+  private worldModelContext: string = '';
+
+  // ---- 动态区跨轮数据 ----
+
+  /**
+   * ★ L4.5 — Semantic Memory 实体上下文（每轮更新）。
+   */
+  private entityContext: string = '';
+
+  /**
+   * ★ L4.5 — Context Anchor 压缩摘要（每轮更新）。
+   */
+  private compactSummary: string = '';
+
+  /**
    * 设置项目专属指令内容。Engine 构造时调用。
    */
   setComdrMd(content: string): void {
     this.comdrMd = content;
+  }
+
+  /**
+   * ★ 设置 World Model 检索到的相关 chunk（L1.x）。
+   * Engine 构造时调用一次，同会话不变。
+   */
+  setWorldModelContext(chunksText: string): void {
+    this.worldModelContext = chunksText;
+  }
+
+  /**
+   * ★ 仓库拓扑图——Aider-style repository map，注入到 L1.5。
+   * 同会话固定 → 缓存友好（除非 file_write 后标记 dirty 重建）。
+   */
+  private repoMap: string = '';
+
+  /**
+   * ★ 任务行为指令——从 L7 提到 L3 静态区。
+   * 同 route 内不变 → 缓存友好。route 切换时更新（罕见）。
+   */
+  private taskBehavior: string = '';
+
+  /** 设置仓库地图。Engine 构造时调用一次。 */
+  setRepoMap(text: string): void {
+    this.repoMap = text;
+  }
+
+  /** 设置任务行为指令。loop.ts 每轮调用——但内容只在 route 变化时更新。 */
+  setTaskBehavior(route: Route): void {
+    const hint = buildTaskHint(route);
+    if (hint !== this.taskBehavior) {
+      this.taskBehavior = hint;
+    }
+  }
+
+  /**
+   * ★ 设置 Semantic Memory 实体上下文（L4.5）。
+   * 每轮调用，反映最新的文件/实体关系。
+   */
+  setEntityContext(text: string): void {
+    this.entityContext = text;
+  }
+
+  /**
+   * ★ 设置 Context Anchor 压缩摘要（L4.5）。
+   * 每轮调用，反映压缩管线的最新摘要。
+   */
+  setCompactSummary(text: string): void {
+    this.compactSummary = text;
+  }
+
+  /**
+   * ★ 计算静态区的 SHA256 指纹——用于监控前缀缓存命中情况。
+   *
+   * 指纹覆盖 L1 (system prompt) + COMDR.md + world model context + L2 (tool defs)。
+   * L3 (session anchor) 同会话内不变但跨会话可能变，因此也纳入计算。
+   *
+   * 如果指纹与上一轮不同 → 前缀缓存必然 miss。
+   *
+   * @param tools     活跃工具定义
+   * @param anchor    会话锚点
+   * @param prevFp    上一轮的指纹（用于比较）
+   * @returns { fingerprint, changed } — 当前指纹 + 是否变化
+   */
+  computeFingerprint(
+    tools: ToolDefinition[],
+    anchor: SessionAnchor,
+    prevFp?: string,
+  ): { fingerprint: string; changed: boolean } {
+    const hash = createHash('sha256');
+    hash.update(SYSTEM_PROMPT);
+    hash.update(this.comdrMd);
+    hash.update(this.worldModelContext);
+    hash.update(serializeTools(tools));
+    hash.update(JSON.stringify(anchor));
+    const fingerprint = hash.digest('hex').slice(0, 16);
+    return {
+      fingerprint,
+      changed: prevFp !== undefined && prevFp !== fingerprint,
+    };
+  }
+
+  /**
+   * ★ 获取静态区指纹（不带 anchor——用于同会话内快速比较）。
+   * 同会话内 L3 不变，因此不带 anchor 的指纹更精确地反映"纯静态区是否漂移"。
+   */
+  computeStaticFingerprint(tools: ToolDefinition[]): { fingerprint: string } {
+    const hash = createHash('sha256');
+    hash.update(SYSTEM_PROMPT);
+    hash.update(this.comdrMd);
+    hash.update(this.worldModelContext);
+    hash.update(serializeTools(tools));
+    return { fingerprint: hash.digest('hex').slice(0, 16) };
   }
 
   /**
@@ -97,23 +205,37 @@ export class PromptConstructor {
     tools: ToolDefinition[],
     anchor: SessionAnchor,
   ): Message[] {
-    const messages: Message[] = [
-      this.buildL1_SystemPrompt(),
-    ];
+    // ★ Merge L1.x + L1.5 + L1.6 + L1 project_instructions + L3 anchor
+    // into ONE system message to save JSON wrapper overhead (~120B).
+    const contextBlocks: string[] = [];
+    if (this.taskBehavior) contextBlocks.push(this.taskBehavior);
+    if (this.comdrMd) contextBlocks.push(`<project>\n${this.comdrMd}\n</project>`);
+    if (this.repoMap) contextBlocks.push(this.repoMap);
+    if (this.worldModelContext) contextBlocks.push(`<world>\n${this.worldModelContext}\n</world>`);
 
-    // ★ comdr.md — 项目专属指令（L1 之后，同会话固定 → 缓存友好）
-    if (this.comdrMd) {
-      messages.push({
-        role: MESSAGE_ROLE.SYSTEM,
-        content: `<project_instructions>\n${this.comdrMd}\n</project_instructions>`,
-      });
+    // L3 anchor: relatedHistory + reflections (static within session)
+    const anchorParts: string[] = [];
+    if (anchor.relatedHistory.length > 0) {
+      anchorParts.push('<history>', ...anchor.relatedHistory.map(h => `- ${h}`), '</history>');
+    }
+    if (anchor.reflectionSummary) {
+      anchorParts.push('<reflection>', anchor.reflectionSummary, '</reflection>');
+    }
+    if (contextBlocks.length > 0 || anchorParts.length > 0) {
+      const merged = [...contextBlocks, ...anchorParts].join('\n');
+      if (merged) {
+        return [
+          this.buildL1_SystemPrompt(),
+          { role: MESSAGE_ROLE.SYSTEM, content: merged },
+          this.buildL2_ToolDefinitions(tools),
+        ];
+      }
     }
 
-    messages.push(
+    return [
+      this.buildL1_SystemPrompt(),
       this.buildL2_ToolDefinitions(tools),
-      this.buildL3_SessionAnchor(anchor),
-    );
-    return messages;
+    ];
   }
 
   /**
@@ -141,104 +263,29 @@ export class PromptConstructor {
     };
   }
 
-  /**
-   * L3: Session Anchor（会话摘要 + 跨会话上下文）
-   */
-  private buildL3_SessionAnchor(anchor: SessionAnchor): Message {
-    const parts: string[] = [];
-
-    if (anchor.relatedHistory.length > 0) {
-      parts.push(
-        '<related_history>',
-        ...anchor.relatedHistory.map((h) => `- ${h}`),
-        '</related_history>',
-      );
-    }
-
-    if (anchor.stateSummary) {
-      parts.push(
-        '<state_summary>',
-        anchor.stateSummary,
-        '</state_summary>',
-      );
-    }
-
-    if (anchor.intentSummary) {
-      parts.push(
-        '<intent_summary>',
-        anchor.intentSummary,
-        '</intent_summary>',
-      );
-    }
-
-    if (parts.length === 0) {
-      parts.push('No prior session context.');
-    }
-
-    return {
-      role: MESSAGE_ROLE.SYSTEM,
-      content: parts.join('\n'),
-    };
-  }
+  /** @deprecated Inlined into buildStaticZone for JSON wrapper savings */
 
   // --------------------------------------------------------------------------
   // ZONE 2: DYNAMIC（每轮变化）
   // --------------------------------------------------------------------------
 
   /**
-   * 构建动态区域 L4-L7
-   * 每轮重建，总量控制在 ~8K tokens 以内
+   * 构建动态区域 L6-L7
+   *
+   * ★ 缓存优化：L4/L5/L4.5 不再作为独立消息（会切断 prefix cache）。
+   * 改为合并到 L7 用户消息末尾。动态消息顺序变为:
+   *   L6: Recent History → L7: User Input + State + Intent + Entity + Summary
+   *
+   * 这样 L1-L3 的 ~3200 tokens 永远命中缓存。
    */
   private buildDynamicZone(
     session: SessionState,
     route: Route,
   ): Message[] {
     return [
-      this.buildL4_StateWindow(session),
-      this.buildL5_IntentWindow(session),
       ...this.buildL6_RecentHistory(session),
-      this.buildL7_UserInput(session, route),
+      this.buildL7_WithContext(session, route),
     ];
-  }
-
-  /**
-   * L4: State Window（最近 5 条 WHAT）
-   */
-  private buildL4_StateWindow(session: SessionState): Message {
-    if (session.stateWindow.length === 0) {
-      return {
-        role: MESSAGE_ROLE.USER,
-        content: '<state_window>\n(empty)\n</state_window>',
-      };
-    }
-
-    const lines = session.stateWindow.map(
-      (e) => `- [${e.key}] ${e.text} (turn ${e.turn})`,
-    );
-    return {
-      role: MESSAGE_ROLE.USER,
-      content: `<state_window>\n${lines.join('\n')}\n</state_window>`,
-    };
-  }
-
-  /**
-   * L5: Intent Window（最近 5 条 WHY）
-   */
-  private buildL5_IntentWindow(session: SessionState): Message {
-    if (session.intentWindow.length === 0) {
-      return {
-        role: MESSAGE_ROLE.USER,
-        content: '<intent_window>\n(empty)\n</intent_window>',
-      };
-    }
-
-    const lines = session.intentWindow.map(
-      (e) => `- [${e.key}] ${e.why} (turn ${e.turn})`,
-    );
-    return {
-      role: MESSAGE_ROLE.USER,
-      content: `<intent_window>\n${lines.join('\n')}\n</intent_window>`,
-    };
   }
 
   /**
@@ -257,13 +304,12 @@ export class PromptConstructor {
     const turns: Message[][] = [];
     let currentTurn: Message[] = [];
 
-    // 从后往前扫描
+    // 从后往前扫描——不限轮次，由压缩管线按 token 预算处理
     for (const msg of [...session.messages].reverse()) {
       // 检测轮次边界：assistant 消息（无论是否有 tool_calls）
       if (msg.role === MESSAGE_ROLE.ASSISTANT && currentTurn.length > 0) {
         turns.unshift(currentTurn);
         currentTurn = [];
-        if (turns.length >= SYSTEM.PROMPT_RECENT_HISTORY_TURNS) break;
       }
 
       currentTurn.unshift(msg);
@@ -293,74 +339,84 @@ export class PromptConstructor {
   }
 
   /**
-   * L7: Current User Input
+   * L7: User Input + Dynamic Context (merged)
    *
-   * ★ 按 taskType 注入行为约束前缀。
-   * prefix 顺序: taskType 约束 → thinking 指令
+   * ★ 缓存优化: State Window, Intent Window, Entity Context, Compact Summary
+   * 不再作为独立消息，而是合并到用户消息末尾。这样 L1-L3 的 ~3200 tokens
+   * 永远命中前缀缓存。
    */
-  private buildL7_UserInput(
+  private buildL7_WithContext(
     session: SessionState,
-    route: Route,
+    _route: Route,
   ): Message {
-    const prefixes: string[] = [];
+    const parts: string[] = [];
 
-    // ---- Task-type behavior constraint ----
-    switch (route.taskType) {
-      case 'query':
-        prefixes.push(
-          '[read-only] Analysis only. Do NOT modify any files. Read, search, and report.',
-        );
-        break;
-      case 'edit':
-        prefixes.push(
-          '[edit] Make minimal precise changes. Read the target file first, edit only what is needed, verify after.',
-        );
-        break;
-      case 'generate':
-        prefixes.push(
-          '[generate] Plan file structure first, then create each file. Handle imports and dependencies correctly.',
-        );
-        break;
-      case 'refactor':
-        prefixes.push(
-          '[refactor] Read full file and all callers before touching anything. Plan the smallest safe steps. Prefer single-file refactors.',
-        );
-        break;
-      case 'architect':
-        prefixes.push(
-          '[architect] Design phase only. Do NOT write implementation code. Output architecture decisions, trade-offs, file layout, and implementation plan.',
-        );
-        break;
-      case 'orchestrate':
-        // ★ 告知 MCP 工具可用性（如果有的话）
-        prefixes.push(
-          '[orchestrate] Multi-step coordination. Check which services are available. Plan parallel vs sequential execution. Use mcp__* tools for external agent tasks.',
-        );
-        break;
+    // ---- User input ----
+    parts.push(session.currentInput);
+
+    // ---- Dynamic context ----
+    const ctx = this.buildContextSuffix(session);
+    if (ctx) {
+      parts.push('');
+      parts.push(ctx);
     }
-
-    // ---- Thinking mode hint ----
-    if (
-      route.thinking.type === THINKING_TYPE.ENABLED &&
-      route.thinking.effort === THINKING_EFFORT.MAX
-    ) {
-      prefixes.push('[thinking:max] Think through the full plan before acting.');
-    }
-
-    const content = prefixes.length > 0
-      ? `${prefixes.join('\n')}\n\n${session.currentInput}`
-      : session.currentInput;
 
     return {
       role: 'user',
-      content,
+      content: parts.join('\n'),
     };
+  }
+
+  /**
+   * ★ 构建动态上下文后缀。标签已最小化以减少缓存外字节。
+   */
+  private buildContextSuffix(session: SessionState): string | null {
+    const blocks: string[] = [];
+
+    if (session.stateWindow.length > 0) {
+      const lines = session.stateWindow.map(e => `- [${e.key}] ${e.text}`);
+      blocks.push(`<s>\n${lines.join('\n')}\n</s>`);
+    }
+    if (session.intentWindow.length > 0) {
+      const lines = session.intentWindow.map(e => `- [${e.key}] ${e.why}`);
+      blocks.push(`<i>\n${lines.join('\n')}\n</i>`);
+    }
+    const extras: string[] = [];
+    if (this.entityContext) {
+      extras.push(`<e>\n${this.entityContext}\n</e>`);
+    }
+    if (this.compactSummary) {
+      extras.push(`<c>\n${this.compactSummary}\n</c>`);
+    }
+    if (extras.length > 0) blocks.push(extras.join('\n'));
+
+    return blocks.length > 0 ? blocks.join('\n') : null;
   }
 }
 
 // ============================================================================
 // §3 辅助
 // ============================================================================
+
+/**
+ * 构建任务行为提示（注入 L1.6 静态区）。
+ * 同 route 内不变 → 缓存友好。
+ */
+export function buildTaskHint(route: Route): string {
+  const mode = (() => {
+    switch (route.taskType) {
+      case 'query':       return '[r] answer directly, use tools only when asked';
+      case 'edit':        return '[e] minimal changes, read first, verify after';
+      case 'generate':    return '[g] plan structure, create files, handle imports';
+      case 'refactor':    return '[r!] read all callers, smallest safe steps, single-file';
+      case 'architect':   return '[a] design only, no impl, output decisions+tradeoffs+plan';
+      case 'orchestrate': return '[o] multi-step, parallel vs sequential, mcp/task_spawn';
+    }
+  })();
+  const think = route.thinking.type === 'enabled' && route.thinking.effort === 'max'
+    ? ' [think:max]' : '';
+  return mode + think;
+}
 
 /**
  * 构建空的会话锚点（新会话无历史）
@@ -377,21 +433,16 @@ export function emptyAnchor(): SessionAnchor {
  * 从双窗口构造锚点摘要文本
  */
 export function anchorFromWindows(
-  stateWindow: { key: string; text: string }[],
-  intentWindow: { key: string; why: string }[],
+  _stateWindow: { key: string; text: string }[],
+  _intentWindow: { key: string; why: string }[],
   relatedHistory: string[] = [],
+  reflections?: string[],
 ): SessionAnchor {
-  const stateSummary = stateWindow
-    .map((e) => `- ${e.key}: ${e.text}`)
-    .join('\n');
-
-  const intentSummary = intentWindow
-    .map((e) => `- ${e.key}: ${e.why}`)
-    .join('\n');
-
+  // ★ State/Intent summaries are now in L7 context suffix — NOT in L3.
+  // L3 should only contain truly static data (relatedHistory, reflections)
+  // to keep the prefix cache boundary clean.
   return {
     relatedHistory,
-    stateSummary,
-    intentSummary,
+    reflectionSummary: reflections?.length ? reflections.join('\n') : undefined,
   };
 }

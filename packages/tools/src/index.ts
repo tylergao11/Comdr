@@ -41,6 +41,8 @@ interface NativeModule {
   rollback(snapshotId: string): boolean;
   forgetSnapshot(snapshotId: string): boolean;
   listTools(): NativeToolDefinition[];
+  /** Bootstrap: scan project for symbols and references. Returns JSON string. */
+  bootstrapProject(projectPath: string): string;
 }
 
 interface NativeExecuteOptions {
@@ -99,6 +101,7 @@ try {
     rollback: () => false,
     forgetSnapshot: () => false,
     listTools: () => [],
+    bootstrapProject: () => '{"symbols":[],"references":[],"files_scanned":[]}',
   };
 }
 
@@ -275,3 +278,59 @@ export function createNativeTools(
 ): INativeTools {
   return new NativeTools(projectPath);
 }
+
+// ============================================================================
+// §5 Bootstrap — 项目静态分析
+// ============================================================================
+
+/**
+ * Bootstrap 返回的类型定义。
+ * 与 Rust bootstrap::BootstrapReport 保持同步。
+ */
+export interface BootstrapSymbol {
+  name: string;
+  kind: 'function' | 'class' | 'interface' | 'module' | 'variable';
+  file_path: string;
+  location: string | null;
+  exported: boolean;
+}
+
+export interface BootstrapReference {
+  from_name: string;
+  from_file: string;
+  to_name: string;
+  to_file: string | null;
+  ref_type: 'imports' | 'calls';
+}
+
+export interface BootstrapReport {
+  symbols: BootstrapSymbol[];
+  references: BootstrapReference[];
+  files_scanned: string[];
+}
+
+/**
+ * 扫描项目目录，提取所有符号和引用。
+ *
+ * 调用 Rust 层 pattern-based 解析器。
+ * 若 Rust 模块未编译 → 静默降级，返回空 report。
+ *
+ * @param projectPath  项目根目录的绝对路径
+ * @returns            BootstrapReport（JSON 解析后的对象）
+ */
+export function bootstrapProject(projectPath: string): BootstrapReport {
+  try {
+    const json = nativeModule.bootstrapProject(projectPath);
+    const parsed = JSON.parse(json) as BootstrapReport;
+    // 验证结构
+    if (!Array.isArray(parsed.symbols) || !Array.isArray(parsed.references) || !Array.isArray(parsed.files_scanned)) {
+      return { symbols: [], references: [], files_scanned: [] };
+    }
+    return parsed;
+  } catch (err) {
+    // Rust 模块未编译 或 解析失败 → 静默降级
+    return { symbols: [], references: [], files_scanned: [] };
+  }
+}
+
+export { nativeModule as _nativeModule };

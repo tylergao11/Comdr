@@ -23,6 +23,7 @@
     "@comdr/core": "workspace:*",
     "@comdr/engine": "workspace:*",
     "@comdr/llm": "workspace:*",
+    "@comdr/tools": "workspace:*",
     "@types/react": "^19.2.17",
     "ink": "^7.0.5",
     "react": "^19",

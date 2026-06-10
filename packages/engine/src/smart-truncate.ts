@@ -256,9 +256,9 @@ export function summarizeSegmentText(
 // ============================================================================
 
 /** diff 采样时保留的头部行数 */
-const DIFF_HEAD_LINES = 50;
+const DIFF_HEAD_LINES = SYSTEM.DIFF_HEAD_LINES;
 /** diff 采样时保留的尾部行数 */
-const DIFF_TAIL_LINES = 50;
+const DIFF_TAIL_LINES = SYSTEM.DIFF_TAIL_LINES;
 /** hunk header 模式 */
 const HUNK_HEADER_RE = /^@@\s+-\d+,\d+\s+\+\d+,\d+\s+@@/;
 
@@ -610,4 +610,91 @@ function wordBoundaryTruncate(s: string, maxLen: number): string {
 
   // fallback: 字符边界截断
   return s.slice(0, maxLen);
+}
+
+// ============================================================================
+// §8 scoreMessageImportance — 消息级重要性评分
+// ============================================================================
+
+/**
+ * 对单条 tool result 消息打分 (0-100)，决定压缩级别。
+ *
+ * 来源: LongLLMLingua (2024) — 不同消息按相关度获得不同压缩率。
+ *       CodeAndSeek (2026) — compactContextEvent() 对字段分级截断。
+ *
+ * @param content   tool result 的完整内容
+ * @param toolName  工具名
+ * @param _args     (保留) 工具参数——未来可用于路径感知的额外打分
+ */
+export function scoreMessageImportance(
+  content: string | null,
+  toolName: string,
+  _args?: Record<string, unknown>,
+): number {
+  if (!content) return 0;
+  let score = 30; // 基线
+
+  // 含错误关键词
+  if (ERROR_PATTERNS.some((p) => p.test(content))) {
+    score += SYSTEM.MESSAGE_IMPORTANCE_ERROR_BONUS;
+  }
+
+  // 含测试结果
+  if (TEST_PATTERNS.some((p) => p.test(content))) {
+    score += SYSTEM.MESSAGE_IMPORTANCE_TEST_BONUS;
+  }
+
+  // 含 diff hunk
+  if (HUNK_HEADER_RE.test(content) || content.includes('+++') || content.includes('---')) {
+    score += SYSTEM.MESSAGE_IMPORTANCE_DIFF_BONUS;
+  }
+
+  // 内容过长 → 可能是噪音
+  if (content.length > SYSTEM.MESSAGE_IMPORTANCE_LONG_THRESHOLD) {
+    score += SYSTEM.MESSAGE_IMPORTANCE_LONG_PENALTY;
+  }
+
+  // 核心文件操作
+  // 从工具名推断——写操作涉及的路径通常在 ToolCall.function.arguments 中
+  // 这里从 toolName 做粗略判断：核心工具操作默认 +10
+  const coreTools = ['file_write', 'file_edit', 'file_delete'];
+  if (coreTools.includes(toolName)) {
+    score += SYSTEM.MESSAGE_IMPORTANCE_CORE_FILE_BONUS;
+  }
+
+  return Math.max(0, Math.min(100, score));
+}
+
+/**
+ * 根据 importance score 返回压缩级别 + 压缩后的内容。
+ *
+ * @returns { level, content } — 压缩级别 + 压缩后内容
+ */
+export function compressByLevel(
+  content: string | null,
+  toolName: string,
+  _args?: Record<string, unknown>,
+): { level: 'preserve' | 'summarize' | 'squash'; content: string } {
+  const score = scoreMessageImportance(content, toolName, _args);
+  const safeName = toolName || 'unknown';
+
+  if (score >= SYSTEM.MESSAGE_IMPORTANCE_PRESERVE_THRESHOLD) {
+    return { level: 'preserve', content: content ?? '' };
+  }
+
+  if (score >= SYSTEM.MESSAGE_IMPORTANCE_SUMMARIZE_THRESHOLD) {
+    return {
+      level: 'summarize',
+      content: summarizeToolOutput(content, toolName),
+    };
+  }
+
+  // squash: 极端压缩
+  const short = content
+    ? wordBoundaryTruncate(content.replace(/\n/g, ' '), 80)
+    : 'no output';
+  return {
+    level: 'squash',
+    content: `[squashed] ${safeName}: ${short}`,
+  };
 }

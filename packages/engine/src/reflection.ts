@@ -35,6 +35,7 @@ import {
   TERMINATION_REASON,
 } from '@comdr/core';
 import { extractAndParseJSON, safeParseArgs } from './utils.js';
+import { summarizeToolOutput } from './smart-truncate.js';
 
 /** Self-correct 返回结果 */
 export interface SelfCorrectResult {
@@ -442,7 +443,7 @@ export class ReflectionEngine {
       if (!parsed?.new_string) {
         return {
           corrected: false,
-          explanation: parsed?.explanation ?? `LLM response not parseable: ${content.slice(0, 200)}`,
+          explanation: parsed?.explanation ?? `LLM response not parseable: ${summarizeToolOutput(content, undefined, 200)}`,
         };
       }
 

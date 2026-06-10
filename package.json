@@ -4,18 +4,24 @@
   "private": true,
   "description": "通用 Coding Agent — TypeScript 编排层 + Rust 执行层",
   "scripts": {
-    "build": "tsc -b packages/core packages/llm packages/tools packages/engine packages/ui",
+    "build": "tsc -b",
     "build:tools": "cd crates/comdr-tools && cargo build --release && napi artifacts",
     "clean": "tsc -b --clean",
     "typecheck": "tsc -b",
     "lint": "eslint packages/ --ext .ts",
-    "setup": "pnpm build && cd packages/ui && pnpm link --global"
+    "test": "npx tsx tests/integration.test.ts && npx tsx tests/rag.test.ts",
+    "test:rag": "npx tsx tests/rag.test.ts",
+    "test:integration": "npx tsx tests/integration.test.ts",
+    "link": "pnpm build && node scripts/install-global.mjs"
   },
   "devDependencies": {
     "typescript": "^5.8.0",
     "@types/node": "^22.0.0",
     "eslint": "^9.0.0",
     "prettier": "^3.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
   },
   "engines": {
     "node": ">=20.0.0",

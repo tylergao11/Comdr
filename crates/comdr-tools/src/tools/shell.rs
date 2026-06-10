@@ -72,7 +72,7 @@ impl Tool for ShellBashTool {
         let command_str = match args.get("command").and_then(|v| v.as_str()) {
             Some(c) => c,
             None => {
-                return ToolOutput::error("SCHEMA_INVALID", "Missing required field: command")
+                return ToolOutput::err("shell_bash", "SCHEMA_INVALID", &[], None)
             }
         };
 
@@ -183,7 +183,7 @@ impl Tool for ShellBashTool {
                 error_code: Some("EXECUTION_FAILED".to_string()),
             }
         } else {
-            ToolOutput::success(result)
+            ToolOutput::ok("shell_bash", &[("exit_code", &exit_code.to_string())], Some(&result))
         }
     }
 }

@@ -63,9 +63,9 @@ hint = "操作Cocos编辑器，创建/编辑prefab场景挂脚本设属性，需
 
 # ===== World Models（自动注入 prompt 的项目知识） =====
 # Comdr 启动时自动从以下位置发现并合并项目知识:
-#   1. ~/.comdr/comdr.md              — 用户全局编码偏好
+#   1. ~/.comdr/COMDR.md              — 用户全局编码偏好
 #   2. ~/.comdr/world-models/*.md     — 外部 Agent 世界模型
-#   3. {projectPath}/comdr.md          — 项目专属指令
+#   3. {projectPath}/COMDR.md          — 项目专属指令
 # 合并后内容注入到每轮 prompt 的 System Prompt 之后。
 # 部署世界模型:
 #   mkdir -p ~/.comdr/world-models/

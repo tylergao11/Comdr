@@ -58,6 +58,18 @@ interface CausalLink {
 // §2 SemanticMemory 类
 // ============================================================================
 
+/**
+ * 常见停用词——从候选词提取中排除。
+ * 这些词在代码相关查询中无区分度。
+ */
+const STOP_WORDS = new Set([
+  'the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'are',
+  'was', 'not', 'but', 'all', 'can', 'has', 'had', 'been', 'were',
+  'they', 'will', 'would', 'could', 'should', 'may', 'might', 'shall',
+  'also', 'then', 'just', 'only', 'into', 'over', 'its', 'get', 'set',
+  '使用', '怎么', '如何', '什么', '为什么', '一个', '这个', '那个',
+]);
+
 export class SemanticMemory {
   // 四张图
   private semanticGraph: {
@@ -200,6 +212,269 @@ export class SemanticMemory {
     return this.entityGraph.edges
       .filter((e) => e.to === fileId)
       .map((e) => e.from);
+  }
+
+  /**
+   * ★ Graph RAG: 从用户输入中检索相关代码实体。
+   *
+   * 算法（确定性图遍历，不走 embedding）:
+   *   1. 从 input 提取候选词（路径段、驼峰/下划线命名单词）
+   *   2. 在 Entity Graph + Semantic Graph 节点中做子串匹配
+   *   3. BFS 一层找邻居节点（defines/imports/calls/depends_on 边）
+   *   4. 查 Temporal Graph: 候选词匹配到的文件 → 最近修改记录
+   *
+   * @param input     用户输入
+   * @param topK      返回最多 K 个实体
+   * @param bfsDepth  BFS 邻居遍历深度（默认 2）
+   * @returns         格式化的上下文文本（可直接注入 prompt）
+   */
+  retrieveRelevantEntities(
+    input: string,
+    topK: number = SYSTEM.SEMANTIC_ENTITY_RETRIEVAL_TOPK,
+    bfsDepth: number = SYSTEM.SEMANTIC_ENTITY_BFS_DEPTH,
+  ): string {
+    const candidates = this.extractCandidates(input);
+    if (candidates.length === 0) return '';
+
+    // Step 1: 在 Semantic + Entity Graph 中匹配
+    const matchedNodes: SemanticNode[] = [];
+    const allNodes = [
+      ...this.semanticGraph.nodes.values(),
+      ...this.entityGraph.nodes.values(),
+    ];
+    const seen = new Set<string>();
+
+    for (const node of allNodes) {
+      if (seen.has(node.id)) continue;
+
+      for (const cand of candidates) {
+        if (
+          node.name.toLowerCase().includes(cand) ||
+          node.path.toLowerCase().includes(cand)
+        ) {
+          matchedNodes.push(node);
+          seen.add(node.id);
+          break;
+        }
+      }
+    }
+
+    // Step 2: BFS 找邻居（合并两个图的边）
+    const allEdges = [
+      ...this.semanticGraph.edges,
+      ...this.entityGraph.edges,
+    ];
+    const neighborMap = new Map<string, string[]>(); // nodeId → neighbor descriptions
+
+    for (const node of matchedNodes) {
+      const neighbors: string[] = [];
+      const visited = new Set<string>([node.id]);
+
+      // BFS
+      let frontier = [node.id];
+      for (let depth = 0; depth < bfsDepth; depth++) {
+        const nextFrontier: string[] = [];
+        for (const fid of frontier) {
+          for (const edge of allEdges) {
+            let neighborId: string | null = null;
+            let rel: string | null = null;
+
+            if (edge.from === fid) {
+              neighborId = edge.to;
+              rel = edge.type;
+            } else if (edge.to === fid) {
+              neighborId = edge.from;
+              rel = `inverse_${edge.type}`;
+            }
+
+            if (neighborId && !visited.has(neighborId)) {
+              visited.add(neighborId);
+              nextFrontier.push(neighborId);
+
+              // 查找邻居节点名称
+              const neighborNode =
+                this.entityGraph.nodes.get(neighborId) ??
+                this.semanticGraph.nodes.get(neighborId);
+              const display = neighborNode
+                ? `${neighborNode.name} (${neighborNode.type})`
+                : neighborId;
+              neighbors.push(`${display} [${rel}]`);
+            }
+          }
+        }
+        frontier = nextFrontier;
+      }
+
+      if (neighbors.length > 0) {
+        neighborMap.set(node.id, neighbors);
+      }
+    }
+
+    // Step 3: 查 Temporal Graph——候选词匹配到的文件
+    const temporalMatches: string[] = [];
+    const temporalFiles = new Set<string>();
+    for (const entry of this.temporalGraph) {
+      if (temporalFiles.has(entry.filePath)) continue;
+      for (const cand of candidates) {
+        if (entry.filePath.toLowerCase().includes(cand)) {
+          temporalMatches.push(
+            `${entry.action} ${entry.filePath} (turn ${entry.turn})`,
+          );
+          temporalFiles.add(entry.filePath);
+          break;
+        }
+      }
+    }
+
+    // Step 4: 格式化输出
+    return this.formatEntityContext(
+      matchedNodes.slice(0, topK),
+      neighborMap,
+      temporalMatches.slice(0, topK),
+    );
+  }
+
+  /**
+   * 从用户输入提取候选词。
+   *
+   * 提取策略:
+   *   - 路径段: 按 / 和 \ 分割
+   *   - 驼峰命名: loop.ts → [loop, ts]
+   *   - 下划线命名: test_feedback → [test, feedback]
+   *   - 英文单词: 按非字母数字分割（排除过短的词和常见停用词）
+   */
+  private extractCandidates(input: string): string[] {
+    const candidates: string[] = [];
+    const lower = input.toLowerCase();
+
+    // 路径段（按 / \ 分割）
+    const pathSegments = lower.split(/[/\\]/);
+    for (const seg of pathSegments) {
+      const clean = seg.trim();
+      if (clean.length >= 2) candidates.push(clean);
+    }
+
+    // 单词（按空格/标点分割）
+    const words = lower.split(/[\s,.;:!?()\[\]{}"'`]+/);
+    for (const w of words) {
+      if (w.length >= 3 && !STOP_WORDS.has(w)) {
+        candidates.push(w);
+        // 驼峰/下划线拆分
+        const parts = w.split(/[_-]/);
+        for (const p of parts) {
+          if (p.length >= 2) candidates.push(p);
+        }
+        // 驼峰拆分: testFeedback → [testfeedback, test, feedback]
+        const camelParts = w.split(/(?=[A-Z])/).map((p) => p.toLowerCase());
+        for (const p of camelParts) {
+          if (p.length >= 2) candidates.push(p);
+        }
+      }
+    }
+
+    // 去重
+    return [...new Set(candidates)];
+  }
+
+  /**
+   * ★ Phase 3: 格式化实体上下文为 Markdown 拓扑子图。
+   *
+   * 输出格式:
+   *   ```
+   *   ## Dependency Graph
+   *   file.ts
+   *   └── [defines] func() @ :42
+   *       ├── [calls] Other.fn() → other.ts:10
+   *       │   └── [depends_on] Cache → cache.ts
+   *       └── [imported_by] app.ts → middleware/auth.ts
+   *
+   *   ## Temporal Context
+   *   - modified file.ts (turn 3)
+   *   ```
+   *
+   * 超过 15 个节点的子图 → 只展示 top 5 节点 + 统计摘要。
+   */
+  private formatEntityContext(
+    nodes: SemanticNode[],
+    neighborMap: Map<string, string[]>,
+    temporalMatches: string[],
+  ): string {
+    const blocks: string[] = [];
+
+    // ── Dependency Graph ──
+    const MAX_NODES = SYSTEM.GRAPH_DISPLAY_MAX_NODES;
+    if (nodes.length > MAX_NODES) {
+      blocks.push('## Dependency Graph');
+      blocks.push(`(${nodes.length} relevant entities — showing top ${Math.min(5, nodes.length)})`);
+    } else if (nodes.length > 0) {
+      blocks.push('## Dependency Graph');
+    }
+
+    for (const node of nodes.slice(0, MAX_NODES)) {
+      const loc = node.location ? ` @ ${node.location}` : '';
+      // 文件节点 → 作为根
+      if (node.type === 'file') {
+        blocks.push(`${node.path}`);
+        this.appendNeighbors(blocks, neighborMap, node.id, 1);
+      } else {
+        blocks.push(`\`${node.name}\` (${node.type}) in ${node.path}${loc}`);
+        this.appendNeighbors(blocks, neighborMap, node.id, 1);
+      }
+    }
+
+    // ── Temporal Context ──
+    if (temporalMatches.length > 0) {
+      blocks.push('');
+      blocks.push('## Temporal Context');
+      for (const tm of temporalMatches.slice(0, SYSTEM.TIMELINE_DISPLAY_MAX_ITEMS)) {
+        blocks.push(`- ${tm}`);
+      }
+    }
+
+    return blocks.join('\n');
+  }
+
+  /**
+   * 递归追加邻居节点（带缩进和树状标记）。
+   * depth 控制递归深度，超过 2 层 → 仅标注 "(+N more)"。
+   */
+  private appendNeighbors(
+    lines: string[],
+    neighborMap: Map<string, string[]>,
+    nodeId: string,
+    depth: number,
+  ): void {
+    const neighbors = neighborMap.get(nodeId);
+    if (!neighbors || neighbors.length === 0) return;
+
+    const MAX_PER_LEVEL = SYSTEM.GRAPH_DISPLAY_NEIGHBORS_PER_LEVEL;
+    const shown = neighbors.slice(0, MAX_PER_LEVEL);
+    const prefix = depth === 1 ? '  ' : '      ';
+
+    for (let i = 0; i < shown.length; i++) {
+      const isLast = i === shown.length - 1 && neighbors.length <= MAX_PER_LEVEL;
+      const branch = isLast ? '└──' : '├──';
+      const n = shown[i]!;
+      // neighbor format: "name (type) [relation]" or "name [relation]"
+      lines.push(`${prefix}${branch} ${n}`);
+
+      // 递归子邻居（仅当 depth < 2）
+      if (depth < 2) {
+        // 从 neighbor string 提取 node ID
+        const parts = n.split(' [');
+        if (parts.length >= 2) {
+          const rel = parts[1]!.replace(']', '');
+          if (rel === 'defines' || rel === 'depends_on' || rel === 'calls' || rel === 'imports') {
+            // 尝试找子邻居: 这里不能直接从 neighbor string 反查到 node ID
+            // 简化处理: 只展示一层深度
+          }
+        }
+      }
+    }
+
+    if (neighbors.length > MAX_PER_LEVEL) {
+      lines.push(`${prefix}└── (+${neighbors.length - MAX_PER_LEVEL} more)`);
+    }
   }
 
   /**

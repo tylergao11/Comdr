@@ -14,7 +14,7 @@
  */
 
 // ===== TUI =====
-import { startTUI, streamToCLI } from './tui.js';
+import { startTUI, streamToCLI } from './tui/index.js';
 export { startTUI, streamToCLI };
 
 // ===== MCP Server =====

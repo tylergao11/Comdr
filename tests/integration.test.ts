@@ -160,7 +160,7 @@ suite1.test('SYSTEM 常量含核心配置值', () => {
   assert(SYSTEM.DEFAULT_TOKEN_BUDGET === 200_000, 'DEFAULT_TOKEN_BUDGET');
   assert(SYSTEM.MAX_STATE_WINDOW_SIZE === 5, 'MAX_STATE_WINDOW_SIZE');
   assert(SYSTEM.MAX_INTENT_WINDOW_SIZE === 5, 'MAX_INTENT_WINDOW_SIZE');
-  assert(SYSTEM.COMPACTION_THRESHOLD_SNIP === 0.8, 'COMPACTION_THRESHOLD_SNIP');
+  assert(SYSTEM.COMPACTION_THRESHOLD_SNIP === 0.25, 'COMPACTION_THRESHOLD_SNIP');
   assert(SYSTEM.LOOP_DETECTION_THRESHOLD === 3, 'LOOP_DETECTION_THRESHOLD');
 });
 
@@ -314,7 +314,7 @@ suite2.test('computeCacheHitRate 正确计算', () => {
 // ============================================================================
 
 import { createNativeTools } from '@comdr/tools';
-import type { INativeTools, ToolExecuteOptions } from '@comdr/core';
+import type { ToolExecuteOptions } from '@comdr/core';
 
 const suite3 = new TestSuite('3. Agent 3 — NativeTools 桥接 + 类型映射');
 
@@ -336,13 +336,13 @@ suite3.test('execute 调用未知工具返回 error', () => {
   const tools = createNativeTools();
   const opts: ToolExecuteOptions = {
     name: 'nonexistent_tool',
+    callId: 'test_call_1',
     arguments: {},
-    snapshotEnabled: false,
     timeoutMs: 5000,
   };
   const result = tools.execute(opts);
   assert(result.ok === false, 'unknown tool should fail');
-  assert(result.errorCode !== undefined, 'should have errorCode');
+  assert(result.errorCategory !== undefined, 'should have errorCategory');
 });
 
 suite3.test('rollback 在无快照时返回 false', () => {
@@ -491,14 +491,12 @@ suite4.test('PromptConstructor.build L7 含 thinking 前缀指令', () => {
   const systemMsgs = messages.filter((m) => m.role === 'system');
   assert(systemMsgs.length >= 2, 'should have at least 2 system messages (L1 + L2)');
 
-  // L7 应该包含 [thinking:max] 前缀
-  const userMsg = messages[messages.length - 1]!;
-  assert(userMsg.role === 'user', 'last message should be user');
-  assertContains(
-    userMsg.content ?? '',
-    '[thinking:max]',
-    'should contain thinking:max prefix',
-  );
+  // ★ thinking hint now in L1.6 static zone (via setTaskBehavior)
+  pc.setTaskBehavior(route);
+  const msgs1 = pc.build(session, [], route, anchor);
+  const hintMsg1 = msgs1.find(m => (m.content ?? '').includes('[r!]'));
+  assert(hintMsg1 !== undefined, 'should have task+think hint in static zone');
+  assertContains(hintMsg1!.content ?? '', '[think:max]', 'should contain think:max hint');
 });
 
 suite4.test('PromptConstructor.build 无 thinking 时不加前缀', () => {
@@ -517,11 +515,13 @@ suite4.test('PromptConstructor.build 无 thinking 时不加前缀', () => {
     allowedTools: [],
   };
 
-  const messages = pc.build(session, [], route, anchor);
-  const userMsg = messages[messages.length - 1]!;
+  pc.setTaskBehavior(route);
+  const msgs2 = pc.build(session, [], route, anchor);
+  const hintMsg2 = msgs2.find(m => (m.content ?? '').startsWith('[r] '));
+  assert(hintMsg2 !== undefined, 'should have task hint in static zone');
   assert(
-    !(userMsg.content ?? '').includes('[thinking'),
-    'should NOT contain thinking prefix when disabled',
+    !(hintMsg2!.content ?? '').includes('[think'),
+    'should NOT contain think hint when disabled',
   );
 });
 
@@ -551,20 +551,13 @@ suite4.test('PromptConstructor.build State Window 内容', () => {
   };
 
   const messages = pc.build(session, [], route, anchor);
-  // 检查 L4 State Window
-  const stateMsg = messages.find(
-    (m) => (m.content ?? '').includes('<state_window>'),
-  );
-  assert(stateMsg !== undefined, 'should contain state_window');
-  assertContains(stateMsg!.content ?? '', 'src/auth.ts', 'state window path');
-  assertContains(stateMsg!.content ?? '', 'src/app.ts', 'state window path 2');
-
-  // 检查 L5 Intent Window
-  const intentMsg = messages.find(
-    (m) => (m.content ?? '').includes('<intent_window>'),
-  );
-  assert(intentMsg !== undefined, 'should contain intent_window');
-  assertContains(intentMsg!.content ?? '', 'token 验证', 'intent window text');
+  // 检查 L7 中的 context suffix（原 L4+L5 已合并到用户消息）
+  const userMsg = messages[messages.length - 1]!;
+  assertContains(userMsg.content ?? '', '<s>', 'should contain state context');
+  assertContains(userMsg.content ?? '', 'src/auth.ts', 'state window path');
+  assertContains(userMsg.content ?? '', 'src/app.ts', 'state window path 2');
+  assertContains(userMsg.content ?? '', '<i>', 'should contain intent context');
+  assertContains(userMsg.content ?? '', 'token 验证', 'intent window text');
 });
 
 // --- 4c. planner.ts ---
@@ -642,7 +635,7 @@ suite4.test('ProgressMeter.measure 增益信号计算', () => {
         function: { name: 'file_write', arguments: '{"path":"x.ts"}' },
       },
       result: {
-        callId: 'c1', ok: true, content: 'ok',
+        callId: 'c1', toolName: 'file_write', ok: true, content: 'ok',
         diffSummary: '+5/-2 lines',
       },
     },
@@ -675,7 +668,7 @@ suite4.test('ProgressMeter.measure unified diff 解析', () => {
         function: { name: 'file_edit', arguments: '{"path":"src/foo.ts"}' },
       },
       result: {
-        callId: 'c1', ok: true, content: 'edited',
+        callId: 'c1', toolName: 'file_edit', ok: true, content: 'edited',
         diffSummary: unifiedDiff,
       },
     },
@@ -725,7 +718,7 @@ suite4.test('ProgressMeter: 循环检测 >3 次同调用', () => {
       function: { name: 'file_read', arguments: '{"path":"x.ts"}' },
     },
     result: {
-      callId: 'c1', ok: true, content: 'content', diffSummary: '+0/-0 lines',
+      callId: 'c1', toolName: 'file_read', ok: true, content: 'content', diffSummary: '+0/-0 lines',
     },
   });
 
@@ -748,13 +741,13 @@ suite4.test('WorkingMemory: State Window 同 key 覆盖', () => {
   const session = mockSession();
 
   wm.updateStateWindow(
-    { callId: 'c1', ok: true, content: 'ok', diffSummary: 'first write' },
+    { callId: 'c1', toolName: 'file_write', ok: true, content: 'ok', diffSummary: 'first write' },
     { id: 'c1', type: 'function', function: { name: 'file_write', arguments: '{"path":"src/x.ts"}' } },
     1,
   );
 
   wm.updateStateWindow(
-    { callId: 'c2', ok: true, content: 'ok', diffSummary: 'second write' },
+    { callId: 'c2', toolName: 'file_write', ok: true, content: 'ok', diffSummary: 'second write' },
     { id: 'c2', type: 'function', function: { name: 'file_write', arguments: '{"path":"src/x.ts"}' } },
     2,
   );
@@ -769,7 +762,7 @@ suite4.test('WorkingMemory: State Window LRU 淘汰', () => {
 
   for (let i = 1; i <= 7; i++) {
     wm.updateStateWindow(
-      { callId: `c${i}`, ok: true, content: 'ok', diffSummary: `op ${i}` },
+      { callId: `c${i}`, toolName: 'file_write', ok: true, content: 'ok', diffSummary: `op ${i}` },
       { id: `c${i}`, type: 'function', function: { name: 'file_write', arguments: `{"path":"src/f${i}.ts"}` } },
       i,
     );
@@ -789,7 +782,7 @@ suite4.test('WorkingMemory: Intent Window 关联 State key', () => {
 
   wm.updateIntentWindow(
     { id: 'c1', type: 'function', function: { name: 'file_write', arguments: '{"path":"src/auth.ts"}' } },
-    { callId: 'c1', ok: true, content: 'ok' },
+    { callId: 'c1', toolName: 'file_write', ok: true, content: 'ok' },
     session,
   );
 
@@ -836,7 +829,7 @@ suite4.test('SessionStore.list 列出所有会话', () => {
 suite4.test('SkillsLoader.activeTools 包含内建工具', () => {
   const sl = new SkillsLoader();
   const tools = sl.activeTools();
-  assert(tools.length >= 16, `expected >= 16 tools, got ${tools.length}`);
+  assert(tools.length >= 22, `expected >= 22 tools, got ${tools.length}`);
 
   const names = tools.map((t) => t.name);
   assert(names.includes('file_read'), 'should have file_read');
@@ -845,6 +838,12 @@ suite4.test('SkillsLoader.activeTools 包含内建工具', () => {
   assert(names.includes('file_delete'), 'should have file_delete');
   assert(names.includes('shell_bash'), 'should have shell_bash');
   assert(names.includes('git_diff'), 'should have git_diff');
+  // ★ 5 个新工具
+  assert(names.includes('tool_search'), 'should have tool_search');
+  assert(names.includes('file_search'), 'should have file_search');
+  assert(names.includes('memory_recall'), 'should have memory_recall');
+  assert(names.includes('symbol_find'), 'should have symbol_find');
+  assert(names.includes('shell_test'), 'should have shell_test');
 });
 
 suite4.test('SkillsLoader.registerSkill + 渐进式展开', () => {
@@ -881,7 +880,7 @@ suite4.test('MCPClient.getStatuses 初始状态 disconnected', () => {
   ]);
   const statuses = client.getStatuses();
   assert(statuses.length === 1, 'should have 1 server status');
-  assert(statuses[0]!.status === 'disconnected', 'initial status should be disconnected');
+  assert(statuses[0]!.status === 'offline', 'initial status should be offline');
   assert(statuses[0]!.tools.length === 0, 'initial tools should be empty');
 });
 
@@ -1126,7 +1125,7 @@ suite6.test('所有 5 个契约各有一组 "通过" 测试', () => {
 // Suite 7: 端到端 — Engine + MockLLM 完整主循环
 // ============================================================================
 
-import type { INativeTools, IEventLogger, AgentConfig } from '@comdr/core';
+import type { IEventLogger, AgentConfig } from '@comdr/core';
 
 const suite7 = new TestSuite('7. 端到端 — Engine 主循环（MockLLM）');
 
@@ -1183,8 +1182,10 @@ suite7.test('Engine.run 纯文本响应 → completed', async () => {
 
   assert(events.includes('text_delta'), 'should have text_delta');
   assert(events.includes('done'), 'should have done event');
-  assert(result.turnsUsed >= 0, 'result has turnsUsed');
-  assert(result.tokensUsed >= 0, 'result has tokensUsed');
+  // ★ result 是 done event，RunResult 在 result.result 里
+  assert(result !== null, 'should have done result');
+  assert(result.result.turns >= 0, 'result has turns');
+  assert(result.result.tokensUsed >= 0, 'result has tokensUsed');
 });
 
 suite7.test('Engine.run tool_call → tool_result 链路', async () => {
@@ -1402,10 +1403,10 @@ suite8.test('ReflectionEngine 失败分析 LLM 调用记录 token', async () => 
     },
     {
       callId: 'call_1',
+      toolName: 'file_write',
       ok: false,
-      content: 'permission denied',
-      errorCode: 'PERMISSION_DENIED',
-      errorCategory: 'permission_denied',
+      content: 'execution failed due to unknown error',
+      errorCategory: 'execution_error',
     },
     mockSession(),
   );

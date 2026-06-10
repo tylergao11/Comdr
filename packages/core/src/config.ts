@@ -33,6 +33,7 @@ import {
   THINKING_TYPE,
   THINKING_EFFORT,
   PERMISSION_MODE as PERM_MODE,
+  MODEL_ROLE,
 } from './types.js';
 import { ConfigValidationError } from './contracts.js';
 
@@ -44,7 +45,7 @@ const DEFAULTS: AgentConfig = {
   llm: {
     apiKey: '',
     baseUrl: 'https://api.deepseek.com',
-    model: 'deepseek-v4-pro',
+    model: MODEL_ROLE.PRIMARY,
     maxTokens: 8192,
     thinking: { type: THINKING_TYPE.ENABLED, effort: THINKING_EFFORT.HIGH },
   },
@@ -52,7 +53,7 @@ const DEFAULTS: AgentConfig = {
     projectPath: '',
     skillsDir: 'skills',
     mcpServers: [],
-    comdrMdPath: 'comdr.md',
+    comdrMdPath: 'COMDR.md',
   },
   agent: {
     maxTurns: 50,

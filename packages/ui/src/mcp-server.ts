@@ -16,8 +16,10 @@ import { createInterface } from 'node:readline';
 import type { IEngine, RunMode } from '@comdr/core';
 import { AGENT_EVENT, RUN_MODE } from '@comdr/core';
 
-/** MCP tool call 响应最大字符数，超过则截断尾部 */
-const MAX_OUTPUT_CHARS = 200_000;
+import { SYSTEM } from '@comdr/core';
+
+/** MCP tool call 响应最大字符数——来自 @comdr/core 唯一配置源 */
+const MAX_OUTPUT_CHARS = SYSTEM.MCP_MAX_OUTPUT_CHARS;
 
 // ============================================================================
 // JSON-RPC 2.0 类型

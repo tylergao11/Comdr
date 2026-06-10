@@ -22,6 +22,12 @@ import type {
   SkillManifest,
 } from '@comdr/core/types';
 import { TOOL_PERMISSION, SYSTEM } from '@comdr/core';
+import {
+  tokenize,
+  BM25Scorer,
+  contextualPrefix,
+} from './retrieval.js';
+import { ADVANCED_TOOLS } from './tools/advanced-tools.js';
 
 // ============================================================================
 // §1 类型定义
@@ -48,6 +54,13 @@ export class SkillsLoader {
   /** 已注入正文的 skill 集合 */
   private expandedSkills: Set<string> = new Set();
 
+  /**
+   * ★ BM25 语义检索索引。
+   * 对 skill 名称 + description + triggers 建索引，用于 trigger 关键词不匹配时的降级。
+   */
+  private semanticIndex: BM25Scorer | null = null;
+  private semanticDocTokens: Map<string, Map<string, number>> = new Map();
+
   // --------------------------------------------------------------------------
   // 静态 skill 管理
   // --------------------------------------------------------------------------
@@ -57,6 +70,7 @@ export class SkillsLoader {
    */
   registerSkill(manifest: SkillManifest): void {
     this.registry.set(manifest.name, manifest);
+    this.rebuildSemanticIndex();
   }
 
   /**
@@ -132,6 +146,9 @@ export class SkillsLoader {
 
     // 内建工具（始终可用）
     tools.push(...BUILTIN_TOOLS);
+
+    // ★ 高级工具（TS 层工具——tool_search, file_search, memory_recall, symbol_find, shell_test）
+    tools.push(...ADVANCED_TOOLS);
 
     // 静态 skill（渐进式：正文未注入时只提供 name + description）
     for (const [, skill] of this.registry) {
@@ -236,6 +253,8 @@ export class SkillsLoader {
     if (!existsSync(dirPath)) return 0;
 
     this._scanRecursive(dirPath, dirPath);
+    // ★ 扫描完成后重建 BM25 语义索引
+    this.rebuildSemanticIndex();
     return this.registry.size;
   }
 
@@ -441,6 +460,8 @@ export class SkillsLoader {
    * 检查用户输入中是否包含任何 skill 的触发词——
    * 命中则自动 expandSkill()，使下一轮的 tool definition 包含完整正文。
    *
+   * 若关键词无匹配 → 降级到 BM25 语义检索。
+   *
    * @param userInput  用户当前输入
    * @returns          被自动展开的 skill 名列表
    */
@@ -448,6 +469,7 @@ export class SkillsLoader {
     const inputLower = userInput.toLowerCase();
     const matched: string[] = [];
 
+    // 策略 1: 关键词精确匹配
     for (const [name, skill] of this.registry) {
       if (this.expandedSkills.has(name)) continue;
       for (const trigger of skill.triggers) {
@@ -459,7 +481,79 @@ export class SkillsLoader {
       }
     }
 
+    // 策略 2: ★ BM25 语义降级——关键词没命中但语义相关
+    if (matched.length === 0 && this.semanticIndex) {
+      const semanticMatches = this.retrieveSemantically(
+        userInput,
+        SYSTEM.SKILLS_RETRIEVAL_TOPK,
+      );
+      for (const { name } of semanticMatches) {
+        if (!this.expandedSkills.has(name)) {
+          this.expandSkill(name);
+          matched.push(name);
+        }
+      }
+    }
+
     return matched;
+  }
+
+  /**
+   * ★ BM25 语义检索——当 trigger 关键词不匹配时降级调用。
+   *
+   * 用 BM25 + Contextual Prefix 对 skill 描述建索引，
+   * 按用户输入语义匹配最相关的 skill。
+   *
+   * @param input  用户输入
+   * @param topK   返回最相关 K 个
+   * @returns      按 BM25 score 降序排列，仅返回 score > 阈值的
+   */
+  retrieveSemantically(
+    input: string,
+    topK: number = SYSTEM.SKILLS_RETRIEVAL_TOPK,
+  ): Array<{ name: string; score: number }> {
+    if (!this.semanticIndex) return [];
+
+    const queryTokens = tokenize(input);
+
+    const scored: Array<{ name: string; score: number }> = [];
+    for (const [name, docTokens] of this.semanticDocTokens) {
+      const score = this.semanticIndex.score(queryTokens, docTokens);
+      if (score >= SYSTEM.SKILLS_SEMANTIC_THRESHOLD) {
+        scored.push({ name, score });
+      }
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, topK);
+  }
+
+  /**
+   * ★ 重建 BM25 语义索引（registerSkill 后调用）。
+   */
+  private rebuildSemanticIndex(): void {
+    if (this.registry.size === 0) {
+      this.semanticIndex = null;
+      this.semanticDocTokens.clear();
+      return;
+    }
+
+    const bm25 = new BM25Scorer();
+    const docTokens = new Map<string, Map<string, number>>();
+
+    for (const [name, skill] of this.registry) {
+      // ★ 用 Contextual Prefix 构建检索文本
+      const text = contextualPrefix(
+        `${skill.description} ${skill.triggers.join(' ')}`,
+        { source: `skill:${name}` },
+      );
+      const tokens = tokenize(text);
+      bm25.addDocument(tokens);
+      docTokens.set(name, tokens);
+    }
+
+    this.semanticIndex = bm25;
+    this.semanticDocTokens = docTokens;
   }
 
   // --------------------------------------------------------------------------
@@ -472,6 +566,8 @@ export class SkillsLoader {
   reset(): void {
     this.runtimeSkills.clear();
     this.expandedSkills.clear();
+    this.semanticIndex = null;
+    this.semanticDocTokens.clear();
   }
 
   /**
@@ -504,7 +600,8 @@ export class SkillsLoader {
 const BUILTIN_TOOLS: ToolDefinition[] = [
   {
     name: 'file_read',
-    description: 'Read a file from the local filesystem.',
+    description:
+      'Read a file. Modes: "full" (default, supports offset/limit), "summary" (structured symbol list — functions, classes, imports), "selector" (specific symbol definition with context). Use summary for large files to save context, selector to jump directly to a function/class.',
     parameters: {
       type: 'object',
       properties: {
@@ -512,19 +609,27 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
           type: 'string',
           description: 'Absolute path to the file to read',
         },
+        mode: {
+          type: 'string',
+          description: '"full" (default), "summary" (symbol list), or "selector" (symbol definition with context)',
+        },
+        symbol: {
+          type: 'string',
+          description: 'Symbol name for selector mode',
+        },
         offset: {
           type: 'number',
-          description: 'Line number to start reading from',
+          description: 'Line number to start reading from (full mode)',
         },
         limit: {
           type: 'number',
-          description: 'Number of lines to read',
+          description: 'Number of lines to read (full mode)',
         },
       },
       required: ['path'],
     },
     permission: TOOL_PERMISSION.READ_ONLY,
-    timeoutMs: 5000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_FAST,
   },
   {
     name: 'file_write',
@@ -545,7 +650,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       required: ['path', 'content'],
     },
     permission: TOOL_PERMISSION.DESTRUCTIVE,
-    timeoutMs: 10000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_NORMAL,
   },
   {
     name: 'file_edit',
@@ -576,7 +681,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       required: ['path', 'old_string', 'new_string'],
     },
     permission: TOOL_PERMISSION.DESTRUCTIVE,
-    timeoutMs: 10000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_NORMAL,
   },
   {
     name: 'file_delete',
@@ -592,7 +697,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       required: ['path'],
     },
     permission: TOOL_PERMISSION.DESTRUCTIVE,
-    timeoutMs: 5000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_FAST,
   },
   {
     name: 'file_glob',
@@ -612,7 +717,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       required: ['pattern'],
     },
     permission: TOOL_PERMISSION.READ_ONLY,
-    timeoutMs: 10000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_NORMAL,
   },
   {
     name: 'file_grep',
@@ -637,7 +742,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       required: ['pattern'],
     },
     permission: TOOL_PERMISSION.READ_ONLY,
-    timeoutMs: 15000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_SEARCH,
   },
   {
     name: 'shell_bash',
@@ -658,7 +763,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       required: ['command'],
     },
     permission: TOOL_PERMISSION.DESTRUCTIVE,
-    timeoutMs: 60000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_SHELL,
   },
   {
     name: 'file_ls',
@@ -673,7 +778,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       },
     },
     permission: TOOL_PERMISSION.READ_ONLY,
-    timeoutMs: 5000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_FAST,
   },
   {
     name: 'git_diff',
@@ -694,7 +799,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       },
     },
     permission: TOOL_PERMISSION.READ_ONLY,
-    timeoutMs: 15000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_SEARCH,
   },
   {
     name: 'git_status',
@@ -709,7 +814,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       },
     },
     permission: TOOL_PERMISSION.READ_ONLY,
-    timeoutMs: 10000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_NORMAL,
   },
   {
     name: 'git_log',
@@ -725,7 +830,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       },
     },
     permission: TOOL_PERMISSION.READ_ONLY,
-    timeoutMs: 10000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_NORMAL,
   },
   {
     name: 'git_add',
@@ -742,7 +847,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       required: ['files'],
     },
     permission: TOOL_PERMISSION.DESTRUCTIVE,
-    timeoutMs: 10000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_NORMAL,
   },
   {
     name: 'git_commit',
@@ -758,7 +863,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       required: ['message'],
     },
     permission: TOOL_PERMISSION.DESTRUCTIVE,
-    timeoutMs: 15000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_SEARCH,
   },
   {
     name: 'git_revert',
@@ -775,7 +880,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       required: ['commit'],
     },
     permission: TOOL_PERMISSION.DESTRUCTIVE,
-    timeoutMs: 15000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_SEARCH,
   },
   {
     name: 'lsp_symbols',
@@ -796,7 +901,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       required: ['path'],
     },
     permission: TOOL_PERMISSION.READ_ONLY,
-    timeoutMs: 20000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_ANALYSIS,
   },
   {
     name: 'lsp_diagnostics',
@@ -813,7 +918,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       required: ['path'],
     },
     permission: TOOL_PERMISSION.READ_ONLY,
-    timeoutMs: 10000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_NORMAL,
   },
   {
     name: 'lsp_structure',
@@ -830,6 +935,6 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
       required: ['path'],
     },
     permission: TOOL_PERMISSION.READ_ONLY,
-    timeoutMs: 10000,
+    timeoutMs: SYSTEM.TOOL_TIMEOUT_NORMAL,
   },
 ];

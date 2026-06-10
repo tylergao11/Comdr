@@ -10,6 +10,7 @@
   "references": [
     { "path": "../core" },
     { "path": "../llm" },
+    { "path": "../tools" },
     { "path": "../engine" }
   ]
 }

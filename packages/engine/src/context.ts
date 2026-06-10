@@ -38,7 +38,7 @@ import type {
 } from '@comdr/core/types';
 import type { IDeepSeekClient } from '@comdr/core/contracts';
 import { SYSTEM, MASKED_PREFIX, MESSAGE_ROLE, THINKING_TYPE } from '@comdr/core';
-import { summarizeToolOutput, summarizeSegmentText } from './smart-truncate.js';
+import { summarizeToolOutput, summarizeSegmentText, compressByLevel } from './smart-truncate.js';
 import { extractAndParseJSON } from './utils.js';
 
 // ============================================================================
@@ -51,12 +51,20 @@ import { extractAndParseJSON } from './utils.js';
 
 export class ContextManager {
   private readonly llm: IDeepSeekClient;
+  /** ★ 可选上下文专用模型——压缩/摘要任务优先使用。未设置时回退到 llm。 */
+  private readonly contextLLM: IDeepSeekClient;
   private persistentSummary: StructuredSummary | null = null;
   /** 压缩/摘要过程中消耗的 token 数（由 Engine 轮询后累加到 session） */
   private _tokensSpent = 0;
 
-  constructor(llm: IDeepSeekClient) {
+  constructor(llm: IDeepSeekClient, contextLLM?: IDeepSeekClient) {
     this.llm = llm;
+    this.contextLLM = contextLLM ?? llm;
+  }
+
+  /** ★ 获取上下文专用 LLM（flash 模型，thinking=disabled） */
+  private getLLMForCompaction(): IDeepSeekClient {
+    return this.contextLLM;
   }
 
   /** 获取本轮压缩消耗的 token 数，读取后自动清零 */
@@ -141,47 +149,79 @@ export class ContextManager {
   // --------------------------------------------------------------------------
 
   /**
-   * Stage 1: Observe (观察掩码)
+   * Stage 1: Observe (差异化压缩)
    *
-   * 对超过 SYSTEM.COMPACTION_OBSERVE_MASK_TURNS 轮的历史消息:
-   *   - 保留 tool call name + ok/error
-   *   - 删除完整 tool output 内容
+   * ★ Phase 2: 替换旧的一刀切掩码，改用三级差异化压缩:
+   *   - preserve: 错误/测试/diff 等高价值消息 → 完整保留
+   *   - summarize: 中等价值 → 智能摘要
+   *   - squash: 低价值 → 极端压缩
+   *
+   * 最后 N 条 tool result 保留完整（preserve），
+   * 从后往前分配 token 预算，超预算后剩余全部 squash。
    */
   applyObservationMask(messages: Message[]): Message[] {
-    // 统计 tool result 数量，保留最后的 N 条完整
-    let toolResultCount = 0;
-    const indices: number[] = [];
-
+    // 收集 tool result 位置（从后往前）
+    const toolIndices: number[] = [];
     for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i]!;
-      if (msg.role === MESSAGE_ROLE.TOOL) {
-        indices.push(i);
-        toolResultCount++;
+      if (messages[i]!.role === MESSAGE_ROLE.TOOL) {
+        toolIndices.push(i);
       }
     }
 
-    // 最后 SYSTEM.COMPACTION_OBSERVE_MASK_TURNS * 2 条 tool result 保留完整
-    const keepCount = SYSTEM.COMPACTION_OBSERVE_MASK_TURNS * 2;
-    const maskIndices = new Set(indices.slice(keepCount));
+    // 最后 N*2 条无条件 preserve
+    const alwaysKeep = SYSTEM.COMPACTION_OBSERVE_MASK_TURNS * 2;
+    const preservedSet = new Set(toolIndices.slice(0, alwaysKeep));
+    const maskTargets = toolIndices.slice(alwaysKeep);
+
+    if (maskTargets.length === 0) return messages;
+
+    // ★ 差异化压缩：对每条目标消息打分
+    const compressed = new Map<number, { level: string; content: string }>();
+    for (const idx of maskTargets) {
+      const msg = messages[idx]!;
+      // 尝试从 tool_call_id 找到对应的 tool call name
+      const toolName = this.inferToolName(messages, msg);
+      const result = compressByLevel(msg.content ?? '', toolName);
+      compressed.set(idx, result);
+    }
 
     return messages.map((msg, i) => {
-      if (!maskIndices.has(i)) return msg;
-
-      // 掩码：只保留 ok/error + 工具名
-      const summary = this.summarizeToolResult(msg.content ?? '');
-
+      if (preservedSet.has(i)) return msg;
+      const c = compressed.get(i);
+      if (!c) return msg;
+      if (c.level === 'preserve') return msg;
       return {
         ...msg,
-        content: `${MASKED_PREFIX} ${summary}`,
+        content: c.level === 'squash' ? c.content : `${MASKED_PREFIX} ${c.content}`,
       };
     });
+  }
+
+  /**
+   * 从 messages 中推断 tool result 对应的工具名。
+   * 通过 tool_call_id 反向查找前面的 assistant + tool_calls 消息。
+   */
+  private inferToolName(messages: Message[], toolMsg: Message): string {
+    const callId = toolMsg.tool_call_id;
+    if (!callId) return 'unknown';
+    // 往前找包含此 callId 的 assistant 消息
+    for (let i = messages.indexOf(toolMsg) - 1; i >= 0; i--) {
+      const msg = messages[i]!;
+      if (msg.role === MESSAGE_ROLE.ASSISTANT && msg.tool_calls) {
+        for (const tc of msg.tool_calls) {
+          if (tc.id === callId) return tc.function.name;
+        }
+      }
+    }
+    return 'unknown';
   }
 
   /**
    * 将 tool result 智能压缩——提取错误/测试结果/有意义的摘要，
    * 而非盲取首行截断。
    *
-   * @see smart-truncate.ts summarizeToolOutput()
+   * @deprecated 替换为 compressByLevel()。保留用于向后兼容。
+   * @see smart-truncate.ts compressByLevel()
    */
   private summarizeToolResult(content: string): string {
     return summarizeToolOutput(content);
@@ -203,11 +243,11 @@ export class ContextManager {
     for (let i = 0; i < original.length && i < masked.length; i++) {
       const orig = original[i]!;
       const mask = masked[i]!;
-      // 检测 content 是否被截断
+      // 检测 content 是否被截断（包括 [masked] 和 [squashed]）
       if (
         orig.content &&
         mask.content &&
-        mask.content.startsWith(MASKED_PREFIX) &&
+        (mask.content.startsWith(MASKED_PREFIX) || mask.content.startsWith('[squashed]')) &&
         orig.content !== mask.content
       ) {
         result.push(orig);
@@ -250,7 +290,7 @@ export class ContextManager {
     ].join('\n');
 
     try {
-      const response = await this.llm.chat({
+      const response = await this.getLLMForCompaction().chat({
         messages: [
           { role: MESSAGE_ROLE.SYSTEM, content: prompt },
         ],
@@ -422,7 +462,7 @@ export class ContextManager {
   ): Promise<{ messages: Message[]; result: CompactionResult }> {
     try {
       const compactPrompt = this.buildCompactPrompt(session);
-      const response = await this.llm.chat({
+      const response = await this.getLLMForCompaction().chat({
         messages: [
           { role: MESSAGE_ROLE.SYSTEM, content: compactPrompt },
           {
@@ -612,6 +652,17 @@ export class ContextManager {
    */
   getPersistentSummary(): StructuredSummary | null {
     return this.persistentSummary;
+  }
+
+  /**
+   * ★ 将 persistentSummary 序列化为文本（用于 prompt 动态区注入）。
+   *
+   * 摘要已经很短（几百 token），不检索直接注入。
+   * 每轮压缩后可能更新，放在 L4.5 动态区。
+   */
+  getSummaryText(): string {
+    if (!this.persistentSummary) return '';
+    return this.serializeSummary(this.persistentSummary);
   }
 
   /**

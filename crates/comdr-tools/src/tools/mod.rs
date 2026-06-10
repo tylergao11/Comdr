@@ -57,20 +57,45 @@ pub struct ToolOutput {
 }
 
 impl ToolOutput {
+    /// Legacy — kept for internal use where structured format isn't needed.
     pub fn success(content: impl Into<String>) -> Self {
-        Self {
-            ok: true,
-            content: Some(content.into()),
-            error_code: None,
-        }
+        Self { ok: true, content: Some(content.into()), error_code: None }
     }
 
     pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            content: Some(message.into()),
-            error_code: Some(code.into()),
+        Self { ok: false, content: Some(message.into()), error_code: Some(code.into()) }
+    }
+
+    /// ★ Unified success format: [OK] tool_name k=v k=v
+    pub fn ok(tool: &str, pairs: &[(&str, &str)], detail: Option<&str>) -> Self {
+        let mut s = format!("[OK] {}", tool);
+        for (k, v) in pairs {
+            s.push(' ');
+            s.push_str(k);
+            s.push('=');
+            s.push_str(v);
         }
+        if let Some(d) = detail {
+            s.push('\n');
+            s.push_str(d);
+        }
+        Self { ok: true, content: Some(s), error_code: None }
+    }
+
+    /// ★ Unified error format: [ERR] tool_name k=v error=msg
+    pub fn err(tool: &str, error_code: &str, pairs: &[(&str, &str)], detail: Option<&str>) -> Self {
+        let mut s = format!("[ERR] {} error={}", tool, error_code);
+        for (k, v) in pairs {
+            s.push(' ');
+            s.push_str(k);
+            s.push('=');
+            s.push_str(v);
+        }
+        if let Some(d) = detail {
+            s.push('\n');
+            s.push_str(d);
+        }
+        Self { ok: false, content: Some(s), error_code: Some(error_code.to_string()) }
     }
 }
 

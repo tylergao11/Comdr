@@ -5,6 +5,37 @@
 
 ---
 
+## 〇、核心原则——高于一切
+
+### 这是 Agent 项目
+
+Comdr 的本质是 **编排层 + 执行层** 承担绝大部分复杂任务。LLM 会漂移、会犯错——不要把关键逻辑寄托在 LLM 的"理解"上。确定性逻辑放编排层（TypeScript），性能敏感逻辑放执行层（Rust）。LLM 只做它擅长的：自然语言理解和生成。
+
+### 禁止硬编码
+
+**禁止魔法数字、魔法字符串。** 同一事实不得在多处抢定义。任何字符串字面量、数值阈值，只要出现超过一次，或具有语义含义，必须定义为常量。全局常量统一在 `packages/core/src/types.ts` 底部常量区定义，通过 `@comdr/core` 的 `index.ts` 导出。
+
+### 单真理源
+
+每个概念只能有一个定义位置。跨 Agent 共享的类型 → `@comdr/core/types.ts`。跨 Agent 共享的接口 → `@comdr/core/contracts.ts`。只属于自己的 → 自己包里。发现重复定义立即合并，不留任何"两个地方各定义一份"的代码。
+
+### 找根因
+
+遇到问题先问自己三问：
+1. **最佳方案是什么？**——不是最快的方案，不是最省事的方案。
+2. **影响哪些部分？**——改一个类型，所有消费者是否同步？
+3. **这是真实原因吗？**——修的是症状还是根因？一层层往下挖。
+
+### 当自己的项目维护
+
+不管代码谁写的，看到问题就修干净。不能因为"这不是我开发的模块"就跳过。Comdr 是一个整体，任何角落的烂代码都会最终影响整个系统。
+
+### 先讨论，不边想边做
+
+不清晰的地方提出来探讨，达成共识后再动手。不允许一边写一边设计——那是 bug 的温床。
+
+---
+
 ## 一、项目概览
 
 ```
@@ -44,6 +75,17 @@ emit({ type: AGENT_EVENT.TEXT_DELTA, content: 'hello' });
 emit({ type: 'text_dalta', content: 'hello' }); // 拼写错误编译器不报
 ```
 
+**禁止魔法数字**——用 `SYSTEM` 常量对象：
+
+```typescript
+// ✅
+import { SYSTEM } from '@comdr/core';
+if (stalledTurns >= SYSTEM.MAX_STALLED_TURNS) { /* abort */ }
+
+// ❌
+if (stalledTurns >= 2) { /* 2 是什么意思？为什么是 2？ */ }
+```
+
 可用常量：`AGENT_EVENT`, `TOOL_PERMISSION`, `PERMISSION_MODE`, `RUN_MODE`, `TASK_TYPE`, `THINKING_TYPE`, `THINKING_EFFORT`, `MESSAGE_ROLE`, `SERVER_STATUS`, `ERROR_CATEGORY`, `TERMINATION_REASON`, `SYSTEM`.
 
 ---
@@ -56,7 +98,7 @@ emit({ type: 'text_dalta', content: 'hello' }); // 拼写错误编译器不报
 
 ```
 @comdr/core  (Agent 1 维护)
-  ├── types.ts      ← 所有共享类型定义
+  ├── types.ts      ← 所有共享类型定义 + 全局常量
   ├── contracts.ts  ← 所有 Agent 间边界接口
   └── index.ts      ← 分层导出
        │
@@ -97,13 +139,11 @@ emit({ type: 'text_dalta', content: 'hello' }); // 拼写错误编译器不报
 ### 3.4 修改契约的流程
 
 ```
-1. 提 PR 到 @comdr/core 的 types.ts 或 contracts.ts
-2. PR 描述写清楚: 为什么改、影响哪些 Agent
-3. 所有受影响的 Agent 的 owner 必须 review
-4. 合并后，所有 Agent 重新 npm install + tsc -b 验证编译
+1. 改 @comdr/core 的 types.ts 或 contracts.ts
+2. 描述清楚: 为什么改、影响哪些 Agent
+3. 所有受影响的 Agent 必须 review
+4. 合并后，所有 Agent 重新 pnpm build && pnpm typecheck 验证编译
 ```
-
-**现阶段没有正式审批流程，但 PR 必须让受影响的人看到。**
 
 ### 3.5 禁止事项
 
@@ -112,6 +152,7 @@ emit({ type: 'text_dalta', content: 'hello' }); // 拼写错误编译器不报
 ❌ 用 any 绕过类型检查
 ❌ 在 @comdr/core 里引入运行时依赖（core 只含类型 + 常量 + 纯函数）
 ❌ 循环依赖: core → llm → engine → core（tsconfig references 已防止）
+❌ 魔法数字 / 魔法字符串——所有字面量必须来自常量对象
 ```
 
 ---
@@ -176,7 +217,7 @@ pnpm lint             # ESLint 检查
 | 所有 agent thinking 丢失 | reasoning_content 完整回传链 | Agent 2 client.ts |
 | Aider 异步压缩竞态 | 同步压缩，no background thread | Agent 4 context.ts |
 | LLM 修 bug 反复失败 | reasoning_content 回注 + Chat Prefix Completion 自动纠正 | Agent 4 reflection.ts selfCorrect() |
-| 模型不知道项目约定 | comdr.md 项目专属指令，进入工作区自动加载 | Agent 4 prompt.ts + world-model.ts |
+| 模型不知道项目约定 | COMDR.md 项目专属指令，进入工作区自动加载 | Agent 4 prompt.ts + world-model.ts |
 | 所有任务同一策略 | Planner 6 模式关键词路由 | Agent 4 planner.ts |
 
 ---
@@ -190,18 +231,12 @@ packages/<name>/tests/   ← 单元测试
 tests/                   ← 集成测试（跨 Agent）
 skills/                  ← 用户自定义 SKILL.md（渐进式加载）
 crates/comdr-tools/src/  ← Rust 执行层（sdb.rs + sdb/test_feedback.rs + snapshot.rs + tools/）
-comdr.md                 ← 项目专属指令（进入工作区自动加载）
+COMDR.md                 ← 项目专属指令（进入工作区自动加载）
 ```
 
 每个包的入口文件必须叫 `index.ts`，导出包的公开 API。
 内部模块按功能拆文件，用 kebab-case 命名。
 新增 Rust 模块必须同时在 `lib.rs` 中注册 napi 导出，并在 TS 契约层同步类型。
-
-**新增模块一览（2026-06）：**
-- `packages/engine/src/world-model.ts` — comdr.md 多源自动发现
-- `crates/comdr-tools/src/sdb/test_feedback.rs` — SDB Step 6 测试发现 + 执行 + 解析（294 行）
-- `packages/core/src/types.ts` — `TestFeedback` 接口、`ToolResult.testFeedback` 字段
-- Contract B (`INativeTools`) — 新增 `discardSnapshot()` 方法
 
 ---
 
@@ -226,11 +261,14 @@ import { Message } from '@comdr/core/types'; // type 导入不能用做值
 
 ---
 
-## 十、工作建议
+## 十、Agent 开发准则
 
-1. **开始写代码前**，先读 README.md 里自己 Agent 章节的完整内容
-2. **遇到需要其他 Agent 提供的类型**，去 `@comdr/core` 查，没有就加
-3. **遇到需要在契约接口上加方法**，先问消费者是否真的需要，再改 contracts.ts
-4. **Agent 2 和 Agent 3 可以完全并行开发**——它们之间没有依赖
-5. **Agent 4 开始前**，Agent 1/2/3 的核心接口必须稳定
-6. **Agent 5 开始前**，Agent 4 的 IEngine 接口必须稳定
+1. **编排层 + 执行层扛主力。** LLM 会漂移、会犯错——确定性逻辑不放 LLM 提示词里，放 TypeScript/Rust 代码里。
+2. **开始写代码前**，先读 README.md 和 CLAUDE.md 里相关章节的完整内容。
+3. **遇到需要其他 Agent 提供的类型**，去 `@comdr/core` 查，没有就加——不在自己包里重复定义。
+4. **遇到需要在契约接口上加方法**，先确认消费者是否真的需要，再改 contracts.ts。
+5. **Agent 2 和 Agent 3 可以完全并行开发**——它们之间没有依赖。
+6. **Agent 4 开始前**，Agent 1/2/3 的核心接口必须稳定。
+7. **Agent 5 开始前**，Agent 4 的 IEngine 接口必须稳定。
+8. **遇到不清晰的设计问题**，停下来讨论，达成共识再动手——不边想边做。
+9. **发现任何模块的 bug 或坏味道**，不管原开发者是谁，修干净——这是你的项目。

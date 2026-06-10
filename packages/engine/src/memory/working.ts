@@ -22,6 +22,7 @@ import type {
   SessionState,
   ToolCall,
   ToolResult,
+  ImportanceLevel,
 } from '@comdr/core/types';
 import { SYSTEM, ERROR_CATEGORY } from '@comdr/core';
 import { safeParseArgs } from '../utils.js';
@@ -30,6 +31,71 @@ import {
   summarizeToolOutput,
   extractIntent,
 } from '../smart-truncate.js';
+
+// ============================================================================
+// §0 重要性评分
+// ============================================================================
+
+/**
+ * 从 ToolCall + ToolResult 计算操作的重要性级别。
+ *
+ * 规则:
+ *   - diffChanges > CRITICAL_THRESHOLD → critical
+ *   - diffChanges > HIGH_THRESHOLD   → high
+ *   - 核心文件扩展名 (.ts/.rs/.toml)  → +1 level
+ *   - 纯读操作 → 最高 medium
+ *   - 失败操作 → low（但保留最近 1 条用于诊断）
+ *   - 默认 → medium
+ */
+function scoreImportance(
+  call: ToolCall,
+  result: ToolResult,
+): ImportanceLevel {
+  // 失败操作 → low
+  if (!result.ok) return 'low';
+
+  const toolName = call.function.name;
+  const isWrite = ['file_write', 'file_edit', 'file_delete'].includes(toolName);
+  const isRead = ['file_read', 'file_grep', 'file_glob', 'file_ls',
+    'git_status', 'git_diff', 'git_log', 'lsp_symbols',
+    'lsp_diagnostics', 'lsp_structure'].includes(toolName);
+
+  // 计算 diff 变更量
+  let diffChanges = 0;
+  if (result.diffSummary) {
+    const nums = result.diffSummary.match(/(\d+)/g);
+    if (nums) diffChanges = nums.reduce((s, n) => s + parseInt(n, 10), 0);
+  }
+
+  let level: ImportanceLevel = 'medium';
+
+  // diff 阈值
+  if (diffChanges > SYSTEM.IMPORTANCE_DIFF_CRITICAL_THRESHOLD) {
+    level = 'critical';
+  } else if (diffChanges > SYSTEM.IMPORTANCE_DIFF_HIGH_THRESHOLD) {
+    level = 'high';
+  } else if (isWrite && diffChanges > 0) {
+    level = 'high'; // 任何有实质变更的写操作
+  }
+
+  // 纯读操作 → 不超过 medium
+  if (isRead && level !== 'critical') {
+    level = level === 'high' ? 'medium' : level;
+  }
+
+  // 核心文件扩展名 → +1 level
+  if (result.diffSummary || isWrite) {
+    const args = safeParseArgs(call.function.arguments);
+    const path = typeof args.path === 'string' ? args.path : '';
+    const ext = path.slice(path.lastIndexOf('.'));
+    if (ext && SYSTEM.IMPORTANCE_CORE_EXTENSIONS.includes(ext)) {
+      if (level === 'medium') level = 'high';
+      else if (level === 'high') level = 'critical';
+    }
+  }
+
+  return level;
+}
 
 // ============================================================================
 // §1 WorkingMemory 类
@@ -53,19 +119,29 @@ export class WorkingMemory {
   updateStateWindow(result: ToolResult, call: ToolCall, turn: number): void {
     const key = this.deriveKey(call);
     const text = this.summarizeResult(result);
+    const importance = scoreImportance(call, result);
 
-    const entry: StateEntry = { key, text, turn };
+    const entry: StateEntry = { key, text, turn, importance };
 
-    // ★ Map delete + set = LRU 晋升到末尾
+    // ★ 同 key → 删除旧条目（随后 set 到末尾 = LRU 晋升）
     if (this.stateMap.has(key)) {
       this.stateMap.delete(key);
     } else if (this.stateMap.size >= SYSTEM.MAX_STATE_WINDOW_SIZE) {
-      // 淘汰最旧的（插入顺序的第一个 key）
-      const oldest = this.stateMap.keys().next().value;
-      if (oldest !== undefined) this.stateMap.delete(oldest);
+      // ★ 重要性加权淘汰：扫所有 entry，淘汰分数最低的
+      this.evictLowestScore();
     }
 
     this.stateMap.set(key, entry);
+  }
+
+  /**
+   * ★ 重要性加权淘汰——找到 score 最低的 entry 并删除。
+   *
+   * scan O(n), n ≤ MAX_STATE_WINDOW_SIZE (5) → 可忽略
+   */
+  private evictLowestScore(): void {
+    const worst = this.findWorstScoredEntry(this.stateMap);
+    if (worst !== null) this.stateMap.delete(worst);
   }
 
   /**
@@ -113,18 +189,63 @@ export class WorkingMemory {
   ): void {
     const key = this.deriveKey(call);
     const why = this.inferIntent(call, result, session);
+    const importance = scoreImportance(call, result);
 
-    const entry: IntentEntry = { key, why, turn: session.turn };
+    const entry: IntentEntry = { key, why, turn: session.turn, importance };
 
     // ★ Map delete + set = LRU 晋升到末尾 (O(1))
     if (this.intentMap.has(key)) {
       this.intentMap.delete(key);
     } else if (this.intentMap.size >= SYSTEM.MAX_INTENT_WINDOW_SIZE) {
-      const oldest = this.intentMap.keys().next().value;
-      if (oldest !== undefined) this.intentMap.delete(oldest);
+      // ★ 重要性加权淘汰
+      this.evictLowestScoreIntent();
     }
 
     this.intentMap.set(key, entry);
+  }
+
+  /**
+   * ★ Intent 窗口的重要性加权淘汰。
+   */
+  private evictLowestScoreIntent(): void {
+    const worst = this.findWorstScoredEntry(this.intentMap);
+    if (worst !== null) this.intentMap.delete(worst);
+  }
+
+  /**
+   * ★ 通用加权淘汰——扫描 map 找到 score 最低的 key。
+   *
+   * 对 StateEntry 和 IntentEntry 均可使用（两者均有可选的 importance 字段）。
+   * scan O(n), n ≤ MAX_WINDOW_SIZE → 可忽略。
+   */
+  private findWorstScoredEntry(
+    map: Map<string, StateEntry | IntentEntry>,
+  ): string | null {
+    const entries = [...map.entries()];
+    if (entries.length === 0) return null;
+
+    const total = entries.length;
+    let worstKey: string | null = null;
+    let worstScore = Infinity;
+
+    const w = SYSTEM.IMPORTANCE_WEIGHTS;
+
+    for (let i = 0; i < entries.length; i++) {
+      const [, entry] = entries[i]!;
+      const impWeight = w[entry.importance ?? 'medium'] ?? w.medium;
+      const posNormalized = (i + 1) / total;
+      // recencyWeight: position 1 (最旧) → ~0, position N (最新) → 1
+      const recencyWeight = Math.pow(posNormalized, SYSTEM.IMPORTANCE_RECENCY_DECAY_EXPONENT);
+      // 最低 30% 保证 importance 有保底——即使最旧也不会权重为 0
+      const score = impWeight * (0.3 + 0.7 * recencyWeight);
+
+      if (score < worstScore) {
+        worstScore = score;
+        worstKey = entries[i]![0];
+      }
+    }
+
+    return worstKey;
   }
 
   /**

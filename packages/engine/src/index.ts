@@ -68,5 +68,22 @@ export { MCPClient, createMCPClient } from './mcp-client.js';
 export type { MCPServerStatus } from '@comdr/core/types';
 export type { MCPToolResult } from './mcp-client.js';
 
-// ===== World Model（comdr.md 多源自动发现） =====
-export { discoverComdrMd } from './world-model.js';
+// ===== World Model（COMDR.md 多源自动发现） =====
+export { discoverComdrMd, discoverAndRetrieve } from './world-model.js';
+export type { WorldModelChunk, WorldModelResult } from './world-model.js';
+
+// ===== 检索模块（BM25 + Contextual Prefix） =====
+export {
+  tokenize,
+  BM25Scorer,
+  contextualPrefix,
+  hashToDim,
+  cosineSimilarity,
+  l2Normalize,
+} from './retrieval.js';
+
+// ===== 工具检索 =====
+export { ToolRetriever, createToolRetriever } from './tool-retriever.js';
+export { generateRepoMap } from './repo-map.js';
+export { runSubAgent, fanOut, pipeline } from './subagent.js';
+export type { SubAgentOpts, SubAgentResult } from './subagent.js';

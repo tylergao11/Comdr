@@ -190,6 +190,12 @@ export interface ToolResult {
   /** 工具名——避免消费者跨索引查找。对应 ToolCall.function.name。 */
   toolName: string;
   ok: boolean;
+  /**
+   * ★ 统一格式化（Comdr 填充式缓存协议 v1）。
+   * 格式: 成功=`[OK] name k=v k=v`  失败=`[ERR] name key=val error=CODE`
+   * 所有实现层（Rust/TS/MCP）必须遵循。详细规范见 @comdr/core README §ToolOutputFormat。
+   * @contract Agent 3 → Agent 4 → Agent 5
+   */
   content: string | null;
   /** SDB Step 5 Diff Validate 输出 */
   diffSummary?: string;
@@ -325,6 +331,7 @@ export type AgentEvent =
   | AgentEventTurnBegin
   | AgentEventTokenUsage
   | AgentEventMCPStatus
+  | AgentEventBootstrapDone
   | AgentEventDone
   | AgentEventError;
 
@@ -379,11 +386,25 @@ export interface AgentEventTokenUsage {
   type: 'token_usage';
   /** LLM 调用后的实际 token 统计 */
   usage: TokenUsage;
+  /** ★ 前缀缓存命中率 (0-1)。计算自 prompt_cache_hit / (hit+miss) */
+  cacheHitRate?: number;
+  /** ★ 本轮静态区指纹是否与上一轮一致 */
+  cacheStable?: boolean;
+  /** ★ 当前静态区指纹（16 字符 hex） */
+  fingerprint?: string;
 }
 
 export interface AgentEventMCPStatus {
   type: 'mcp_status';
   servers: MCPServerStatus[];
+}
+
+/** ★ Bootstrap 完成——携带项目符号和文件统计 */
+export interface AgentEventBootstrapDone {
+  type: 'bootstrap_done';
+  symbolsFound: number;
+  referencesFound: number;
+  filesScanned: number;
 }
 
 // ---- 终止事件 ----
@@ -411,6 +432,19 @@ export interface AgentEventError {
  * key 稳定（如 file:src/foo.ts），同 key 覆盖
  * @contract Agent 4 内部使用
  */
+/**
+ * 操作重要性级别——用于 State/Intent Window 加权淘汰。
+ *
+ * critical: 大规模重构、核心文件修改（diffChanges > 50）
+ * high:     有实质变更的操作
+ * medium:   读操作或小改动
+ * low:      失败的操作或无关输出
+ */
+export type ImportanceLevel = 'critical' | 'high' | 'medium' | 'low';
+
+/** 消息压缩级别——用于差异化的上下文压缩策略 */
+export type CompressionLevel = 'preserve' | 'summarize' | 'squash';
+
 export interface StateEntry {
   /** 稳定 key，同 key 覆盖（如 "file:src/foo.ts"） */
   key: string;
@@ -418,6 +452,8 @@ export interface StateEntry {
   text: string;
   /** 创建轮次 */
   turn: number;
+  /** ★ 重要性级别——用于加权淘汰（非纯 LRU） */
+  importance?: ImportanceLevel;
 }
 
 /**
@@ -432,6 +468,8 @@ export interface IntentEntry {
   why: string;
   /** 创建轮次 */
   turn: number;
+  /** ★ 重要性级别——用于加权淘汰 */
+  importance?: ImportanceLevel;
 }
 
 // ============================================================================
@@ -479,8 +517,14 @@ export interface ProjectConfig {
   skillsDir: string;
   mcpServers: MCPServerConfig[];
   /**
+   * ★ 上下文管理专用模型（CodeAndSeek 双模型模式）。
+   * 设置后，压缩/摘要/反思任务使用此模型（推荐 deepseek-v4-flash）。
+   * 未设置 → 回退到主模型（向后兼容）。
+   */
+  contextModel?: string;
+  /**
    * 项目专属指令文件（类似 Claude Code 的 CLAUDE.md）。
-   * 相对于 projectPath 的路径，默认 `comdr.md`。
+   * 相对于 projectPath 的路径，默认 `COMDR.md`。
    * 文件不存在 → 静默跳过。内容注入到 System Prompt 附近。
    */
   comdrMdPath: string;
@@ -555,10 +599,12 @@ export interface SessionState {
 export interface SessionAnchor {
   /** 相关历史会话摘要（来自 episodic memory 检索） */
   relatedHistory: string[];
-  /** 当前会话 state window 摘要 */
-  stateSummary: string;
-  /** 当前会话 intent window 摘要 */
-  intentSummary: string;
+  /** @deprecated 现在在 L7 context suffix 中——此处保留向后兼容 */
+  stateSummary?: string;
+  /** @deprecated 现在在 L7 context suffix 中——此处保留向后兼容 */
+  intentSummary?: string;
+  /** ★ 跨会话反思洞察（来自 EpisodicMemory.reflect()） */
+  reflectionSummary?: string;
 }
 
 // ============================================================================
@@ -818,6 +864,24 @@ export interface EpisodeSummary {
   embedding?: number[];
 }
 
+/**
+ * ★ 跨会话反思条目——从多次会话中提取的高层抽象。
+ *
+ * 来源: Generative Agents (Park 2023) — Reflection 层。
+ *       Reflexion (Shinn 2023) — 从失败中提取教训。
+ */
+export interface ReflectionEntry {
+  id: string;
+  /** 洞察内容 */
+  insight: string;
+  /** 支撑此洞察的 episode IDs */
+  evidence: string[];
+  /** 置信度 0-1 */
+  confidence: number;
+  /** 生成时间 */
+  createdAt: string;
+}
+
 // ============================================================================
 // §16 反思系统
 // ============================================================================
@@ -883,6 +947,7 @@ export const AGENT_EVENT = {
   TURN_BEGIN: 'turn_begin',
   TOKEN_USAGE: 'token_usage',
   MCP_STATUS: 'mcp_status',
+  BOOTSTRAP_DONE: 'bootstrap_done',
   DONE: 'done',
   ERROR: 'error',
 } as const;
@@ -1005,6 +1070,24 @@ export const TERMINATION_REASON = {
 } as const;
 
 /**
+ * ★ 模型角色——Comdr 双模型架构的唯一定义源。
+ *
+ * 主模型负责 coding（thinking/代码生成/工具调用），
+ * 上下文模型负责压缩/摘要/反思（轻量、便宜、不需要 thinking）。
+ *
+ * 默认值可通过 AgentConfig.llm.model 和 ProjectConfig.contextModel 覆盖，
+ * 但代码中禁止硬编码模型名字符串——始终引用此常量。
+ *
+ * @contract Agent 2,4,5 共享——修改需通知所有消费者。
+ */
+export const MODEL_ROLE = {
+  /** 主编码模型 */
+  PRIMARY: 'deepseek-v4-pro',
+  /** 上下文管理模型——压缩/摘要/反思任务 */
+  CONTEXT: 'deepseek-v4-flash',
+} as const;
+
+/**
  * 系统范围常量
  */
 export const SYSTEM = {
@@ -1017,7 +1100,8 @@ export const SYSTEM = {
   /** 默认 token 预算 */
   DEFAULT_TOKEN_BUDGET: 200_000,
   /** 上下文压缩触发阈值 */
-  COMPACTION_THRESHOLD_SNIP: 0.8,
+  /** ★ 从 0.8 降到 0.25——LLM 在 30K token 处就出现中段注意力衰减，不必等满窗口再压缩 */
+  COMPACTION_THRESHOLD_SNIP: 0.25,
   COMPACTION_THRESHOLD_COLLAPSE: 0.9,
   COMPACTION_THRESHOLD_COMPACT: 0.95,
   /** Progress Meter 连续零进展轮次 → abort */
@@ -1062,6 +1146,28 @@ export const SYSTEM = {
   DEFAULT_SKILL_TIMEOUT_MS: 60_000,
   /** 展开后 skill 默认超时毫秒 */
   EXPANDED_SKILL_TIMEOUT_MS: 120_000,
+
+  // ---- 工具超时分级（取代 skills.ts 中 18 个硬编码值） ----
+  /** 快速只读工具: file_read, file_ls, file_delete, symbol_find, tool_search */
+  TOOL_TIMEOUT_FAST: 5_000,
+  /** 标准读写工具: file_write, file_edit, file_glob, git_*, memory_recall */
+  TOOL_TIMEOUT_NORMAL: 10_000,
+  /** 搜索工具: file_grep, file_search, git_diff, git_log */
+  TOOL_TIMEOUT_SEARCH: 15_000,
+  /** 分析工具: lsp_* */
+  TOOL_TIMEOUT_ANALYSIS: 20_000,
+  /** Shell 命令: shell_bash */
+  TOOL_TIMEOUT_SHELL: 60_000,
+  /** 测试执行: shell_test, task_spawn */
+  TOOL_TIMEOUT_HEAVY: 120_000,
+
+  // ---- 路径/目录默认值 ----
+  /** 技能目录默认名 */
+  DEFAULT_SKILLS_DIR: 'skills',
+
+  // ---- 输出限制 ----
+  /** MCP 输出最大字符数 */
+  MCP_MAX_OUTPUT_CHARS: 200_000,
   /** 工作台文本截断长度 */
   WORKING_TEXT_MAX_LENGTH: 100,
   /** deriveKey cmd 截断长度 */
@@ -1070,6 +1176,24 @@ export const SYSTEM = {
   DERIVE_KEY_ARGS_LENGTH: 40,
   /** 意图提取最大长度 */
   INTENT_EXTRACT_MAX_LENGTH: 60,
+
+  // ---- 展示限制（prompt 注入的截断上限，防止单模块占用过多 token） ----
+  /** 子图最大展示节点数（超出显示 top 5 + 统计摘要） */
+  GRAPH_DISPLAY_MAX_NODES: 15,
+  /** 子图每层最多展示邻居数 */
+  GRAPH_DISPLAY_NEIGHBORS_PER_LEVEL: 4,
+  /** 时间线最多展示条目数（对齐 MAX_STATE_WINDOW_SIZE） */
+  TIMELINE_DISPLAY_MAX_ITEMS: 5,
+  /** 仓库地图每文件最多展示符号数 */
+  REPOMAP_SYMBOLS_PER_FILE: 5,
+  /** 仓库地图每目录最多展示跨引用数 */
+  REPOMAP_XREFS_PER_DIR: 3,
+  /** 仓库地图总跨引用数上限 */
+  REPOMAP_XREFS_TOTAL: 10,
+  /** unified diff 头部保留行数 */
+  DIFF_HEAD_LINES: 50,
+  /** unified diff 尾部保留行数 */
+  DIFF_TAIL_LINES: 50,
 
   // ---- 上下文压缩阈值 ----
   /** Stage 1 观察掩码保留的最近轮数 */
@@ -1081,7 +1205,7 @@ export const SYSTEM = {
 
   // ---- Prompt 构造 ----
   /** L6 最近历史保留的对话轮数 */
-  PROMPT_RECENT_HISTORY_TURNS: 5,
+  /** @deprecated L6 不再按轮次截断——由 ContextManager 按 token 预算主动压缩 */
 
   // ---- 记忆系统 ----
   /** 情景记忆 embedding 维度 */
@@ -1092,6 +1216,67 @@ export const SYSTEM = {
   SEMANTIC_RECENT_FILES_K: 10,
   /** 情景记忆中间快照间隔（轮），0 = 仅在会话结束时保存 */
   EPISODIC_SNAPSHOT_INTERVAL: 10,
+  /** 跨会话反思触发间隔——每完成 N 个会话后触发一次 */
+  EPISODIC_REFLECTION_INTERVAL: 10,
+
+  // ---- 重要性评分 ----
+  /** 重要性权重——critical/high/medium/low */
+  IMPORTANCE_WEIGHTS: {
+    critical: 1.0,
+    high: 0.7,
+    medium: 0.35,
+    low: 0.1,
+  },
+  /** diffChanges 超过此值 → critical */
+  IMPORTANCE_DIFF_CRITICAL_THRESHOLD: 50,
+  /** diffChanges 超过此值 → high */
+  IMPORTANCE_DIFF_HIGH_THRESHOLD: 10,
+  /** 核心文件扩展名——操作这些文件 +1 importance level */
+  IMPORTANCE_CORE_EXTENSIONS: ['.ts', '.tsx', '.rs', '.toml', '.json', '.yaml', '.yml'] as readonly string[],
+  /** recency 衰减指数——越大衰减越快。2.0 = 距离末尾 2 个位置的 entry 权重只有一半 */
+  IMPORTANCE_RECENCY_DECAY_EXPONENT: 2.0,
+
+  // ---- 消息级压缩评分 ----
+  /** 含错误关键词 → +分 */
+  MESSAGE_IMPORTANCE_ERROR_BONUS: 60,
+  /** 含测试结果行 → +分 */
+  MESSAGE_IMPORTANCE_TEST_BONUS: 30,
+  /** 含 diff hunk → +分 */
+  MESSAGE_IMPORTANCE_DIFF_BONUS: 20,
+  /** 内容 > 此字符数 → -分（长输出可能是噪音） */
+  MESSAGE_IMPORTANCE_LONG_THRESHOLD: 500,
+  /** 内容过长时的罚分 */
+  MESSAGE_IMPORTANCE_LONG_PENALTY: -10,
+  /** 核心文件(.ts/.rs)上的操作 → +分 */
+  MESSAGE_IMPORTANCE_CORE_FILE_BONUS: 10,
+  /** 完整保留的分数阈值 */
+  MESSAGE_IMPORTANCE_PRESERVE_THRESHOLD: 60,
+  /** 智能摘要的分数阈值（低于此值 → squash） */
+  MESSAGE_IMPORTANCE_SUMMARIZE_THRESHOLD: 20,
+
+  // ---- BM25 检索参数 ----
+  /** BM25 k1 参数——词频饱和控制 */
+  BM25_K1: 1.2,
+  /** BM25 b 参数——文档长度归一化 */
+  BM25_B: 0.75,
+
+  // ---- World Model 分块检索 ----
+  /** World Model 分块检索 Top-K */
+  WORLD_MODEL_RETRIEVAL_TOPK: 3,
+  /** COMDR.md 总字符数低于此阈值时不分块，全量注入 */
+  WORLD_MODEL_CHUNK_MIN_CHARS: 1200,
+
+  // ---- Semantic Memory Graph RAG ----
+  /** 语义记忆实体检索 Top-K */
+  SEMANTIC_ENTITY_RETRIEVAL_TOPK: 5,
+  /** 实体图 BFS 邻居遍历深度 */
+  SEMANTIC_ENTITY_BFS_DEPTH: 3,
+
+  // ---- Skills 语义降级 ----
+  /** Skills 语义检索 Top-K */
+  SKILLS_RETRIEVAL_TOPK: 2,
+  /** Skills BM25 score 激活阈值 */
+  SKILLS_SEMANTIC_THRESHOLD: 0.15,
 } as const;
 
 /**

@@ -1,8 +1,8 @@
-# comdr.md — Comdr 项目专属指令
+# COMDR.md — Comdr 项目专属指令
 
 > Comdr 进入此工作区时自动加载，注入到每轮 System Prompt 之后。
 > 文件不存在或为空 → 静默跳过，不影响运行。
-> 换目录 → 自动读取新目录的 comdr.md。
+> 换目录 → 自动读取新目录的 COMDR.md。
 
 ## 项目身份
 

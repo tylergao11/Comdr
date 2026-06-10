@@ -22,6 +22,7 @@ use napi_derive::napi;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
+mod bootstrap;
 mod sdb;
 mod snapshot;
 mod tools;
@@ -154,5 +155,19 @@ pub fn forget_snapshot(snapshot_id: String) -> bool {
 #[napi]
 pub fn list_tools() -> Vec<JsToolDefinition> {
     gate().cached_tools()
+}
+
+/// Bootstrap: scan project directory and extract symbols + references.
+///
+/// Zero LLM calls — pure regex-based static analysis.
+/// Supports TypeScript/JavaScript, Python, and Rust.
+/// Results feed into Semantic Memory's four graphs.
+///
+/// @param project_path  Absolute path to the project root directory.
+/// @returns JSON string of BootstrapReport (parsed by TS bridge layer).
+#[napi]
+pub fn bootstrap_project(project_path: String) -> String {
+    let report = bootstrap::scan_project(&project_path);
+    serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string())
 }
 

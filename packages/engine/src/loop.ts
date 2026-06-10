@@ -39,7 +39,6 @@ import type {
 import {
   AGENT_EVENT,
   SYSTEM,
-  ALL_TOOLS_SENTINEL,
   MESSAGE_ROLE,
   THINKING_TYPE,
   THINKING_EFFORT,
@@ -68,7 +67,14 @@ import { SessionStore } from './persistence.js';
 import { MCPClient } from './mcp-client.js';
 import { safeParseArgs } from './utils.js';
 import { summarizeDiff } from './smart-truncate.js';
-import { discoverComdrMd } from './world-model.js';
+import { discoverComdrMd, discoverAndRetrieve } from './world-model.js';
+import { createToolRetriever } from './tool-retriever.js';
+import { generateRepoMap } from './repo-map.js';
+import { isAdvancedTool, executeAdvancedTool } from './tools/execute.js';
+import type { ToolExecContext } from './tools/execute.js';
+import { scheduleParallel } from './scheduler.js';
+import { bootstrapProject } from '@comdr/tools';
+import type { BootstrapReport } from '@comdr/tools';
 import { resolve as pathResolve } from 'node:path';
 
 // ============================================================================
@@ -78,6 +84,7 @@ import { resolve as pathResolve } from 'node:path';
 export class Engine implements IEngine {
   // 注入的依赖
   private readonly llm: IDeepSeekClient;
+  private readonly contextLLM: IDeepSeekClient | undefined;
   private readonly tools: INativeTools | null;
   private readonly logger: IEventLogger | null;
   private readonly config: AgentConfig;
@@ -99,16 +106,23 @@ export class Engine implements IEngine {
   // 运行时状态
   private session: SessionState | null = null;
   private abortController: AbortController | null = null;
+  /** ★ 上一轮的静态区指纹——用于检测前缀缓存是否失效 */
+  private lastStaticFingerprint: string | null = null;
   /** Skills 加载日志，在 run() 启动时 yield */
   private skillsLog: string | null = null;
+  /** ★ Bootstrap 结果——构造时完成，run() 时 yield 事件 */
+  private bootstrapReport: BootstrapReport | null = null;
 
   constructor(
     llm: IDeepSeekClient,
     config: AgentConfig,
     tools: INativeTools | null = null,
     logger: IEventLogger | null = null,
+    /** ★ 可选上下文专用 LLM——压缩/摘要/反思任务优先使用。推荐 flash 模型。 */
+    contextLLM?: IDeepSeekClient,
   ) {
     this.llm = llm;
+    this.contextLLM = contextLLM;
     this.tools = tools;
     this.logger = logger;
     this.config = config;
@@ -116,7 +130,7 @@ export class Engine implements IEngine {
     // 初始化子系统
     this.reasoning = new ReasoningManager();
     this.prompt = new PromptConstructor();
-    this.context = new ContextManager(llm);
+    this.context = new ContextManager(llm, contextLLM);
     this.workingMemory = new WorkingMemory();
     this.episodicMemory = new EpisodicMemory();
     this.semanticMemory = new SemanticMemory();
@@ -128,7 +142,7 @@ export class Engine implements IEngine {
 
     // ★ 从磁盘恢复跨会话情景记忆（不存在/损坏 → 静默降级）
     const epData = this.sessionStore.loadEpisodic();
-    if (epData) this.episodicMemory.deserialize(epData);
+    if (epData) this.episodicMemory.deserialize(epData.episodes, epData.reflections);
 
     // MCP 客户端——有配置的 server 才初始化
     this.mcpClient =
@@ -136,24 +150,59 @@ export class Engine implements IEngine {
         ? new MCPClient(config.project.mcpServers)
         : null;
 
-    // ★ comdr.md — 多源自动发现（全局 + world-models + 项目根目录）
+    // ★ COMDR.md — 多源自动发现（全局 + world-models + 项目根目录）
     this.prompt.setComdrMd(
       discoverComdrMd(
         config.project.projectPath,
-        config.project.comdrMdPath || 'comdr.md',
+        config.project.comdrMdPath || 'COMDR.md',
       ),
     );
 
     // ★ 扫描 skills 目录，注册所有 SKILL.md（渐进式加载）
     const skillsDir = pathResolve(
       config.project.projectPath,
-      config.project.skillsDir || 'skills',
+      config.project.skillsDir || SYSTEM.DEFAULT_SKILLS_DIR,
     );
     const skillsCount = this.skillsLoader.scanDirectory(skillsDir);
     if (skillsCount > 0) {
-      // 启动时通过 thinking_delta 通知用户已加载的 skill 数量
-      this.skillsLog = `Loaded ${skillsCount} skills from ${config.project.skillsDir || 'skills'}/`;
+      this.skillsLog = `Loaded ${skillsCount} skills from ${config.project.skillsDir || SYSTEM.DEFAULT_SKILLS_DIR}/`;
     }
+
+    // ★ 初始化 TF-IDF 工具检索器——按语义匹配工具，替代固定白名单
+    const allToolDefs = this.skillsLoader.activeTools();
+    if (allToolDefs.length > 0) {
+      this.planner.setRetriever(createToolRetriever(allToolDefs));
+    }
+
+    // ★ Bootstrap: 静态分析项目符号和引用 → 填充 Semantic Memory
+    this.bootstrapReport = bootstrapProject(config.project.projectPath);
+    if (this.bootstrapReport) {
+      for (const sym of this.bootstrapReport.symbols) {
+        // ★ Map Bootstrap kind → SemanticNode type (interface → class)
+        const nodeType = (
+          sym.kind === 'interface' ? 'class' : sym.kind
+        ) as 'function' | 'class' | 'module' | 'variable';
+        this.semanticMemory.registerSymbol(
+          sym.name,
+          nodeType,
+          sym.file_path,
+          sym.location ?? undefined,
+        );
+      }
+      for (const ref of this.bootstrapReport.references) {
+        this.semanticMemory.registerReference(
+          ref.from_name,
+          ref.from_file,
+          ref.to_name,
+          ref.to_file ?? '',
+          ref.ref_type,
+        );
+      }
+    }
+
+    // ★ Repository Map: Aider-style 仓库拓扑视图（L1.5，同会话静态 → 缓存友好）
+    const repoMap = generateRepoMap(this.bootstrapReport);
+    if (repoMap) this.prompt.setRepoMap(repoMap);
   }
 
   // ==========================================================================
@@ -181,6 +230,8 @@ export class Engine implements IEngine {
     const session = sessionId
       ? await this.resumeSession(sessionId)
       : this.createSession(userInput);
+    // ★ 始终用实际用户输入覆盖——resumeSession 可能写入了占位文本
+    session.currentInput = userInput;
     this.session = session;
 
     // ★ 启动 MCP Servers
@@ -188,6 +239,8 @@ export class Engine implements IEngine {
       try {
         const mcpCount = await this.mcpClient.startAll();
         if (mcpCount > 0) {
+          // ★ 将 MCP 工具纳入 BM25 检索索引
+          this.planner.addToolsToRetriever(this.mcpClient.getTools());
           yield {
             type: AGENT_EVENT.THINKING_DELTA,
             content: `[Comdr] ${mcpCount} MCP servers connected`,
@@ -203,6 +256,35 @@ export class Engine implements IEngine {
       yield {
         type: AGENT_EVENT.MCP_STATUS,
         servers: this.mcpClient.getStatuses(),
+      };
+    }
+
+    // ★ World Model 分块检索（同会话不变 → L1.x 静态区缓存友好）
+    const worldModel = discoverAndRetrieve(
+      userInput,
+      this.config.project.projectPath,
+      this.config.project.comdrMdPath || 'COMDR.md',
+    );
+    if (worldModel.relevantChunks.length > 0) {
+      const chunksText = worldModel.relevantChunks
+        .map((c) => c.content)
+        .join('\n\n---\n\n');
+      this.prompt.setWorldModelContext(chunksText);
+      if (worldModel.didChunk) {
+        yield {
+          type: AGENT_EVENT.THINKING_DELTA,
+          content: `[Comdr] World model: ${worldModel.relevantChunks.length} relevant sections loaded`,
+        };
+      }
+    }
+
+    // ★ Emit bootstrap done（如果有）
+    if (this.bootstrapReport && this.bootstrapReport.files_scanned.length > 0) {
+      yield {
+        type: AGENT_EVENT.BOOTSTRAP_DONE,
+        symbolsFound: this.bootstrapReport.symbols.length,
+        referencesFound: this.bootstrapReport.references.length,
+        filesScanned: this.bootstrapReport.files_scanned.length,
       };
     }
 
@@ -273,17 +355,38 @@ export class Engine implements IEngine {
         }
         let route = this.planner.route(session.currentInput, tools);
 
+        // ★ 行为指令注入静态区——同 route 不变 = 缓存友好
+        this.prompt.setTaskBehavior(route);
+
+        // ★ L4.5 — Semantic Memory Graph RAG（每轮动态更新）
+        const entityContext = this.semanticMemory.retrieveRelevantEntities(
+          session.currentInput,
+        );
+        this.prompt.setEntityContext(entityContext);
+
+        // ★ L4.5 — Context Anchor 压缩摘要（每轮更新）
+        const summaryText = this.context.getSummaryText();
+        this.prompt.setCompactSummary(summaryText);
+
         // 1e. 构建 prompt（★ 每次构建时检索跨会话相关历史）
         const relatedHistory = this.episodicMemory
           .retrieve(session.currentInput)
           .map((ep) => ep.structuredSummary?.sessionIntent ?? ep.task)
           .filter(Boolean);
+        const reflections = this.episodicMemory.getReflections().map((r) => r.insight);
         const anchor = anchorFromWindows(
           this.workingMemory.getStateWindow(),
           this.workingMemory.getIntentWindow(),
           relatedHistory,
+          reflections.length > 0 ? reflections : undefined,
         );
         const promptMessages = this.prompt.build(session, tools, route, anchor);
+
+        // ★ Cache monitoring: always use full tools for fingerprint stability
+        const fp = this.prompt.computeStaticFingerprint(tools);
+        const cacheStable = this.lastStaticFingerprint !== null
+          && fp.fingerprint === this.lastStaticFingerprint;
+        this.lastStaticFingerprint = fp.fingerprint;
 
         // 1f. 调用 LLM（★ 真流式——Promise-queue 桥接回调→AsyncGenerator）
         yield {
@@ -309,9 +412,7 @@ export class Engine implements IEngine {
         const chatPromise = this.llm.chatStream(
           {
             messages: promptMessages,
-            tools: route.allowedTools.includes(ALL_TOOLS_SENTINEL)
-              ? tools
-              : tools.filter((t) => route.allowedTools.includes(t.name)),
+            tools,  // ★ Always send all tools — stable JSON = max prefix cache hit
             thinking: route.thinking,
             signal: this.abortController.signal,
           },
@@ -346,11 +447,29 @@ export class Engine implements IEngine {
           response.usage.promptTokens +
           response.usage.completionTokens;
 
-        // ★ Emit actual token usage
+        // ★ Emit actual token usage + cache metrics
+        const hit = response.usage.cacheHitTokens;
+        const miss = response.usage.cacheMissTokens;
+        const totalCached = hit + miss;
+        const cacheHitRate = totalCached > 0
+          ? hit / totalCached
+          : (cacheStable ? 1.0 : 0); // fallback: assume stable=cache hit
         yield {
           type: AGENT_EVENT.TOKEN_USAGE,
           usage: response.usage,
+          cacheHitRate,
+          cacheStable,
+          fingerprint: fp.fingerprint,
         };
+
+        // ★ Cache hit rate 告警
+        if (cacheStable && cacheHitRate < 0.8) {
+          this.logger?.log({
+            type: AGENT_EVENT.PROGRESS_WARNING,
+            stalledTurns: 0,
+            message: `Prefix cache hit rate ${(cacheHitRate * 100).toFixed(1)}% < 80% — static zone may have drifted (fp: ${fp.fingerprint})`,
+          });
+        }
 
         // 日志
         this.logger?.logTokens(response.usage);
@@ -361,100 +480,115 @@ export class Engine implements IEngine {
         // 1h. 处理响应
         const message = response.message;
 
-        if (message.content && !message.tool_calls) {
+        const hasToolCalls =
+          message.tool_calls != null && message.tool_calls.length > 0;
+
+        if (message.content && !hasToolCalls) {
           // 纯文本响应 → 完成（文本已在上面流式输出）
           session.messages.push(message);
           return yield* this.finalize(TERMINATION_REASON.COMPLETED, session);
         }
 
-        if (message.tool_calls && message.tool_calls.length > 0) {
+        if (hasToolCalls) {
           session.messages.push(message);
 
           const toolResults: { call: ToolCall; result: ToolResult }[] = [];
 
-          for (const call of message.tool_calls) {
-            // a. Intra-reflection: 执行前预判
-            const preCheck = this.reflection.intra(call, session, route);
-            if (preCheck.abort) {
-              yield {
-                type: AGENT_EVENT.ERROR,
-                code: preCheck.abortReason ?? TERMINATION_REASON.LOOP_DETECTED,
-                message: preCheck.skipReason ?? 'Pre-execution check failed',
-                recoverable: false,
-              };
-              return yield* this.finalize(
-                preCheck.abortReason ?? TERMINATION_REASON.LOOP_DETECTED,
-                session,
-              );
-            }
-            if (preCheck.skip) {
-              yield {
-                type: AGENT_EVENT.THINKING_DELTA,
-                content: `跳过: ${preCheck.skipReason ?? 'irrelevant'}`,
-              };
-              continue;
-            }
+                  // ★ 拓扑分层执行: 层内并行, 层间串行
+          const schedule = scheduleParallel(message.tool_calls!);
 
-            // 发送 tool_call 事件
-            yield { type: AGENT_EVENT.TOOL_CALL, call };
+          for (const batch of schedule) {
+            // ★ 收集并行执行中的事件（yield 不能在 Promise.all 内）
+            const pendingEvents: AgentEvent[] = [];
+            const batchResults = await Promise.all(
+              batch.map(async (call) => {
+                const preCheck = this.reflection.intra(call, session, route);
+                if (preCheck.abort) {
+                  pendingEvents.push({
+                    type: AGENT_EVENT.ERROR,
+                    code: preCheck.abortReason ?? TERMINATION_REASON.LOOP_DETECTED,
+                    message: preCheck.skipReason ?? 'Pre-execution check failed',
+                    recoverable: false,
+                  });
+                  return { call, skip: true, abort: true, reason: preCheck.abortReason };
+                }
+                if (preCheck.skip) {
+                  const skipMsg: Message = {
+                    role: MESSAGE_ROLE.TOOL,
+                    content: `[skipped] ${preCheck.skipReason ?? 'irrelevant'}`,
+                    tool_call_id: call.id,
+                  };
+                  session.messages.push(skipMsg);
+                  return { call, skip: true, result: { callId: call.id, toolName: call.function.name, ok: false, content: skipMsg.content! } as ToolResult };
+                }
 
-            // b. 执行工具 (Agent 3 SDB / MCP / mock)
-            const rawResult = await this.executeToolAsync(call);
-            // ★ 智能 diff 压缩——Rust 侧全量输出，TS 侧做 head+tail+sample
-            const result: ToolResult = rawResult.diffSummary
-              ? { ...rawResult, diffSummary: summarizeDiff(rawResult.diffSummary) ?? rawResult.diffSummary }
-              : rawResult;
-            toolResults.push({ call, result });
+                pendingEvents.push({ type: AGENT_EVENT.TOOL_CALL, call });
 
-            // 发送 tool_result 事件
-            yield { type: AGENT_EVENT.TOOL_RESULT, result };
+                const rawResult = await this.executeToolAsync(call);
+                const result: ToolResult = rawResult.diffSummary
+                  ? { ...rawResult, diffSummary: summarizeDiff(rawResult.diffSummary) ?? rawResult.diffSummary }
+                  : rawResult;
+                pendingEvents.push({ type: AGENT_EVENT.TOOL_RESULT, result });
 
-            // c. ★ reasoning_content 捕获（后续消息需要）
-            // 已经在 1g 步骤中捕获，这里确保与 tool_call_id 关联
+                session.messages.push({
+                  role: MESSAGE_ROLE.TOOL,
+                  content: result.content ?? (result.ok ? 'ok' : 'error'),
+                  tool_call_id: call.id,
+                });
 
-            // d. 构造 tool result message
-            const toolMessage: Message = {
-              role: MESSAGE_ROLE.TOOL,
-              content: result.content ?? (result.ok ? 'ok' : 'error'),
-              tool_call_id: call.id,
-            };
-            session.messages.push(toolMessage);
-
-            // e. Inter-reflection: 执行后审查
-            const postCheck = await this.reflection.inter(
-              call,
-              result,
-              session,
+                if (
+                  result.testFeedback?.failed &&
+                  result.testFeedback.failed > 0 &&
+                  message.reasoning_content
+                ) {
+                  const correction = await this.reflection.selfCorrect(call, result, message.reasoning_content);
+                  if (correction.corrected && correction.correctedArgs) {
+                    const correctedCall: ToolCall = {
+                      ...call,
+                      function: { ...call.function, arguments: JSON.stringify(correction.correctedArgs) },
+                    };
+                    const correctedRaw = await this.executeToolAsync(correctedCall);
+                    const correctedResult: ToolResult = correctedRaw.diffSummary
+                      ? { ...correctedRaw, diffSummary: summarizeDiff(correctedRaw.diffSummary) ?? correctedRaw.diffSummary }
+                      : correctedRaw;
+                    pendingEvents.push({ type: AGENT_EVENT.TOOL_RESULT, result: correctedResult });
+                    session.messages.push({
+                      role: MESSAGE_ROLE.TOOL,
+                      content: correctedResult.content ?? 'ok',
+                      tool_call_id: correctedCall.id,
+                    });
+                    if (result.snapshotId) this.tools?.rollback(result.snapshotId);
+                    return { call: correctedCall, result: correctedResult };
+                  }
+                }
+                return { call, result };
+              })
             );
 
-            if (postCheck.feedback) {
-              // 注入 LLM 反馈到下一轮消息
-              session.messages.push({
-                role: MESSAGE_ROLE.SYSTEM,
-                content: `[reflection] ${postCheck.feedback}`,
-              });
-            }
+            // ★ Yield all pending events in batch order
+            for (const ev of pendingEvents) yield ev;
 
-            if (postCheck.needsRollback && result.snapshotId) {
-              if (this.tools) {
-                this.tools.rollback(result.snapshotId);
+            for (const r of batchResults) {
+              if (!r.skip) toolResults.push({ call: r.call, result: r.result! });
+              if (r.abort) {
+                return yield* this.finalize(r.reason ?? TERMINATION_REASON.LOOP_DETECTED, session);
               }
-              yield {
-                type: AGENT_EVENT.THINKING_DELTA,
-                content: '⚠️ 检测到问题，已自动回滚。',
-              };
             }
+          }
 
-            // f. 更新双窗口
+          // Post-loop: 更新内存 (按原始顺序)
+          for (const { call, result } of toolResults) {
+            this.reflection.inter(call, result, session).then(postCheck => {
+              if (postCheck.feedback) {
+                session.messages.push({
+                  role: MESSAGE_ROLE.SYSTEM,
+                  content: `[reflection] ${postCheck.feedback}`,
+                });
+              }
+            });
             this.workingMemory.updateStateWindow(result, call, session.turn);
             this.workingMemory.updateIntentWindow(call, result, session);
-
-            // 更新语义记忆
-            this.semanticMemory.recordFileOperation(
-              call,
-              result,
-              session.turn,
-            );
+            this.semanticMemory.recordFileOperation(call, result, session.turn);
           }
 
           // 1i. Progress check
@@ -498,15 +632,9 @@ export class Engine implements IEngine {
               content: `思维模式升级: ${newRoute.thinking.type === THINKING_TYPE.ENABLED ? `思考:${newRoute.thinking.effort}` : '标准'}`,
             };
           }
-        } else if (!message.content) {
-          // ★ Fallback: 空响应（thinking-only，无 content 无 tools）
-          // DeepSeek V4 thinking 模式下可能只返回 reasoning_content，
-          // content 为 null。必须 push message 并 finalize，否则无限循环。
-          //
-          // 此 else if 与上方的 tool_calls 分支互斥：
-          //   - 有 tool_calls → 执行工具后 continue（自然穿透到 try-catch 后的 turn++ 逻辑）
-          //   - 无 tool_calls + 无 content → thinking-only → finalize
-          //   - 有 content + 无 tool_calls → 已在第一个 if 中 finalize
+        } else {
+          // ★ Fallback: 空响应 或 空 tool_calls——finalize 防止无限循环
+          // DeepSeek V4 thinking 模式下可能只返回 reasoning_content。
           session.messages.push(message);
           return yield* this.finalize(TERMINATION_REASON.COMPLETED, session);
         }
@@ -538,8 +666,19 @@ export class Engine implements IEngine {
           return yield* this.finalize(TERMINATION_REASON.USER_ABORTED, session);
         }
 
-        // 其他错误 → 注入反馈，尝试恢复
+        // 400 错误 → tool_calls/tool_results 不匹配，无法恢复
         const errorMsg = err instanceof Error ? err.message : String(err);
+        if (errorMsg.includes('400') || errorMsg.includes('tool_calls')) {
+          yield {
+            type: AGENT_EVENT.ERROR,
+            code: TERMINATION_REASON.API_ERROR_UNRECOVERABLE,
+            message: `API 消息结构错误（不可恢复）: ${errorMsg}`,
+            recoverable: false,
+          };
+          return yield* this.finalize(TERMINATION_REASON.API_ERROR_UNRECOVERABLE, session);
+        }
+
+        // 其他错误 → 注入反馈，尝试恢复
         yield {
           type: AGENT_EVENT.ERROR,
           code: ERROR_CATEGORY.EXECUTION_ERROR,
@@ -547,7 +686,6 @@ export class Engine implements IEngine {
           recoverable: true,
         };
 
-        // 注入错误反馈到下一轮
         session.messages.push({
           role: MESSAGE_ROLE.SYSTEM,
           content: `[error] ${errorMsg}. Try a different approach.`,
@@ -732,6 +870,17 @@ export class Engine implements IEngine {
     if (session.turn > 0) {
       const structuredSummary = this.context.getPersistentSummary();
       this.episodicMemory.consolidate(session, structuredSummary);
+      // ★ commit(): 将本会话快照合并进检索 store → 下次会话可检索
+      this.episodicMemory.commit();
+
+      // ★ 跨会话反思——每 N 个会话触发一次（优先用 flash 模型）
+      if (this.episodicMemory.shouldReflect()) {
+        const reflectLLM = this.contextLLM ?? this.llm;
+        this.episodicMemory.reflect(reflectLLM).catch(() => {
+          // 反思失败 → 静默降级，下次再试
+        });
+      }
+
       this.sessionStore.saveEpisodic(this.episodicMemory.serialize());
     }
 
@@ -748,9 +897,44 @@ export class Engine implements IEngine {
   }
 
   /**
+   * ★ 统一工具输出格式——与 Rust 层 ToolOutput::ok/err 对齐。
+   * [OK] tool_name k=v k=v  /  [ERR] tool_name key=val error=msg
+   */
+  private formatToolOutput(toolName: string, ok: boolean, pairs: Record<string, string>, detail?: string): string {
+    const parts: string[] = [ok ? `[OK] ${toolName}` : `[ERR] ${toolName}`];
+    for (const [k, v] of Object.entries(pairs)) {
+      parts.push(`${k}=${v}`);
+    }
+    if (detail) {
+      parts.push(`\n${detail}`);
+    }
+    return parts.join(' ');
+  }
+
+  /**
+   * ★ 构建 TS 层工具执行上下文。
+   */
+  private getToolExecContext(): ToolExecContext {
+    const allToolDefs = this.skillsLoader.activeTools();
+    return {
+      projectPath: this.config.project.projectPath,
+      episodicMemory: this.episodicMemory,
+      semanticMemory: this.semanticMemory,
+      toolRetriever: createToolRetriever(allToolDefs),
+      nativeTools: this.tools,
+      engine: this,
+    };
+  }
+
+  /**
    * 执行工具（Agent 3 SDB 桥接或 mock）
    */
   private async executeToolAsync(call: ToolCall): Promise<ToolResult> {
+    // ★ 高级 TS 工具 → 本地执行
+    if (isAdvancedTool(call.function.name)) {
+      return await executeAdvancedTool(call, this.getToolExecContext());
+    }
+
     // ★ MCP 工具 → 路由到 MCP Client
     if (call.function.name.startsWith('mcp__') && this.mcpClient) {
       return this.executeMCPTool(call);
@@ -860,22 +1044,27 @@ export class Engine implements IEngine {
         args,
       );
 
+      const name = call.function.name;
+      const content = result.ok
+        ? this.formatToolOutput(name, true, {}, result.content ?? undefined)
+        : this.formatToolOutput(name, false, { error: result.errorCategory ?? 'execution_error' }, result.content ?? undefined);
       return {
         callId: call.id,
-        toolName: call.function.name,
+        toolName: name,
         ok: result.ok,
-        content: result.content,
-        // ★ 传播 MCP 返回的 errorCategory（schema_invalid / execution_error / ...）
+        content,
         errorCategory: result.ok
           ? undefined
           : (result.errorCategory as ToolResult['errorCategory'] ?? 'execution_error'),
       };
     } catch (err) {
+      const name = call.function.name;
+      const msg = err instanceof Error ? err.message : String(err);
       return {
         callId: call.id,
-        toolName: call.function.name,
+        toolName: name,
         ok: false,
-        content: err instanceof Error ? err.message : String(err),
+        content: this.formatToolOutput(name, false, { error: 'execution_error' }, msg),
         errorCategory: 'execution_error',
       };
     }
@@ -885,89 +1074,14 @@ export class Engine implements IEngine {
    * Mock 工具执行（Agent 3 未就绪时的降级方案）
    */
   private mockExecuteTool(call: ToolCall): ToolResult {
-    const args = safeParseArgs(call.function.arguments);
-    const toolName = call.function.name;
-
-    switch (toolName) {
-      case 'file_read': {
-        const path = typeof args.path === 'string' ? args.path : '';
-        return {
-          callId: call.id,
-          toolName,
-          ok: false,
-          content: `[mock] Cannot read file: ${path}. Agent 3 (comdr-tools) not yet available.`,
-          errorCategory: 'execution_error',
-        };
-      }
-      case 'file_write': {
-        const path = typeof args.path === 'string' ? args.path : '';
-        return {
-          callId: call.id,
-          toolName,
-          ok: false,
-          content: `[mock] Cannot write file: ${path}. Agent 3 (comdr-tools) not yet available.`,
-          errorCategory: 'execution_error',
-        };
-      }
-      case 'file_edit': {
-        const path = typeof args.path === 'string' ? args.path : '';
-        return {
-          callId: call.id,
-          toolName,
-          ok: false,
-          content: `[mock] Cannot edit file: ${path}. Agent 3 (comdr-tools) not yet available.`,
-          errorCategory: 'execution_error',
-        };
-      }
-      case 'file_glob': {
-        const pattern = typeof args.pattern === 'string' ? args.pattern : '*';
-        return {
-          callId: call.id,
-          toolName,
-          ok: false,
-          content: `Agent 3 (comdr-tools) not available. Cannot run glob '${pattern}'. Run \`pnpm build:tools\` to compile the Rust module.`,
-          errorCategory: 'execution_error',
-        };
-      }
-      case 'file_grep': {
-        const pattern = typeof args.pattern === 'string' ? args.pattern : '';
-        return {
-          callId: call.id,
-          toolName,
-          ok: false,
-          content: `Agent 3 (comdr-tools) not available. Cannot run grep '${pattern}'. Run \`pnpm build:tools\` to compile the Rust module.`,
-          errorCategory: 'execution_error',
-        };
-      }
-      case 'shell_bash': {
-        const cmd = typeof args.command === 'string' ? args.command : '';
-        return {
-          callId: call.id,
-          toolName,
-          ok: false,
-          content: `Agent 3 (comdr-tools) not available. Cannot execute: ${cmd}. Run \`pnpm build:tools\` to compile the Rust module.`,
-          errorCategory: 'execution_error',
-        };
-      }
-      case 'file_delete': {
-        return {
-          callId: call.id,
-          toolName,
-          ok: false,
-          content: '[mock] file_delete not available without Agent 3.',
-          errorCategory: 'execution_error',
-        };
-      }
-      default: {
-        return {
-          callId: call.id,
-          toolName,
-          ok: false,
-          content: `[mock] Unknown tool: ${toolName}. Agent 3 not yet available.`,
-          errorCategory: 'execution_error',
-        };
-      }
-    }
+    const name = call.function.name;
+    return {
+      callId: call.id,
+      toolName: name,
+      ok: false,
+      content: this.formatToolOutput(name, false, { error: 'execution_error' }, 'Agent 3 not available. Run `pnpm build:tools`.'),
+      errorCategory: 'execution_error',
+    };
   }
 
 }
@@ -1006,6 +1120,7 @@ export function createEngine(
   config: AgentConfig,
   tools: INativeTools | null = null,
   logger: IEventLogger | null = null,
+  contextLLM?: IDeepSeekClient,
 ): Engine {
-  return new Engine(llm, config, tools, logger);
+  return new Engine(llm, config, tools, logger, contextLLM);
 }

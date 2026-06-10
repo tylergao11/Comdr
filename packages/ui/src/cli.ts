@@ -8,10 +8,11 @@
  *
  * @agent Agent 5 — CLI 入口
  */
-import { startTUI, streamToCLI } from './tui.js';
+import { startTUI, streamToCLI } from './tui/index.js';
 import { createEngine } from '@comdr/engine';
 import { DeepSeekClient } from '@comdr/llm';
-import { loadConfig, RUN_MODE } from '@comdr/core';
+import { createNativeTools } from '@comdr/tools';
+import { loadConfig, RUN_MODE, MODEL_ROLE } from '@comdr/core';
 import type { IEngine, RunMode } from '@comdr/core';
 
 // ============================================================================
@@ -55,8 +56,13 @@ function getEngine(): IEngine {
   try {
     const config = loadConfig(process.cwd());
     const llm = new DeepSeekClient(config.llm);
-    process.stderr.write(`[comdr] 真实引擎就绪 · ${config.llm.model} · ${config.agent.tokenBudget / 1000}K budget\n`);
-    return createEngine(llm, config);
+    const tools = createNativeTools(config.project.projectPath);
+
+    // ★ 压缩/摘要/反思默认走 flash（便宜 10x，任务不需要重型推理）
+    const flashModel = config.project.contextModel || MODEL_ROLE.CONTEXT;
+    const contextLLM = new DeepSeekClient({ ...config.llm, model: flashModel });
+    process.stderr.write(`[comdr] 真实引擎就绪 · ${config.llm.model} · context: ${flashModel} · ${config.agent.tokenBudget / 1000}K budget\n`);
+    return createEngine(llm, config, tools, undefined, contextLLM);
   } catch (err) {
     // ★ 配置错误 → 直接退出，不降级到 MockEngine
     process.stderr.write(

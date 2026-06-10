@@ -4,6 +4,7 @@
 ///   - `edit` must actually change the file (SDB Step 5 verifies this)
 ///   - `write` must be atomic where possible
 ///   - `grep` must handle large codebases efficiently
+///   - `read` supports summary mode (symbol list) and selector mode (symbol extraction)
 
 use std::sync::Arc;
 
@@ -11,6 +12,8 @@ use crate::tools::{Tool, ToolContext, ToolOutput, ToolPermission};
 
 /// Default max grep results returned.
 const DEFAULT_MAX_RESULTS: usize = 250;
+/// Default context lines for selector mode (±N lines around target).
+const SELECTOR_CONTEXT_LINES: usize = 10;
 use serde_json::Value;
 
 /// Build and return all file-related tool instances.
@@ -36,7 +39,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file from the local filesystem. Supports offset and limit for large files."
+        "Read a file. Modes: 'full' (default, supports offset/limit), 'summary' (structured symbol list — functions, classes, imports), 'selector' (specific symbol definition with ±10 context lines). Use summary for large files to save context, selector to jump to a function/class."
     }
 
     fn parameters(&self) -> Value {
@@ -47,13 +50,23 @@ impl Tool for FileReadTool {
                     "type": "string",
                     "description": "Absolute path to the file to read"
                 },
+                "mode": {
+                    "type": "string",
+                    "description": "Read mode: 'full' (default), 'summary' (structured symbol list), 'selector' (symbol definition with context)",
+                    "enum": ["full", "summary", "selector"],
+                    "default": "full"
+                },
+                "symbol": {
+                    "type": "string",
+                    "description": "Symbol name for selector mode (e.g. 'loginHandler', 'AuthService')"
+                },
                 "offset": {
                     "type": "number",
-                    "description": "Line number to start reading from (0-indexed)"
+                    "description": "Line number to start reading from (0-indexed, full mode)"
                 },
                 "limit": {
                     "type": "number",
-                    "description": "Maximum number of lines to read"
+                    "description": "Maximum lines to read (full mode)"
                 }
             },
             "required": ["path"]
@@ -71,46 +84,295 @@ impl Tool for FileReadTool {
     fn execute(&self, args: &Value, _ctx: &ToolContext) -> ToolOutput {
         let path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
-            None => return ToolOutput::error("SCHEMA_INVALID", "Missing required field: path"),
+            None => return ToolOutput::err("file_write", "SCHEMA_INVALID", &[], None),
         };
-
         let path = normalize_path(path);
+        let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("full");
 
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", format!("Cannot read '{}': {}", path, e)),
-        };
-
-        // Apply offset/limit if provided
-        let offset = args.get("offset").and_then(|v| v.as_f64()).map(|n| n as usize).unwrap_or(0);
-        let limit = args.get("limit").and_then(|v| v.as_f64()).map(|n| n as usize);
-
-        let lines: Vec<&str> = content.lines().collect();
-        let total_lines = lines.len();
-
-        let start = offset.min(total_lines);
-        let end = match limit {
-            Some(lim) => (start + lim).min(total_lines),
-            None => total_lines,
-        };
-
-        let output: String = lines[start..end]
-            .iter()
-            .enumerate()
-            .map(|(i, line)| format!("{:>6}\t{}", start + i + 1, line))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let header = format!(
-            "File: {} (lines {}-{} of {})\n\n",
-            path,
-            start + 1,
-            end,
-            total_lines
-        );
-
-        ToolOutput::success(header + &output)
+        match mode {
+            "summary" => exec_summary(&path),
+            "selector" => {
+                let symbol = match args.get("symbol").and_then(|v| v.as_str()) {
+                    Some(s) => s,
+                    None => return ToolOutput::err("file_read", "SCHEMA_INVALID", &[], Some("selector mode requires symbol")),
+                };
+                exec_selector(&path, symbol)
+            }
+            _ => exec_full(&path, args), // "full" — existing behavior
+        }
     }
+}
+
+// ============================================================================
+// file_read helpers
+// ============================================================================
+
+/// Full-mode read — existing offset/limit behavior extracted into a free function.
+fn exec_full(path: &str, args: &Value) -> ToolOutput {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return ToolOutput::err("file_read", "EXECUTION_FAILED", &[("path", path)], Some(&e.to_string())),
+    };
+
+    let offset = args.get("offset").and_then(|v| v.as_f64()).map(|n| n as usize).unwrap_or(0);
+    let limit = args.get("limit").and_then(|v| v.as_f64()).map(|n| n as usize);
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let start = offset.min(total_lines);
+    let end = match limit {
+        Some(lim) => (start + lim).min(total_lines),
+        None => total_lines,
+    };
+
+    let output: String = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:>6}\t{}", start + i + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let range = format!("{}-{}/{}", start + 1, end, total_lines);
+    ToolOutput::ok("file_read", &[("path", path), ("lines", &range)], Some(&output))
+}
+
+/// Summary mode — uses the same pattern-based extractors as bootstrap
+/// to return a structured symbol list instead of full file content.
+fn exec_summary(path: &str) -> ToolOutput {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return ToolOutput::err("file_read", "EXECUTION_FAILED", &[("path", path)], Some(&e.to_string())),
+    };
+
+    let lang = language_from_ext(path);
+    if lang.is_none() {
+        let total = content.lines().count();
+        let preview: String = content.lines().take(40).collect::<Vec<_>>().join("\n");
+        return ToolOutput::ok("file_read", &[("path", path), ("mode", "summary"), ("lines", &total.to_string())], Some(&preview));
+    }
+
+    let lang = lang.unwrap();
+    let (symbols, references) = extract_symbols(path, &content, lang);
+    let total_lines = content.lines().count();
+
+    let mut out = format!("File: {} ({} lines, {} symbols)\n\n", path, total_lines, symbols.len());
+
+    // ── Exports ──
+    let exports: Vec<_> = symbols.iter().filter(|s| s.exported).collect();
+    if !exports.is_empty() {
+        out.push_str("## Exports\n");
+        for s in &exports {
+            let loc = s.location.as_ref().map(|l| format!(" @ {}", l)).unwrap_or_default();
+            out.push_str(&format!("- {}() {}  {}{}\n",
+                s.name, loc,
+                if s.kind == "class" || s.kind == "interface" { format!("[{}] ", s.kind) } else { String::new() },
+                if s.exported { "[exported]" } else { "" },
+            ));
+        }
+        out.push('\n');
+    }
+
+    // ── Internal ──
+    let internal: Vec<_> = symbols.iter().filter(|s| !s.exported).collect();
+    if !internal.is_empty() {
+        out.push_str("## Internal\n");
+        for s in &internal {
+            let loc = s.location.as_ref().map(|l| format!(" @ {}", l)).unwrap_or_default();
+            out.push_str(&format!("- {}() {}{}\n", s.name, loc, s.kind));
+        }
+        out.push('\n');
+    }
+
+    // ── Imports ──
+    if !references.is_empty() {
+        out.push_str("## Imports\n");
+        for r in &references {
+            let target = r.to_file.as_deref().unwrap_or("(external)");
+            out.push_str(&format!("- {} from '{}'\n", r.from_name, target));
+        }
+    }
+
+    ToolOutput::ok("file_read", &[("path", path), ("mode", "summary")], Some(&out))
+}
+
+/// Selector mode — find a symbol by name and return its definition with context.
+fn exec_selector(path: &str, symbol_name: &str) -> ToolOutput {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return ToolOutput::err("file_read", "EXECUTION_FAILED", &[("path", path)], Some(&e.to_string())),
+    };
+
+    let lang = match language_from_ext(path) {
+        Some(l) => l,
+        None => return ToolOutput::err("file_read", "EXECUTION_FAILED", &[("path", path)], Some("unsupported file type")),
+    };
+
+    let (symbols, _) = extract_symbols(path, &content, lang);
+    let target = symbols.iter().find(|s| s.name == symbol_name);
+
+    let line_num = match target.and_then(|s| s.location.as_ref()) {
+        Some(loc) => {
+            // location format: "path:line" → extract line number
+            loc.split(':').last()
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(1)
+        }
+        None => {
+            return ToolOutput::err("file_read", "EXECUTION_FAILED", &[("path", path), ("symbol", symbol_name)], Some("not found, use summary mode"));
+        }
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let start = if line_num > SELECTOR_CONTEXT_LINES { line_num - SELECTOR_CONTEXT_LINES - 1 } else { 0 };
+    let end = (line_num + SELECTOR_CONTEXT_LINES).min(total);
+
+    let output: String = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let current = start + i + 1;
+            let marker = if current == line_num { ">>>" } else { "   " };
+            format!("{} {:>5}\t{}", marker, current, line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let header = format!(
+        "File: {} | Symbol: {}() @ line {} (lines {}-{} of {})\n\n",
+        path, symbol_name, line_num, start + 1, end, total,
+    );
+    ToolOutput::ok("file_read", &[("path", path), ("mode", "selector"), ("symbol", symbol_name)], Some(&output))
+}
+
+// ============================================================================
+// Symbol extraction helpers (reuse bootstrap.rs patterns)
+// ============================================================================
+
+/// Internal symbol struct — mirrors bootstrap::BootstrapSymbol but lives in this module.
+struct FileSymbol {
+    name: String,
+    kind: String,
+    location: Option<String>,
+    exported: bool,
+}
+
+/// Internal reference struct.
+struct FileReference {
+    from_name: String,
+    to_file: Option<String>,
+}
+
+/// Detect language from file extension (same logic as bootstrap.rs).
+fn language_from_ext(path: &str) -> Option<&'static str> {
+    if path.ends_with(".ts") || path.ends_with(".tsx") || path.ends_with(".js") || path.ends_with(".jsx") || path.ends_with(".mjs") {
+        Some("typescript")
+    } else if path.ends_with(".py") {
+        Some("python")
+    } else if path.ends_with(".rs") {
+        Some("rust")
+    } else {
+        None
+    }
+}
+
+/// Extract symbols and references from source using regex (same patterns as bootstrap.rs).
+fn extract_symbols(path: &str, source: &str, lang: &str) -> (Vec<FileSymbol>, Vec<FileReference>) {
+    let mut symbols = Vec::new();
+    let mut references = Vec::new();
+    let lines: Vec<&str> = source.lines().collect();
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("#[") {
+            continue;
+        }
+        let line_num = i + 1;
+        let loc = Some(format!("{}:{}", path, line_num));
+
+        match lang {
+            "typescript" => {
+                use regex::Regex;
+                // Quick inline regex — same patterns as bootstrap.rs
+                let re_export = Regex::new(r"export\s+(?:async\s+)?(?:function|class|interface|const|let|var|type|enum)\s+(\w+)").unwrap();
+                let re_func = Regex::new(r"^(?:async\s+)?(?:function|class|interface)\s+(\w+)").unwrap();
+                let re_const = Regex::new(r"^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=").unwrap();
+                let re_import_named = Regex::new(r"import\s+\{([^}]+)\}\s+from\s+['\"]([^'\"]+)['\"]").unwrap();
+                let re_import_default = Regex::new(r"import\s+(\w+)\s+from\s+['\"]([^'\"]+)['\"]").unwrap();
+
+                if let Some(caps) = re_export.captures(trimmed) {
+                    let kind = if trimmed.contains("function") || trimmed.contains("async") { "function" }
+                        else if trimmed.contains("class") { "class" }
+                        else if trimmed.contains("interface") { "interface" }
+                        else if trimmed.contains("type") || trimmed.contains("enum") { "class" }
+                        else { "variable" };
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: kind.to_string(), location: loc, exported: true });
+                    continue;
+                }
+                if let Some(caps) = re_func.captures(trimmed) {
+                    let kind = if trimmed.contains("function") { "function" } else if trimmed.contains("class") { "class" } else { "interface" };
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: kind.to_string(), location: loc, exported: false });
+                }
+                if let Some(caps) = re_const.captures(trimmed) {
+                    let name = caps[1].to_string();
+                    if !symbols.iter().any(|s: &FileSymbol| s.name == name) {
+                        symbols.push(FileSymbol { name, kind: "variable".to_string(), location: loc, exported: trimmed.starts_with("export") });
+                    }
+                }
+                if let Some(caps) = re_import_named.captures(trimmed) {
+                    for name in caps[1].split(',').map(|s| s.trim()) {
+                        references.push(FileReference { from_name: name.to_string(), to_file: Some(caps[2].to_string()) });
+                    }
+                }
+                if let Some(caps) = re_import_default.captures(trimmed) {
+                    references.push(FileReference { from_name: caps[1].to_string(), to_file: Some(caps[2].to_string()) });
+                }
+            }
+            "python" => {
+                let re_def = regex::Regex::new(r"def\s+(\w+)\s*\(").unwrap();
+                let re_class = regex::Regex::new(r"class\s+(\w+)\s*[:(]").unwrap();
+                let re_from_import = regex::Regex::new(r"from\s+(\S+)\s+import\s+(.+)").unwrap();
+                if let Some(caps) = re_def.captures(trimmed) {
+                    let name = caps[1].to_string();
+                    if !name.starts_with('_') || name == "__init__" {
+                        symbols.push(FileSymbol { name, kind: "function".to_string(), location: loc, exported: !trimmed.starts_with('_') });
+                    }
+                }
+                if let Some(caps) = re_class.captures(trimmed) {
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "class".to_string(), location: loc, exported: true });
+                }
+                if let Some(caps) = re_from_import.captures(trimmed) {
+                    for name in caps[2].split(',').map(|s| s.split(" as ").next().unwrap_or(s).trim()) {
+                        references.push(FileReference { from_name: name.to_string(), to_file: Some(caps[1].to_string()) });
+                    }
+                }
+            }
+            "rust" => {
+                let re_fn = regex::Regex::new(r"(?:pub(?:\s*\(\s*crate\s*\))?\s+)?(?:async\s+)?fn\s+(\w+)\s*[<(]").unwrap();
+                let re_struct = regex::Regex::new(r"(?:pub\s+)?struct\s+(\w+)").unwrap();
+                let re_enum = regex::Regex::new(r"(?:pub\s+)?enum\s+(\w+)").unwrap();
+                let re_trait = regex::Regex::new(r"(?:pub\s+)?trait\s+(\w+)").unwrap();
+                if let Some(caps) = re_fn.captures(trimmed) {
+                    let is_pub = trimmed.contains("pub ");
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "function".to_string(), location: loc, exported: is_pub });
+                }
+                if let Some(caps) = re_struct.captures(trimmed) {
+                    let is_pub = trimmed.contains("pub ");
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "class".to_string(), location: loc, exported: is_pub });
+                }
+                if let Some(caps) = re_enum.captures(trimmed) {
+                    let is_pub = trimmed.contains("pub ");
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "class".to_string(), location: loc, exported: is_pub });
+                }
+                if let Some(caps) = re_trait.captures(trimmed) {
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "interface".to_string(), location: loc, exported: true });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (symbols, references)
 }
 
 // ============================================================================
@@ -156,11 +418,11 @@ impl Tool for FileWriteTool {
     fn execute(&self, args: &Value, _ctx: &ToolContext) -> ToolOutput {
         let path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
-            None => return ToolOutput::error("SCHEMA_INVALID", "Missing required field: path"),
+            None => return ToolOutput::err("file_write", "SCHEMA_INVALID", &[], None),
         };
         let content = match args.get("content").and_then(|v| v.as_str()) {
             Some(c) => c,
-            None => return ToolOutput::error("SCHEMA_INVALID", "Missing required field: content"),
+            None => return ToolOutput::err("file_write", "SCHEMA_INVALID", &[], None),
         };
 
         let path = normalize_path(path);
@@ -168,23 +430,17 @@ impl Tool for FileWriteTool {
         // Ensure parent directory exists
         if let Some(parent) = std::path::Path::new(&path).parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                return ToolOutput::error(
-                    "EXECUTION_FAILED",
-                    format!("Cannot create parent directory for '{}': {}", path, e),
-                );
+                return ToolOutput::err("file_write", "EXECUTION_FAILED", &[("path", &path)], Some(&e.to_string()));
             }
         }
 
         match std::fs::write(&path, content) {
             Ok(()) => ToolOutput::success(format!(
-                "Wrote {} bytes to '{}'",
+                Ok(()) => ToolOutput::ok("file_write", &[("path", &path), ("bytes", &content.len().to_string())], None),
                 content.len(),
                 path
             )),
-            Err(e) => ToolOutput::error(
-                "EXECUTION_FAILED",
-                format!("Cannot write '{}': {}", path, e),
-            ),
+            Err(e) => ToolOutput::err("file_edit", "EXECUTION_FAILED", &[("path", &path)], Some(&e.to_string())),
         }
     }
 }
@@ -241,15 +497,15 @@ impl Tool for FileEditTool {
     fn execute(&self, args: &Value, _ctx: &ToolContext) -> ToolOutput {
         let path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
-            None => return ToolOutput::error("SCHEMA_INVALID", "Missing required field: path"),
+            None => return ToolOutput::err("file_write", "SCHEMA_INVALID", &[], None),
         };
         let old_string = match args.get("old_string").and_then(|v| v.as_str()) {
             Some(s) => s,
-            None => return ToolOutput::error("SCHEMA_INVALID", "Missing required field: old_string"),
+            None => return ToolOutput::err("file_edit", "SCHEMA_INVALID", &[], None),
         };
         let new_string = match args.get("new_string").and_then(|v| v.as_str()) {
             Some(s) => s,
-            None => return ToolOutput::error("SCHEMA_INVALID", "Missing required field: new_string"),
+            None => return ToolOutput::err("file_edit", "SCHEMA_INVALID", &[], None),
         };
         let replace_all = args
             .get("replace_all")
@@ -261,37 +517,22 @@ impl Tool for FileEditTool {
         let original = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
-                return ToolOutput::error(
-                    "EXECUTION_FAILED",
-                    format!("Cannot read '{}': {}", path, e),
-                )
+                return ToolOutput::err("file_edit", "EXECUTION_FAILED", &[("path", &path)], Some(&e.to_string()))
             }
         };
 
         if old_string.is_empty() {
-            return ToolOutput::error("SCHEMA_INVALID", "old_string must not be empty");
+            return ToolOutput::err("file_edit", "SCHEMA_INVALID", &[], None);
         }
 
         let occurrences = original.matches(old_string).count();
 
         if occurrences == 0 {
-            return ToolOutput::error(
-                "EXECUTION_FAILED",
-                format!(
-                    "old_string not found in '{}'. The file may have changed since you last read it.",
-                    path
-                ),
-            );
+            return ToolOutput::err("file_edit", "EXECUTION_FAILED", &[("path", &path)], Some("old_string not found"));
         }
 
         if !replace_all && occurrences > 1 {
-            return ToolOutput::error(
-                "EXECUTION_FAILED",
-                format!(
-                    "old_string found {} times in '{}'. Use replace_all: true or make old_string more specific.",
-                    occurrences, path
-                ),
-            );
+            return ToolOutput::err("file_edit", "EXECUTION_FAILED", &[("path", &path), ("occurrences", &occurrences.to_string())], Some("use replace_all or make old_string more specific"));
         }
 
         let modified = if replace_all {
@@ -303,15 +544,9 @@ impl Tool for FileEditTool {
         match std::fs::write(&path, &modified) {
             Ok(()) => {
                 let replaced_count = if replace_all { occurrences } else { 1 };
-                ToolOutput::success(format!(
-                    "Replaced {} occurrence(s) of old_string in '{}'",
-                    replaced_count, path
-                ))
+                ToolOutput::ok("file_edit", &[("path", &path), ("replaced", &replaced_count.to_string())], None)
             }
-            Err(e) => ToolOutput::error(
-                "EXECUTION_FAILED",
-                format!("Cannot write '{}': {}", path, e),
-            ),
+            Err(e) => ToolOutput::err("file_edit", "EXECUTION_FAILED", &[("path", &path)], Some(&e.to_string())),
         }
     }
 }
@@ -355,17 +590,14 @@ impl Tool for FileDeleteTool {
     fn execute(&self, args: &Value, _ctx: &ToolContext) -> ToolOutput {
         let path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
-            None => return ToolOutput::error("SCHEMA_INVALID", "Missing required field: path"),
+            None => return ToolOutput::err("file_write", "SCHEMA_INVALID", &[], None),
         };
 
         let path = normalize_path(path);
 
         match std::fs::remove_file(&path) {
-            Ok(()) => ToolOutput::success(format!("Deleted '{}'", path)),
-            Err(e) => ToolOutput::error(
-                "EXECUTION_FAILED",
-                format!("Cannot delete '{}': {}", path, e),
-            ),
+            Ok(()) => ToolOutput::ok("file_delete", &[("path", &path)], None),
+            Err(e) => ToolOutput::err("file_delete", "EXECUTION_FAILED", &[("path", &path)], Some(&e.to_string())),
         }
     }
 }
@@ -413,7 +645,7 @@ impl Tool for FileGlobTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
             Some(p) => p,
-            None => return ToolOutput::error("SCHEMA_INVALID", "Missing required field: pattern"),
+            None => return ToolOutput::err("file_glob", "SCHEMA_INVALID", &[], None),
         };
 
         let base_path = args
@@ -436,17 +668,14 @@ impl Tool for FileGlobTool {
                 .map(|p| normalize_path(&p.to_string_lossy()))
                 .collect(),
             Err(e) => {
-                return ToolOutput::error(
-                    "EXECUTION_FAILED",
-                    format!("Glob pattern error: {}", e),
-                )
+                return ToolOutput::err("file_glob", "EXECUTION_FAILED", &[], Some(&e.to_string()))
             }
         };
 
         if results.is_empty() {
-            ToolOutput::success("No files matched.".to_string())
+            ToolOutput::ok("file_glob", &[("matched", "0")], None)
         } else {
-            ToolOutput::success(results.join("\n"))
+            ToolOutput::ok("file_glob", &[("matched", &results.len().to_string())], Some(&results.join("\n")))
         }
     }
 }
@@ -502,16 +731,13 @@ impl Tool for FileGrepTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
             Some(p) => p,
-            None => return ToolOutput::error("SCHEMA_INVALID", "Missing required field: pattern"),
+            None => return ToolOutput::err("file_glob", "SCHEMA_INVALID", &[], None),
         };
 
         let regex = match regex::Regex::new(pattern) {
             Ok(r) => r,
             Err(e) => {
-                return ToolOutput::error(
-                    "SCHEMA_INVALID",
-                    format!("Invalid regex pattern: {}", e),
-                )
+                return ToolOutput::err("file_grep", "SCHEMA_INVALID", &[], Some(&e.to_string()))
             }
         };
 
@@ -552,10 +778,7 @@ impl Tool for FileGrepTool {
                 .map(|e| e.path().to_path_buf())
                 .collect()
         } else {
-            return ToolOutput::error(
-                "EXECUTION_FAILED",
-                format!("Path not found: '{}'", search_path),
-            );
+            return ToolOutput::err("file_grep", "EXECUTION_FAILED", &[("path", &search_path)], Some("path not found"));
         };
 
         'outer: for file_path in files {
@@ -585,10 +808,10 @@ impl Tool for FileGrepTool {
         }
 
         if results.is_empty() {
-            ToolOutput::success("No matches found.".to_string())
+            ToolOutput::ok("file_grep", &[("matched", "0")], None)
         } else {
             let summary = format!("Found {} match(es):\n\n{}", results.len(), results.join("\n"));
-            ToolOutput::success(summary)
+            ToolOutput::ok("file_grep", &[("matched", &results.len().to_string())], Some(&summary))
         }
     }
 }
@@ -676,10 +899,10 @@ impl Tool for FileLsTool {
         });
 
         if listing.is_empty() {
-            ToolOutput::success(format!("Directory '{}' is empty.", dir_path))
+            ToolOutput::ok("file_ls", &[("path", &dir_path), ("entries", "0")], None)
         } else {
             let header = format!("Listing '{}' ({} entries):\n\n", dir_path, listing.len());
-            ToolOutput::success(header + &listing.join("\n"))
+            ToolOutput::ok("file_ls", &[("path", &dir_path), ("entries", &listing.len().to_string())], Some(&listing.join("\n")))
         }
     }
 }

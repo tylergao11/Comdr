@@ -25,6 +25,7 @@ import { join } from 'node:path';
 
 import type { SessionState } from '@comdr/core/types';
 import { SYSTEM } from '@comdr/core';
+import { summarizeToolOutput } from './smart-truncate.js';
 
 /** 会话文件最大字节数（≈5MB），超过则压缩保存（剔除旧 tool result 内容） */
 const MAX_SESSION_FILE_SIZE = 5_000_000;
@@ -67,7 +68,7 @@ export class SessionStore {
         if (msg.role === 'tool') {
           toolResultCount++;
           if (toolResultCount > KEEP && msg.content && msg.content.length > 200) {
-            msg.content = msg.content.slice(0, 200) + '…[trimmed]';
+            msg.content = summarizeToolOutput(msg.content, undefined, 200);
           }
         }
       }
@@ -207,23 +208,33 @@ export class SessionStore {
    * 加载跨会话情景记忆（JSON 字符串）
    * @returns 序列化的 episodic memory 数据，不存在或损坏时返回 null
    */
-  loadEpisodic(): string | null {
+  loadEpisodic(): { episodes: string; reflections: string } | null {
     const filePath = this.getEpisodicPath();
     if (!existsSync(filePath)) return null;
     try {
-      return readFileSync(filePath, 'utf-8');
+      return JSON.parse(readFileSync(filePath, 'utf-8')) as { episodes: string; reflections: string };
     } catch {
-      return null;
+      // 兼容旧格式：纯 JSON array → 视为 episodes
+      try {
+        const raw = readFileSync(filePath, 'utf-8');
+        return { episodes: raw, reflections: '[]' };
+      } catch {
+        return null;
+      }
     }
   }
 
   /**
-   * 保存跨会话情景记忆到磁盘
+   * 保存跨会话情景记忆到磁盘（含 episodes + reflections）
    */
-  saveEpisodic(data: string): void {
+  saveEpisodic(data: { episodes: string; reflections: string }): void {
     this.ensureDir();
     try {
-      writeFileSync(this.getEpisodicPath(), data, 'utf-8');
+      writeFileSync(
+        this.getEpisodicPath(),
+        JSON.stringify(data, null, 2),
+        'utf-8',
+      );
     } catch {
       // 写入失败 → 静默降级
     }

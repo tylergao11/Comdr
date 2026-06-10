@@ -74,7 +74,7 @@ impl Tool for GitDiffTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let repo = match open_repo(&ctx.project_path) {
             Ok(r) => r,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", e),
+            Err(e) => return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e)),
         };
 
         let staged = args.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -107,7 +107,7 @@ impl Tool for GitDiffTool {
 
         let diff = match diff {
             Ok(d) => d,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", e),
+            Err(e) => return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e)),
         };
 
         // Render diff as text
@@ -131,13 +131,13 @@ impl Tool for GitDiffTool {
         });
 
         if let Err(e) = print_result {
-            return ToolOutput::error("EXECUTION_FAILED", format!("Diff render error: {}", e));
+            return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e.to_string()));
         }
 
         if output.trim().is_empty() {
-            ToolOutput::success("No changes (working tree clean).")
+            ToolOutput::ok("git_diff", &[("changed", "0")], None)
         } else {
-            ToolOutput::success(output)
+            ToolOutput::ok("git_diff", &[("changed", "1")], Some(&output))
         }
     }
 }
@@ -181,7 +181,7 @@ impl Tool for GitStatusTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let repo = match open_repo(&ctx.project_path) {
             Ok(r) => r,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", e),
+            Err(e) => return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e)),
         };
 
         let mut status_opts = git2::StatusOptions::new();
@@ -194,11 +194,11 @@ impl Tool for GitStatusTool {
 
         let statuses = match repo.statuses(Some(&mut status_opts)) {
             Ok(s) => s,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", format!("Status error: {}", e)),
+            Err(e) => return ToolOutput::err("git_status", "EXECUTION_FAILED", &[], Some(&e.to_string())),
         };
 
         if statuses.is_empty() {
-            return ToolOutput::success("Nothing to commit, working tree clean.");
+            return ToolOutput::ok("git_status", &[("dirty", "0")], None);
         }
 
         let mut output = String::new();
@@ -208,7 +208,7 @@ impl Tool for GitStatusTool {
             output.push_str(&format!("{} {}\n", status_code, path));
         }
 
-        ToolOutput::success(output)
+        ToolOutput::ok("git_diff", &[("changed", "1")], Some(&output))
     }
 }
 
@@ -272,7 +272,7 @@ impl Tool for GitLogTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let repo = match open_repo(&ctx.project_path) {
             Ok(r) => r,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", e),
+            Err(e) => return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e)),
         };
 
         let count = args
@@ -283,7 +283,7 @@ impl Tool for GitLogTool {
 
         let mut revwalk = match repo.revwalk() {
             Ok(r) => r,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", format!("Revwalk error: {}", e)),
+            Err(e) => return ToolOutput::err("git_log", "EXECUTION_FAILED", &[], Some(&e.to_string())),
         };
 
         revwalk.push_head().map_err(|e| format!("Push head error: {}", e)).unwrap_or(());
@@ -320,9 +320,9 @@ impl Tool for GitLogTool {
         }
 
         if output.is_empty() {
-            ToolOutput::success("No commits found.")
+            ToolOutput::ok("git_log", &[("commits", "0")], None)
         } else {
-            ToolOutput::success(output)
+            ToolOutput::ok("git_diff", &[("changed", "1")], Some(&output))
         }
     }
 }
@@ -365,12 +365,12 @@ impl Tool for GitAddTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let repo = match open_repo(&ctx.project_path) {
             Ok(r) => r,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", e),
+            Err(e) => return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e)),
         };
 
         let files_val = match args.get("files") {
             Some(v) => v,
-            None => return ToolOutput::error("SCHEMA_INVALID", "Missing required field: files"),
+            None => return ToolOutput::err("git_add", "SCHEMA_INVALID", &[], None),
         };
 
         let paths: Vec<String> = match files_val {
@@ -389,7 +389,7 @@ impl Tool for GitAddTool {
 
         let mut index = match repo.index() {
             Ok(i) => i,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", format!("Index error: {}", e)),
+            Err(e) => return ToolOutput::err("git_commit", "EXECUTION_FAILED", &[], Some(&e.to_string())),
         };
 
         let mut added = 0;
@@ -406,8 +406,8 @@ impl Tool for GitAddTool {
         }
 
         match index.write() {
-            Ok(()) => ToolOutput::success(format!("Staged {} file(s): {:?}", added, paths)),
-            Err(e) => ToolOutput::error("EXECUTION_FAILED", format!("Index write error: {}", e)),
+            Ok(()) => ToolOutput::ok("git_add", &[("added", &added.to_string())], None),
+            Err(e) => ToolOutput::err("git_add", "EXECUTION_FAILED", &[], Some(&e.to_string())),
         }
     }
 }
@@ -451,18 +451,18 @@ impl Tool for GitCommitTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let repo = match open_repo(&ctx.project_path) {
             Ok(r) => r,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", e),
+            Err(e) => return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e)),
         };
 
         let message = match args.get("message").and_then(|v| v.as_str()) {
             Some(m) => m,
-            None => return ToolOutput::error("SCHEMA_INVALID", "Missing required field: message"),
+            None => return ToolOutput::err("git_commit", "SCHEMA_INVALID", &[], None),
         };
 
         // Get the current index as a tree
         let mut index = match repo.index() {
             Ok(i) => i,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", format!("Index error: {}", e)),
+            Err(e) => return ToolOutput::err("git_commit", "EXECUTION_FAILED", &[], Some(&e.to_string())),
         };
 
         let tree_oid = match index.write_tree() {
@@ -477,7 +477,7 @@ impl Tool for GitCommitTool {
 
         let tree = match repo.find_tree(tree_oid) {
             Ok(t) => t,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", format!("Tree error: {}", e)),
+            Err(e) => return ToolOutput::err("git_commit", "EXECUTION_FAILED", &[], Some(&e.to_string())),
         };
 
         // Get or create the parent commit
@@ -496,8 +496,8 @@ impl Tool for GitCommitTool {
         let parents: Vec<&git2::Commit> = parent.iter().collect();
 
         match repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parents) {
-            Ok(oid) => ToolOutput::success(format!("Committed: {}", oid)),
-            Err(e) => ToolOutput::error("EXECUTION_FAILED", format!("Commit error: {}", e)),
+            Ok(oid) => ToolOutput::ok("git_commit", &[("oid", &oid.to_string().chars().take(8).collect::<String>())], None),
+            Err(e) => ToolOutput::err("git_commit", "EXECUTION_FAILED", &[], Some(&e.to_string())),
         }
     }
 }
@@ -541,12 +541,12 @@ impl Tool for GitRevertTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let repo = match open_repo(&ctx.project_path) {
             Ok(r) => r,
-            Err(e) => return ToolOutput::error("EXECUTION_FAILED", e),
+            Err(e) => return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e)),
         };
 
         let commit_hash = match args.get("commit").and_then(|v| v.as_str()) {
             Some(c) => c,
-            None => return ToolOutput::error("SCHEMA_INVALID", "Missing required field: commit"),
+            None => return ToolOutput::err("git_revert", "SCHEMA_INVALID", &[], None),
         };
 
         let oid = match git2::Oid::from_str(commit_hash) {
@@ -577,14 +577,9 @@ impl Tool for GitRevertTool {
                 status_opts.include_untracked(false);
                 if let Ok(statuses) = repo.statuses(Some(&mut status_opts)) {
                     if statuses.iter().any(|s| s.status().contains(git2::Status::CONFLICTED)) {
-                        return ToolOutput {
-                            ok: false,
-                            content: Some(format!(
-                                "Revert of '{}' caused conflicts. Resolve manually and commit.",
+                        return ToolOutput::err("git_revert", "EXECUTION_FAILED", &[("commit", commit_hash)], Some("conflicts"))
                                 commit_hash
                             )),
-                            error_code: Some("EXECUTION_FAILED".to_string()),
-                        };
                     }
                 }
 
@@ -592,7 +587,7 @@ impl Tool for GitRevertTool {
                 let mut index = match repo.index() {
                     Ok(i) => i,
                     Err(e) => {
-                        return ToolOutput::error("EXECUTION_FAILED", format!("Index error: {}", e))
+                        return ToolOutput::err("git_commit", "EXECUTION_FAILED", &[], Some(&e.to_string()))
                     }
                 };
                 let tree_oid = match index.write_tree() {
@@ -634,16 +629,13 @@ impl Tool for GitRevertTool {
                     &tree,
                     &parents,
                 ) {
-                    Ok(oid) => ToolOutput::success(format!(
-                        "Reverted commit '{}' as {}",
-                        commit_hash, oid
-                    )),
+                    Ok(oid) => ToolOutput::ok("git_revert", &[("commit", commit_hash), ("revert_oid", &oid.to_string())], None),
                     Err(e) => {
-                        ToolOutput::error("EXECUTION_FAILED", format!("Revert commit error: {}", e))
+                        ToolOutput::err("git_revert", "EXECUTION_FAILED", &[], Some(&e.to_string()))
                     }
                 }
             }
-            Err(e) => ToolOutput::error("EXECUTION_FAILED", format!("Revert error: {}", e)),
+            Err(e) => ToolOutput::err("git_revert", "EXECUTION_FAILED", &[], Some(&e.to_string())),
         }
     }
 }
