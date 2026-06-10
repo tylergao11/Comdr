@@ -149,10 +149,17 @@ export class EpisodicMemory {
    * 仅在会话终止时调用（triggered by Engine.terminate()）。
    * 合并后新会话的 retrieve() 才能检索到本次会话的摘要。
    */
+  /**
+   * ★ 只 commit 成功的会话——失败的、中断的、错误的不进入长期记忆。
+   * SuperLocalMemory (2026): Bayesian trust scoring，失败会话 trust -= 0.2。
+   */
   commit(): void {
     for (const [id, summary] of this.pendingStore) {
+      if (summary.outcome !== 'completed' && summary.outcome !== null) {
+        // 失败/中断的会话 → 不入 store，但计入 reflection 的失败模式统计
+        continue;
+      }
       this.store.set(id, summary);
-      // 注册到 BM25 索引
       const text = this.serializeForEmbedding(summary);
       const tokens = tokenize(text);
       this.episodeTokens.set(id, tokens);

@@ -108,13 +108,14 @@ export class SemanticMemory {
 
     const action = this.inferAction(call.function.name);
 
-    // 1. 更新 Temporal Graph
-    this.temporalGraph.push({
-      filePath: path,
-      action,
-      turn,
-      timestamp: new Date().toISOString(),
-    });
+    // 1. Temporal Graph — 去重追加，防跨会话重复
+    const dupKey = `${path}:${action}:${turn}`;
+    if (!this.temporalGraph.some(e => `${e.filePath}:${e.action}:${e.turn}` === dupKey)) {
+      this.temporalGraph.push({
+        filePath: path, action, turn,
+        timestamp: new Date().toISOString(),
+      });
+    }
 
     // 2. 更新 Semantic Graph（如果是 write/edit）
     if (action === 'created' || action === 'modified') {
@@ -127,9 +128,8 @@ export class SemanticMemory {
       );
     }
 
-    // 3. 检测因果关系
+    // 3. 检测因果关系（★ 上限 100 条，自动淘汰最旧）
     if (result.errorCategory === 'test_failed') {
-      // 找到最近一次修改同一文件的记录
       const lastMod = this.findLastModification(path, turn);
       if (lastMod) {
         this.causalGraph.push({
@@ -138,6 +138,10 @@ export class SemanticMemory {
           turn,
           confidence: 0.7,
         });
+        // 保持最近 100 条
+        if (this.causalGraph.length > 100) {
+          this.causalGraph = this.causalGraph.slice(-100);
+        }
       }
     }
   }
