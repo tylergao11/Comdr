@@ -26,6 +26,8 @@ import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { SYSTEM } from '@comdr/core';
+import type { ILSPBridge } from '@comdr/core/contracts';
+import type { LSPFileContext } from '@comdr/core/types';
 import {
   tokenize,
   BM25Scorer,
@@ -184,47 +186,42 @@ export function discoverComdrMd(
   projectPath: string,
   comdrMdPath: string = 'COMDR.md',
 ): string {
-  const sections: string[] = [];
-  const home = homedir();
+  const { fullText } = discoverAllSources(projectPath, comdrMdPath);
+  return fullText;
+}
 
-  // 1. 全局: ~/.comdr/COMDR.md
-  const globalPath = join(home, '.comdr', 'COMDR.md');
-  if (existsSync(globalPath)) {
-    const content = safeRead(globalPath);
-    if (content) sections.push(content);
-  }
+// ============================================================================
+// §4.5 Retriever 缓存（同 projectPath 复用 BM25 索引，避免每轮重建）
+// ============================================================================
 
-  // 2. World models: ~/.comdr/world-models/*.md
-  const worldModelsDir = join(home, '.comdr', 'world-models');
-  if (existsSync(worldModelsDir)) {
-    try {
-      const files = readdirSync(worldModelsDir)
-        .filter((f) => f.endsWith('.md'))
-        .sort();
-      for (const file of files) {
-        const content = safeRead(join(worldModelsDir, file));
-        if (content) {
-          const label = file.replace(/\.md$/, '');
-          sections.push(`## ${label}\n\n${content}`);
-        }
-      }
-    } catch {
-      // 目录存在但不可读 → 跳过
+/** 缓存的 BM25 检索器 + 其关联 chunk 列表 */
+let cachedRetriever: {
+  projectPath: string;
+  chunks: WorldModelChunk[];
+  retriever: ReturnType<typeof createWorldModelRetriever>;
+} | null = null;
+
+/**
+ * 获取或创建 BM25 检索器。
+ * 同 projectPath 的 chunk 不变时复用缓存，避免每轮重建 token 索引。
+ */
+function getOrCreateRetriever(
+  chunks: WorldModelChunk[],
+  projectPath: string,
+): ReturnType<typeof createWorldModelRetriever> {
+  if (cachedRetriever && cachedRetriever.projectPath === projectPath) {
+    // 检查 chunks 是否相同（引用相等或长度/来源相同——实际场景中不会变）
+    if (cachedRetriever.chunks === chunks) {
+      return cachedRetriever.retriever;
     }
   }
-
-  // 3. 项目级: {projectPath}/COMDR.md
-  const projectPath_ = join(projectPath, comdrMdPath);
-  if (existsSync(projectPath_)) {
-    const content = safeRead(projectPath_);
-    if (content) sections.push(content);
-  }
-
-  return sections.join('\n\n---\n\n');
+  const retriever = createWorldModelRetriever(chunks);
+  cachedRetriever = { projectPath, chunks, retriever };
+  return retriever;
 }
 
 /**
- * ★ 多源发现 + 分块检索。
+ * 多源发现 + 分块检索。
  *
  * 分别从各来源收集 chunk（保留正确的 source 名），
  * 用 BM25 + Contextual Prefix 检索 Top-K 相关 chunk。
@@ -241,11 +238,47 @@ export function discoverAndRetrieve(
   projectPath: string,
   comdrMdPath: string = 'COMDR.md',
 ): WorldModelResult {
-  const home = homedir();
+  const { fullText, chunks } = discoverAllSources(projectPath, comdrMdPath);
 
-  // ★ 按来源分别收集 chunk，保留正确的 source 名
-  const allChunks: WorldModelChunk[] = [];
+  if (!fullText || chunks.length === 0) {
+    return { fullText: '', relevantChunks: [], didChunk: false };
+  }
+
+  // 小文件不分块
+  const totalChars = chunks.reduce((sum, c) => sum + c.content.length, 0);
+  if (totalChars < SYSTEM.WORLD_MODEL_CHUNK_MIN_CHARS) {
+    return { fullText, relevantChunks: [], didChunk: false };
+  }
+
+  // 只有 1 个 chunk 也不检索——内容太少，直接全量注入
+  // ★ didChunk: false 告诉调用方：relevantChunks 为空不代表无内容
+  if (chunks.length <= 1) {
+    return { fullText, relevantChunks: [], didChunk: false };
+  }
+
+  // 检索（复用缓存，避免每轮重建 BM25 索引）
+  const retriever = getOrCreateRetriever(chunks, projectPath);
+  const relevantChunks = retriever.retrieve(
+    input,
+    SYSTEM.WORLD_MODEL_RETRIEVAL_TOPK,
+  );
+
+  return { fullText, relevantChunks, didChunk: true };
+}
+
+/**
+ * ★ 共享的发现逻辑——三个来源的发现和 chunk 化在一个地方定义。
+ *
+ * discoverComdrMd() 和 discoverAndRetrieve() 都委托给此函数，
+ * 确保格式化逻辑只有一份。
+ */
+function discoverAllSources(
+  projectPath: string,
+  comdrMdPath: string,
+): { fullText: string; chunks: WorldModelChunk[] } {
+  const home = homedir();
   const fullTextParts: string[] = [];
+  const allChunks: WorldModelChunk[] = [];
 
   // 1. 全局: ~/.comdr/COMDR.md
   const globalPath = join(home, '.comdr', 'COMDR.md');
@@ -288,31 +321,61 @@ export function discoverAndRetrieve(
     }
   }
 
-  const fullText = fullTextParts.join('\n\n---\n\n');
+  return { fullText: fullTextParts.join('\n\n---\n\n'), chunks: allChunks };
+}
 
-  if (!fullText || allChunks.length === 0) {
-    return { fullText: '', relevantChunks: [], didChunk: false };
+// ============================================================================
+// §4.5 LSP 语义管道（补充文本 World Model）
+// ============================================================================
+
+/**
+ * ★ 构建 LSP 语义 World Model chunk。
+ *
+ * 和现有 discoverComdrMd() 的关系:
+ *   - discoverComdrMd():     文本级 World Model（COMDR.md → BM25 检索）
+ *   - buildLSPWorldChunks(): 语义级 World Model（LSP → 类型图/调用链）
+ *
+ *   两者互补——bootstrap(Rust) 做广度扫描，LSP 做深度分析。
+ *
+ * 用法:
+ *   const chunks = await buildLSPWorldChunks(lspBridge, currentFile);
+ *   const text = formatLSPChunksForPrompt(chunks);
+ *   prompt.setLSPContext(text);
+ *
+ * @param lspBridge  Terminal 2 提供的 LSP 桥接
+ * @param filePaths  需要深度分析的文件路径列表
+ * @returns          Agent 友好的 LSP 语义描述列表
+ */
+export async function buildLSPWorldChunks(
+  lspBridge: ILSPBridge,
+  filePaths: string[],
+): Promise<LSPFileContext[]> {
+  const results: LSPFileContext[] = [];
+
+  for (const filePath of filePaths) {
+    const ctx = await lspBridge.getFileContext(filePath);
+    if (ctx) {
+      results.push(ctx);
+    }
   }
 
-  // 小文件不分块
-  const totalChars = allChunks.reduce((sum, c) => sum + c.content.length, 0);
-  if (totalChars < SYSTEM.WORLD_MODEL_CHUNK_MIN_CHARS) {
-    return { fullText, relevantChunks: [], didChunk: false };
-  }
+  return results;
+}
 
-  // 只有 1 个 chunk 也不检索
-  if (allChunks.length <= 1) {
-    return { fullText, relevantChunks: [], didChunk: false };
-  }
-
-  // 检索
-  const retriever = createWorldModelRetriever(allChunks);
-  const relevantChunks = retriever.retrieve(
-    input,
-    SYSTEM.WORLD_MODEL_RETRIEVAL_TOPK,
-  );
-
-  return { fullText, relevantChunks, didChunk: true };
+/**
+ * ★ 从 State Window 提取关键文件路径。
+ * 用于决定哪些文件需要 LSP 深度分析。
+ */
+export function extractKeyFiles(stateWindow: { key: string }[]): string[] {
+  return stateWindow
+    .map(e => {
+      // key 格式: "file:src/auth/login.ts" → "src/auth/login.ts"
+      if (e.key.startsWith('file:')) {
+        return e.key.slice(5);
+      }
+      return null;
+    })
+    .filter((p): p is string => p !== null);
 }
 
 // ============================================================================

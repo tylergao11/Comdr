@@ -1,78 +1,144 @@
 # Comdr
 
-> DeepSeek V4 驱动的通用 coding agent。TypeScript 编排 + Rust 执行。
+> DeepSeek V4 驱动的通用 coding agent。TypeScript 编排 + Rust 执行。CLI 入口，VS Code 主交互面。
 
 ## 快速开始
 
 ```bash
 pnpm install && pnpm build && pnpm build:tools
-comdr                    # 交互模式
-comdr exec "重构 auth"    # 全自动
-comdr plan "分析架构"     # 只读
 ```
 
-## 为什么选 Comdr
+### CLI 模式
 
-| 问题 | 我们的解法 |
-|------|-----------|
-| LLM 修 bug 反复失败 | Self-Correct：reasoning 回注 + flash 模型纠正 + 自动回滚 |
-| 上下文腐烂 | 双窗口 + 智能压缩（50K 触发，flash 模型执行） |
-| 缓存浪费 | **95%+** DeepSeek 前缀缓存命中（工具全量 + 上下文后置 + 消息合并） |
-| 工具串行慢 | 拓扑并行调度——同层工具并发执行 |
-| 模型贵 | 双模型架构——pro 做 coding，flash 做压缩（便宜 10x） |
+```bash
+comdr                        # 交互模式
+comdr exec "重构 auth 模块"    # 全自动执行
+comdr plan "分析架构"          # 只读分析
+```
 
-## 上下文管理
+### VS Code 模式
 
-**4 阶段压缩管线**（50K tokens 触发，对齐论文 Lost in the Middle 的 30K 退化线）：
+```bash
+code --extensionDevelopmentPath="packages/vscode" .
+```
 
-| 阶段 | 方式 | 说明 |
+或 `F5`（launch.json 已配置）。启动后左侧 Activity Bar 出现 🤖 图标，点击打开 Chat 面板。首次使用在面板内填入 DeepSeek API key。
+
+## 架构
+
+```
+人类 ──→ VS Code (webview) / CLI (TUI)
+                │ Contract C: IEngine
+         ┌──────▼──────────────────────┐
+         │  Agent 4  @comdr/engine     │  编排核心：9 步主循环
+         │  loop · prompt · planner    │  6 模式路由 · 双窗口记忆
+         │  reflection · progress      │  self-correct · 停滞检测
+         │  context · skills · subagent│  同步压缩 · fan-out 并行
+         └──┬──────────────┬───────────┘
+    Contract A │              │ Contract B
+    (IDeepSeekClient)        │ (INativeTools)
+   ┌──────────▼──┐    ┌─────▼──────────────────┐
+   │ Agent 2     │    │ Agent 3  comdr-tools   │
+   │ @comdr/llm  │    │ Rust / napi-rs          │
+   │ DeepSeek    │    │ SDB 6步管线 + 22 tools  │
+   │ reasoning   │    │ file · git · shell · lsp│
+   └─────────────┘    └────────────────────────┘
+
+   Agent 1  @comdr/core    类型 + 常量 + 契约（唯一真理源）
+   Agent 5  @comdr/ui      CLI / TUI / MCP Server
+   Agent 6  @comdr/vscode  VS Code Extension（Webview React）
+```
+
+## 核心机制
+
+| 坑（开源 agent 已知） | Comdr 的解法 |
+|---|---|
+| LLM 修 bug 反复失败 | **SDB 6 步**：Schema → 权限 → 快照 → 执行 → Diff 验证 → 测试反馈。失败自动回滚 + reasoning 回注自纠正 |
+| 上下文腐烂 | **双窗口**：State Window + Intent Window 重要性加权淘汰。4 阶段智能压缩（50K 触发，flash 模型执行） |
+| 工具 no-op | **Diff Validate**：实际变更 vs 预期对比，不一致标记失败 |
+| 循环停滞 | **Progress Meter**：2 轮零进展 = warning，3 轮 = abort |
+| thinking 丢失 | **reasoning_content 完整回传链**：每轮注入上一轮 thinking，保证 LLM 有完整推理上下文 |
+| 缓存命中低 | **95%+ 前缀缓存命中**：工具全量发送 + 上下文后置 + sorted_keys 序列化 |
+| 所有任务同一策略 | **Planner 6 模式**：关键词路由，不同任务走不同 prompt 路径 |
+| 模型不知道项目约定 | **COMDR.md 自动加载** + World Model 多源分块检索 |
+
+## 工具
+
+| 类别 | 工具 | 数量 |
+|---|---|---|
+| 文件 | `file_read` `file_write` `file_edit` `file_delete` `file_glob` `file_grep` `file_ls` | 7 |
+| Shell | `shell_bash` `shell_test` | 2 |
+| Git | `git_diff` `git_status` `git_log` `git_add` `git_commit` `git_revert` | 6 |
+| 语义 | `tool_search` `file_search` `symbol_find` `memory_recall` | 4 |
+| 编排 | `task_spawn` | 1 |
+| VS Code | `vscode_open_editor` `vscode_diff` `vscode_reveal_line` 等 | 6 |
+
+统一输出 `[OK] tool k=v` / `[ERR] tool k=v error=CODE`，Rust + TS + MCP 三层一致。
+
+## VS Code 集成
+
+Phase 1 已交付：
+
+- **Chat Panel** — React Webview，消息流 + thinking 折叠 + diff 审批（Accept/Reject）
+- **Activity Bar** — 🤖 图标，点击展开 Chat 面板
+- **Config Setup** — 无 API key 时自动弹出配置表单
+- **LSP Bridge** — 诊断快照 + 差值计算（为 self-correct 提供编译器事实信号）
+- **Shadow Workspace** — 隔离编辑窗口（mock 阶段，Phase 3 启用真实 Fork）
+- **6 个 VS Code 工具** — `vscode_open_editor` / `vscode_diff` / `vscode_execute_command` 等
+
+详见 [docs/vscode-integration-plan.md](docs/vscode-integration-plan.md)。
+
+## 运行模式
+
+| 命令 | 权限 | 用途 |
 |------|------|------|
-| Observe | 差异化压缩 | 错误保留、测试保留、无关 squash |
-| Anchor | flash 摘要 | 增量合并结构化摘要 |
-| Collapse | 虚拟投影 | 旧消息 → `[history collapsed]` |
-| Compact | flash 全量压缩 | 保留双窗口 anchor |
-
-**子系统**：State/Intent 双窗口（重要性加权淘汰）· BM25 跨会话检索 + 反思层 · Graph RAG 拓扑子图注入 · Aider-style 仓库地图 · World Model 多源分块检索。
-
-所有内容截断使用智能模式提取（`smart-truncate.ts`），绝不含糊硬切。
-
-## 22 个工具 + 统一输出
-
-| 类别 | 工具 |
-|------|------|
-| 文件 | `file_read` `file_write` `file_edit` `file_delete` `file_glob` `file_grep` `file_ls` |
-| Shell | `shell_bash` `shell_test` |
-| Git | `git_diff` `git_status` `git_log` `git_add` `git_commit` `git_revert` |
-| 语义 | `tool_search` `file_search` `symbol_find` `memory_recall` |
-| 编排 | `task_spawn` |
-
-**工具工厂** `createTool()` 声明式注册——8 行替代 30 行手写 JSON Schema。
-
-**统一输出格式** `[OK] tool k=v` / `[ERR] tool k=v error=CODE`——Rust + TS + MCP 三层统一，缓存友好。契约定义在 `@comdr/core types.ts`。
-
-## 并行 + 子 Agent
-
-拓扑依赖分析（Kahn BFS）→ 同层并行，层间串行。不同文件的读写并发，同文件冲突自动串行。
-
-子 Agent 确定性 fan-out（`fanOut` / `runSubAgent` / `pipeline`），独立上下文，共享 LLM + tools。
+| `comdr` | 确认破坏性操作 | 日常交互 |
+| `comdr plan` | 只读 | 分析架构、审查代码 |
+| `comdr exec` | 全自动 | CI / headless |
+| `comdr mcp-server` | — | 启动 MCP JSON-RPC endpoint |
+| `comdr session list/resume/delete` | — | 会话管理 |
 
 ## 双模型
 
 | 角色 | 默认模型 | 职责 |
 |------|---------|------|
-| PRIMARY | `deepseek-v4-pro` | coding |
-| CONTEXT | `deepseek-v4-flash` | 压缩/摘要/反思（便宜 10x） |
+| PRIMARY | `deepseek-v4-pro` | 代码生成、推理 |
+| CONTEXT | `deepseek-v4-flash` | 压缩摘要、反思（1/10 成本） |
 
-模型名唯一真理源：`@comdr/core/types.ts` `MODEL_ROLE` 常量。
+模型配置唯一真理源：`MODEL_ROLE` 常量（`@comdr/core/types.ts`）。
 
-## 运行模式
+## 开发
 
-| 命令 | 行为 |
-|------|------|
-| `comdr` | 交互，破坏性操作确认 |
-| `comdr plan` | 只读分析 |
-| `comdr exec` | 全自动 |
-| `comdr mcp-server` | MCP JSON-RPC endpoint |
-| `comdr session list/resume/delete` | 会话管理 |
+```bash
+pnpm install          # 安装依赖
+pnpm build            # tsc -b 编译全部 TS 包
+pnpm build:tools      # Cargo 编译 Rust → .node
+pnpm typecheck        # 纯类型检查
+pnpm test             # 集成测试
+```
 
-`@comdr/core` 是类型的唯一真理源。工作规范见 [CLAUDE.md](CLAUDE.md)。
+### 包结构
+
+```
+packages/
+  core/       Agent 1 — 类型 + 常量 + 契约（唯一真理源）
+  llm/        Agent 2 — DeepSeek API 客户端
+  engine/     Agent 4 — 编排核心（主循环、prompt、记忆、反思）
+  tools/      Agent 3 — napi-rs 桥接层（TS 侧）
+  ui/         Agent 5 — CLI / TUI / MCP Server
+  vscode/     Agent 6 — VS Code Extension
+crates/
+  comdr-tools/   Agent 3 — Rust 执行层（SDB 管线 + 22 工具）
+```
+
+### 依赖方向（编译期强制）
+
+```
+@comdr/core  ←  纯类型 + 常量，零依赖
+@comdr/llm   ←  依赖 core
+@comdr/engine ← 依赖 core + llm + tools (napi)
+@comdr/ui    ←  依赖 core + engine
+@comdr/vscode ← 依赖 core + engine + llm
+```
+
+工作规范见 [CLAUDE.md](CLAUDE.md)。契约系统见 `packages/core/src/contracts.ts`。

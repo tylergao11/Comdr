@@ -60,10 +60,22 @@ function scoreImportance(
     'lsp_diagnostics', 'lsp_structure'].includes(toolName);
 
   // 计算 diff 变更量
+  // ★ 优先解析 "+N/-M" 格式，避免把文件数、行号等非变更数字错误求和
   let diffChanges = 0;
   if (result.diffSummary) {
-    const nums = result.diffSummary.match(/(\d+)/g);
-    if (nums) diffChanges = nums.reduce((s, n) => s + parseInt(n, 10), 0);
+    const compact = result.diffSummary.match(/\+(\d+)\/-(\d+)/);
+    if (compact) {
+      diffChanges = parseInt(compact[1]!, 10) + parseInt(compact[2]!, 10);
+    } else {
+      // fallback: 统计 unified diff 中的实际 +/- 行
+      let added = 0;
+      let removed = 0;
+      for (const line of result.diffSummary.split('\n')) {
+        if (line.startsWith('+') && !line.startsWith('+++')) added++;
+        else if (line.startsWith('-') && !line.startsWith('---')) removed++;
+      }
+      diffChanges = added + removed;
+    }
   }
 
   let level: ImportanceLevel = 'medium';
@@ -230,6 +242,9 @@ export class WorkingMemory {
    *
    * 对 StateEntry 和 IntentEntry 均可使用（两者均有可选的 importance 字段）。
    * scan O(n), n ≤ MAX_WINDOW_SIZE → 可忽略。
+   *
+   * ★ Tie-breaking: 同分时优先淘汰旧 entry（age = total - posNormalized），
+   *   而非按迭代顺序取第一个。避免"最新低重要性"被误淘汰而"最旧高重要性"被保留。
    */
   private findWorstScoredEntry(
     map: Map<string, StateEntry | IntentEntry>,
@@ -240,10 +255,12 @@ export class WorkingMemory {
     const total = entries.length;
     let worstKey: string | null = null;
     let worstScore = Infinity;
+    let worstAge = 0; // 同分平局时优先淘汰旧的
 
     const w = SYSTEM.IMPORTANCE_WEIGHTS;
 
     for (let i = 0; i < entries.length; i++) {
+      // ★ 循环保证 0 <= i < entries.length → entries[i] 在 bounds 内
       const [, entry] = entries[i]!;
       const impWeight = w[entry.importance ?? 'medium'] ?? w.medium;
       const posNormalized = (i + 1) / total;
@@ -251,9 +268,13 @@ export class WorkingMemory {
       const recencyWeight = Math.pow(posNormalized, SYSTEM.IMPORTANCE_RECENCY_DECAY_EXPONENT);
       // 最低 30% 保证 importance 有保底——即使最旧也不会权重为 0
       const score = impWeight * (0.3 + 0.7 * recencyWeight);
+      // age: 越大表示越旧（posNormalized 越小）
+      const age = total - (i + 1);
 
-      if (score < worstScore) {
+      // score 更低 → 淘汰。同分时优先淘汰更旧的（age 更大的）
+      if (score < worstScore || (score === worstScore && age > worstAge)) {
         worstScore = score;
+        worstAge = age;
         worstKey = entries[i]![0];
       }
     }

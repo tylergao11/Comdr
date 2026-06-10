@@ -76,7 +76,8 @@ export function generateRepoMap(report: BootstrapReport | null): string {
   // ── 目录树 ──
   const crossRefs: string[] = [];
   let totalChars = 0;
-  const budgetPerDir = Math.floor(MAX_REPO_MAP_TOKENS * 3 / dirs.length); // ~3 chars/token
+  // ★ budgetPerDir 传入 formatFileSymbols() 但当前未被消费——预留接口
+  const _budgetPerDir = Math.floor(MAX_REPO_MAP_TOKENS * 3 / dirs.length); // ~3 chars/token
 
   for (const dir of dirs) {
     const files = dirMap[dir]!;
@@ -90,7 +91,7 @@ export function generateRepoMap(report: BootstrapReport | null): string {
 
     // 文件
     for (const [filePath, syms] of Object.entries(files)) {
-      const fmt = formatFileSymbols(filePath, syms, budgetPerDir);
+      const fmt = formatFileSymbols(filePath, syms, _budgetPerDir);
       lines.push(fmt);
       totalChars += fmt.length;
     }
@@ -128,8 +129,13 @@ function filterRelevant(symbols: BootstrapSymbol[]): BootstrapSymbol[] {
       return false;
     }
     // 跳过非关键扩展名的文件
-    const ext = s.file_path.slice(s.file_path.lastIndexOf('.'));
-    if (ext && !MAP_FILE_EXTENSIONS.has(ext)) return false;
+    // ★ 无扩展名的文件（Dockerfile, Makefile, CMakeLists.txt 等）不过滤——
+    //   它们可能是重要的构建/配置文件
+    const dotIdx = s.file_path.lastIndexOf('.');
+    if (dotIdx > 0) {
+      const ext = s.file_path.slice(dotIdx);
+      if (!MAP_FILE_EXTENSIONS.has(ext)) return false;
+    }
     return true;
   });
 }
@@ -208,8 +214,8 @@ function formatFileSymbols(
     }
   }
 
-  if (sorted.length > 5) {
-    acc += `\n│   ... (+${sorted.length - 5} more)`;
+  if (sorted.length > SYSTEM.REPOMAP_SYMBOLS_PER_FILE) {
+    acc += `\n│   ... (+${sorted.length - SYSTEM.REPOMAP_SYMBOLS_PER_FILE} more)`;
   }
 
   return acc;

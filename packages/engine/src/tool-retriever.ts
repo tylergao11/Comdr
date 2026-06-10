@@ -11,7 +11,7 @@
  */
 
 import type { ToolDefinition } from '@comdr/core/types';
-import { ALL_TOOLS_SENTINEL } from '@comdr/core';
+import { ALL_TOOLS_SENTINEL, SYSTEM } from '@comdr/core';
 import {
   tokenize,
   BM25Scorer,
@@ -130,11 +130,17 @@ export class ToolRetriever {
 
     scores.sort((a, b) => b.score - a.score);
 
-    // 取 top-K，score > 0.01 的
+    // 取 top-K，score > TOOL_RETRIEVER_BM25_THRESHOLD 的
     const result: string[] = [];
     for (const s of scores) {
       if (result.length >= topK) break;
-      if (s.score > 0.01) {
+      if (s.score > SYSTEM.TOOL_RETRIEVER_BM25_THRESHOLD) {
+        // ★ BM25 参数 k1/b 变化影响分数分布，此阈值需同步校准。
+        //   BM25Scorer 默认 k1=1.2, b=0.75。
+        //   k1 增大 → 高频词 TF 更易饱和 → 文档间分数差异缩小 → 阈值应降低。
+        //   b 增大 → 长度归一化更强 → 长文档分数被压低 → 阈值应降低。
+        //   当前阈值 0.01 极低，对 18-30 个内置工具池有效；
+        //   引入大量 MCP 工具后应重新评估分数分布并调整此值。
         result.push(s.name);
       }
     }

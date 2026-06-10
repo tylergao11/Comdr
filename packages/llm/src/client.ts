@@ -32,7 +32,6 @@ import { serializeTools } from './prompt-cache.js';
 // ============================================================================
 
 const DEFAULT_BASE_URL = 'https://api.deepseek.com';
-const BETA_BASE_URL = 'https://api.deepseek.com/beta';
 const MAX_RETRIES = SYSTEM.LLM_MAX_RETRIES;
 const RETRY_BASE_MS = SYSTEM.LLM_RETRY_BASE_MS;
 
@@ -254,6 +253,7 @@ export class DeepSeekClient implements IDeepSeekClient {
         if (payload === '[DONE]') continue;
 
         try {
+          // ★ 信任 DeepSeek API 响应格式——JSON 解析成功后类型断言安全
           const chunk = JSON.parse(payload) as DeepSeekChunk;
 
           if (chunk.usage) {
@@ -305,11 +305,12 @@ export class DeepSeekClient implements IDeepSeekClient {
           }
         } catch {
           // JSON 解析失败 → 跳过（非标准 SSE payload）
-          // ★ 累计失败超过阈值时警告——避免静默丢弃所有响应
           sseParseFailures++;
-          if (sseParseFailures === 50) {
+          // ★ 使用 >= 防止计数器溢出后错过阈值；
+          //   每 100 次失败重新报告，避免永远静默
+          if (sseParseFailures >= 50 && sseParseFailures % 100 === 50) {
             console.warn(
-              '[Comdr] SSE parse: 50 consecutive non-JSON data lines. ' +
+              `[Comdr] SSE parse: ${sseParseFailures} non-JSON data lines. ` +
               'DeepSeek response format may have changed.',
             );
           }
@@ -422,11 +423,11 @@ export class DeepSeekClient implements IDeepSeekClient {
   private getEndpoint(params: ChatParams): string {
     // ★ 检测是否包含 prefix: true 的 assistant message
     // 有 → 使用 beta Chat Prefix Completion endpoint
+    // 基于用户配置的 baseUrl 拼接，而非硬编码 api.deepseek.com
     const hasPrefix = params.messages.some(
       (m) => m.role === MESSAGE_ROLE.ASSISTANT && m.prefix === true,
     );
-
-    const baseUrl = hasPrefix ? BETA_BASE_URL : this.baseUrl;
+    const baseUrl = hasPrefix ? `${this.baseUrl}/beta` : this.baseUrl;
     return `${baseUrl}/chat/completions`;
   }
 
@@ -440,6 +441,17 @@ export class DeepSeekClient implements IDeepSeekClient {
    * 重试: 429 / 5xx → 指数退避 1s→2s→4s，max 3 次
    * 不重试: 401 / 403 → 直接抛 DeepSeekAuthError
    */
+  /**
+   * 指数退避延迟计算。
+   * ★ 单一真理源——保证 HTTP 重试和网络错误重试使用相同的退避公式。
+   *   attempt=0 → RETRY_BASE_MS (1s)
+   *   attempt=1 → RETRY_BASE_MS * 2 (2s)
+   *   attempt=2 → RETRY_BASE_MS * 4 (4s)
+   */
+  private backoffDelay(attempt: number): number {
+    return RETRY_BASE_MS * Math.pow(2, attempt);
+  }
+
   private async fetchWithRetry(
     url: string,
     body: DeepSeekRequestBody,
@@ -477,8 +489,7 @@ export class DeepSeekClient implements IDeepSeekClient {
           );
 
           if (attempt < MAX_RETRIES) {
-            const delay = RETRY_BASE_MS * Math.pow(2, attempt); // 1s, 2s, 4s
-            await sleep(delay);
+            await sleep(this.backoffDelay(attempt));
             continue;
           }
 
@@ -505,8 +516,7 @@ export class DeepSeekClient implements IDeepSeekClient {
         lastError = err instanceof Error ? err : new Error(String(err));
 
         if (attempt < MAX_RETRIES) {
-          const delay = RETRY_BASE_MS * Math.pow(2, attempt);
-          await sleep(delay);
+          await sleep(this.backoffDelay(attempt));
           continue;
         }
         throw lastError;

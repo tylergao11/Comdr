@@ -139,7 +139,28 @@ export interface Message {
    * 生命周期管理由 Agent 4 reasoning.ts 负责，Agent 2 负责原样传递。
    */
   reasoning_content?: string;
-  /** Chat Prefix Completion 标记（beta endpoint） */
+  /**
+   * Chat Prefix Completion 标记（beta endpoint）。
+   * 当此 message 是最后一条 assistant 消息且希望利用前缀缓存时设为 true。
+   * ★ 设置后 getEndpoint() 会将 baseUrl 切换到 /beta 路径。
+   * ★ prefix=true 的 message 必须保留 reasoning_content（即使是空串）。
+   *
+   * 谁负责设置:
+   *   - Agent 4 reflection.ts selfCorrect() 在构造纠正消息时设置 prefix=true
+   *   - Agent 2 endpoint 选择时读取此字段
+   *
+   * 设置时机:
+   *   只有在需要利用 Chat Prefix Completion 前缀缓存时才设。
+   *   普通推理轮次不设此字段（保持默认 undefined / false）。
+   *
+   * 与 reasoning_content 的关系:
+   *   prefix=true 时仍必须保留 reasoning_content（即使是空串），
+   *   因为 DeepSeek 要求消息链中 reasoning_content 不能断裂。
+   *   prefix 只影响路由（/v1/chat/completions → /beta/chat/completions），
+   *   不影响 reasoning_content 的处理逻辑。
+   *
+   * @contract Agent 2 (endpoint 选择)、Agent 4 (reflection.ts selfCorrect 设置) 使用
+   */
   prefix?: boolean;
 }
 
@@ -268,8 +289,9 @@ export interface ToolExecuteOptions {
  * Agent 3 返回的执行结果（原生层 → 已合并进 ToolResult）
  *
  * @deprecated 使用 ToolResult 代替。INativeTools.execute() 现在直接返回 ToolResult。
- *   保留此类型仅用于向后兼容的文档引用。
- * @contract Agent 3 → Agent 4
+ *   此类型保留仅用于文档引用，不要在新代码中导入。
+ *   移除时间线: Phase 2 重构时删除。
+ * @contract Agent 3 → Agent 4（仅文档引用）
  */
 export interface ToolExecuteResult {
   ok: boolean;
@@ -566,7 +588,7 @@ export type PermissionMode =
   | 'strict';
 
 // ============================================================================
-// §7 记忆系统
+// §8 记忆系统
 // ============================================================================
 
 /**
@@ -608,7 +630,7 @@ export interface SessionAnchor {
 }
 
 // ============================================================================
-// §8 进度系统
+// §9 进度系统
 // ============================================================================
 
 /**
@@ -639,7 +661,7 @@ export interface ProgressSignal {
  */
 
 // ============================================================================
-// §9 引擎/编排系统
+// §10 引擎/编排系统
 // ============================================================================
 
 /**
@@ -661,7 +683,7 @@ export interface RunResult {
 }
 
 // ============================================================================
-// §10 规划系统
+// §11 规划系统
 // ============================================================================
 
 /**
@@ -706,7 +728,7 @@ export interface PlanStep {
 }
 
 // ============================================================================
-// §11 Skills 系统
+// §12 Skills 系统
 // ============================================================================
 
 /**
@@ -725,7 +747,7 @@ export interface SkillManifest {
 }
 
 // ============================================================================
-// §13 LLM 客户端系统
+// §14 LLM 客户端系统
 // ============================================================================
 
 /**
@@ -767,7 +789,7 @@ export interface TokenUsage {
 }
 
 // ============================================================================
-// §14 路由与终止系统
+// §15 路由与终止系统
 // ============================================================================
 
 /**
@@ -797,7 +819,7 @@ export type TerminationReason =
   | 'timeout';
 
 // ============================================================================
-// §15 上下文压缩系统
+// §16 上下文压缩系统
 // ============================================================================
 
 /**
@@ -883,7 +905,7 @@ export interface ReflectionEntry {
 }
 
 // ============================================================================
-// §16 反思系统
+// §17 反思系统
 // ============================================================================
 
 /**
@@ -925,7 +947,7 @@ export interface InterReflection {
 }
 
 // ============================================================================
-// §17 命名规范——事件类型常量
+// §18 命名规范——事件类型常量
 // ============================================================================
 
 /**
@@ -1204,8 +1226,7 @@ export const SYSTEM = {
   COMPACTION_MAX_DECISIONS: 15,
 
   // ---- Prompt 构造 ----
-  /** L6 最近历史保留的对话轮数 */
-  /** @deprecated L6 不再按轮次截断——由 ContextManager 按 token 预算主动压缩 */
+
 
   // ---- 记忆系统 ----
   /** 情景记忆 embedding 维度 */
@@ -1277,6 +1298,58 @@ export const SYSTEM = {
   SKILLS_RETRIEVAL_TOPK: 2,
   /** Skills BM25 score 激活阈值 */
   SKILLS_SEMANTIC_THRESHOLD: 0.15,
+
+  // ---- Procedural Memory 跨项目模式提取 ----
+  /** 模式提取最大 episode 数 */
+  PROCUDURAL_EXTRACTION_MAX_EPISODES: 20,
+
+  // ---- Self-Check 自检管线 ----
+  /** 同类文件最多读取数 */
+  SELF_CHECK_MAX_SIBLINGS: 3,
+  /** 单条检查消息最大字符数 */
+  SELF_CHECK_MAX_MESSAGE_LENGTH: 120,
+  /** 单文件最大行数（file_size_guard 规则） */
+  SELF_CHECK_MAX_FILE_LINES: 300,
+  /** 文件大小 guard 警告最低 class 数 */
+  SELF_CHECK_MAX_CLASSES_PER_FILE: 3,
+
+  // ---- 工具超时默认值 ----
+  /** 只读工具默认超时 (ms) */
+  DEFAULT_TIMEOUT_READ_ONLY: 10_000,
+  /** 破坏性工具默认超时 (ms) */
+  DEFAULT_TIMEOUT_DESTRUCTIVE: 30_000,
+  /** 需确认工具默认超时 (ms) */
+  DEFAULT_TIMEOUT_REQUIRES_APPROVAL: 60_000,
+
+  // ---- 日志 ----
+  /** 日志旋转保留行数 */
+  LOG_RETAIN_LINES: 1000,
+
+  // ---- 语义记忆 ----
+  /** 因果图最大条目数（超限触发淘汰） */
+  CAUSAL_GRAPH_MAX_LENGTH: 100,
+
+  // ---- 会话持久化 ----
+  /** 会话 JSON 文件最大字节数 (~5MB) */
+  MAX_SESSION_FILE_SIZE: 5_000_000,
+  /** 裁剪时保留的最近 tool result 条数 */
+  SESSION_KEEP_TOOL_RESULTS: 20,
+  /** tool result 内容超过此字符数时触发剪切 */
+  SESSION_TRIM_CONTENT_THRESHOLD: 200,
+
+  // ---- 文件搜索/索引 ----
+  /** 项目文件扫描上限 */
+  SCAN_PROJECT_MAX_FILES: 200,
+  /** BM25 索引时文件内容截断字符数 */
+  FILE_INDEX_TRUNCATE_CHARS: 8000,
+
+  // ---- 工具检索 ----
+  /** BM25 工具检索 score 阈值 */
+  TOOL_RETRIEVER_BM25_THRESHOLD: 0.01,
+
+  // ---- MCP ----
+  /** MCP 工具调用默认超时 (ms) */
+  MCP_DEFAULT_TIMEOUT_MS: 30_000,
 } as const;
 
 /**
@@ -1288,3 +1361,166 @@ export const ALL_TOOLS_SENTINEL = 'all' as const;
  * 上下文掩码前缀——标记被压缩的 tool result
  */
 export const MASKED_PREFIX = '[masked]' as const;
+
+// ============================================================================
+// §19 VS Code 深度集成（Contract F1/F2 共享类型）
+// ============================================================================
+
+/**
+ * LSP 诊断严重级别
+ * @contract Terminal 1 (Fork) → Terminal 2 (Extension) → Terminal 3 (Engine)
+ */
+export type LSPDiagnosticSeverity = 'error' | 'warning' | 'hint';
+
+/**
+ * LSP 诊断条目——从 Language Server 返回的单条诊断
+ *
+ * ★ 关键: 这是 Agent 的"编译器事实来源"。
+ *   Lanser-CLI 论文: LSP 诊断差值可作为过程奖励信号。
+ *   JetBrains PSI 论文: 结构化诊断注入 → Recall@1 +20%。
+ *
+ * @contract Terminal 1 (Fork) → Terminal 2 (Extension) → Terminal 3 (Engine)
+ */
+export interface LSPDiagnostic {
+  /** 文件路径（绝对路径） */
+  file: string;
+  /** 行号（1-based） */
+  line: number;
+  /** 列号（1-based） */
+  column: number;
+  /** 严重级别 */
+  severity: LSPDiagnosticSeverity;
+  /** 人类可读的诊断消息 */
+  message: string;
+  /** LSP 诊断代码（如 'ts(2322)', 'unused-import'） */
+  code?: string;
+  /** 来源（如 'ts', 'eslint', 'rust-analyzer'） */
+  source?: string;
+}
+
+/**
+ * LSP 文件语义上下文——Agent 友好的结构化代码理解
+ *
+ * 组合了多个 LSP 调用结果:
+ *   - textDocument/documentSymbol → exports
+ *   - textDocument/hover → 类型签名
+ *   - textDocument/references → callers
+ *   - callHierarchy/outgoingCalls → callees
+ *   - typeHierarchy → typeDependencies
+ *
+ * ★ LSAP 论文核心洞察: Agent 不应该做 12 次 LSP 原子调用。
+ *   这个类型把 12 次调用压缩为 1 个结构化对象。
+ *
+ * @contract Terminal 2 (Extension) → Terminal 3 (Engine)
+ */
+export interface LSPFileContext {
+  /** 文件路径（绝对路径） */
+  file: string;
+  /** 导出符号列表 */
+  exports: readonly LSPSymbolInfo[];
+  /** 导入符号列表 */
+  imports: readonly LSPImportInfo[];
+  /** 调用者——谁调用了当前文件的符号 */
+  callers: readonly LSPCallerInfo[];
+  /** 被调用者——当前文件的符号调用了谁 */
+  callees: readonly LSPCalleeInfo[];
+  /** 类型依赖关系 */
+  typeDependencies: readonly LSPTypeEdge[];
+  /** 当前 LSP 诊断 */
+  diagnostics: readonly LSPDiagnostic[];
+}
+
+/** 符号信息 */
+export interface LSPSymbolInfo {
+  name: string;
+  kind: 'function' | 'class' | 'type' | 'variable' | 'interface' | 'enum';
+  /** 类型签名（如 '(x: number) => string'） */
+  signature: string;
+  /**
+   * 在文件中的位置（行号，1-based）。
+   * LSP 协议使用 0-based 行号，但此类型在映射层转换为 1-based 以便 Agent 阅读。
+   */
+  line: number;
+}
+
+/** 导入信息 */
+export interface LSPImportInfo {
+  name: string;
+  from: string;
+  /** 在此文件中何处使用（行号列表，简化为首次使用行号） */
+  usedAtLine?: number;
+}
+
+/** 调用者信息 */
+export interface LSPCallerInfo {
+  /** 调用者符号名 */
+  symbol: string;
+  /** 调用者所在文件 */
+  file: string;
+  /** 调用位置（行号，1-based） */
+  line: number;
+}
+
+/** 被调用者信息 */
+export interface LSPCalleeInfo {
+  /** 被调用的符号名 */
+  symbol: string;
+  /** 被调用符号所在文件 */
+  file: string;
+}
+
+/** 类型依赖边 */
+export interface LSPTypeEdge {
+  /** 类型名 */
+  name: string;
+  /** 关系类型 */
+  relation: 'extends' | 'implements' | 'union-member' | 'type-reference';
+}
+
+/**
+ * LSP 诊断快照——用于计算 Agent 操作前后的诊断差值
+ *
+ * ★ Lanser-CLI 论文: 诊断差值 = 过程奖励信号的基础。
+ *   D_before - D_after > 0 → Agent 修复了错误（奖励）
+ *   D_after - D_before > 0 → Agent 引入了新错误（惩罚）
+ *
+ * @contract Terminal 2 (Extension) → Terminal 3 (Engine reflection.ts)
+ */
+export interface DiagnosticSnapshot {
+  /** 文件路径 */
+  file: string;
+  /** 文件内容 SHA256（用于确认快照对应正确的文件状态） */
+  hash: string;
+  /** 快照时的诊断列表 */
+  diagnostics: LSPDiagnostic[];
+  /** 快照时间戳 */
+  timestamp: number;
+}
+
+/**
+ * LSP 诊断差值——Agent 操作前后诊断变化
+ *
+ * @contract Terminal 2 (Extension) → Terminal 3 (Engine reflection.ts)
+ */
+export interface DiagnosticDelta {
+  /** Agent 新引入的诊断（操作前没有，操作后有） */
+  introduced: LSPDiagnostic[];
+  /** Agent 修复的诊断（操作前有，操作后没有） */
+  fixed: LSPDiagnostic[];
+  /** 未改变的诊断（操作前后都存在） */
+  unchanged: LSPDiagnostic[];
+}
+
+// ============================================================================
+// §20 VS Code 集成常量
+// ============================================================================
+
+/**
+ * LSP Diagnostic 严重级别常量
+ * @contract 所有 Agent 使用此常量，禁止硬编码字符串
+ */
+export const LSP_SEVERITY = {
+  ERROR: 'error',
+  WARNING: 'warning',
+  HINT: 'hint',
+} as const;

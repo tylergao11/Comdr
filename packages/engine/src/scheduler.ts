@@ -56,6 +56,7 @@ export function scheduleParallel(calls: ToolCall[]): Schedule {
     for (let j = 0; j < i; j++) {
       // j.i 顺序: 只有当 task[j] 和 task[i] 冲突时, i 才等 j
       // 冲突 = 路径有交集 + 至少一个写操作
+      // ★ 循环保证 0 <= j < i < n → tasks[j] / tasks[i] / adj[j] 均在 bounds 内
       if (conflict(tasks[j]!, tasks[i]!)) {
         adj[j]!.push(i);
         indeg[i]!++;
@@ -73,6 +74,7 @@ export function scheduleParallel(calls: ToolCall[]): Schedule {
 
   while (frontier.length > 0) {
     // 当前层: 所有入度=0 的节点 → 可并行执行
+    // frontier 只包含 [0, n) 内的索引 → calls[i] 保证在 bounds 内
     layers.push(frontier.map((i) => calls[i]!));
 
     const next: number[] = [];
@@ -120,7 +122,9 @@ function extractTask(call: ToolCall): Task {
   // shell 命令 → 尝试提取文件路径（保守: 标记为互斥）
   if (name === 'shell_bash' && typeof args.command === 'string') {
     const cmd = args.command as string;
-    const matches = cmd.match(/(?:\/|\.\/|\.\.\/)[^\s]+/g);
+    // 同时支持 Unix (/) 和 Windows (\) 路径。Windows 路径如 C:\Users\file.ts
+    // 正则使用 [\\/] 而非只匹配 /，防止反斜杠路径被遗漏导致并行竞态。
+    const matches = cmd.match(/(?:[a-zA-Z]:)?(?:[\\/]|\.(?:[\\/]|\.(?:[\\/])?))[^\s]+/g);
     if (matches) {
       for (const m of matches) paths.push(normalizePath(m));
     } else {
@@ -129,15 +133,26 @@ function extractTask(call: ToolCall): Task {
     }
   }
 
-  // git 操作 → 无文件路径 → 不冲突
-  // (git_diff/status/log 都是只读, git_add/commit/revert 有写但无路径交集)
+  // git 写操作无文件路径——标记为 __git__ 特殊路径防止竞态
+  if (
+    (name === 'git_add' || name === 'git_commit' || name === 'git_revert') &&
+    paths.length === 0
+  ) {
+    paths.push('__git__');
+  }
 
   const isWrite = !READ_ONLY_TOOLS.has(name);
 
   return { call, paths, isWrite };
 }
 
-/** 只读工具集合 */
+/** 只读工具集合。
+ *
+ * shell_bash 未包含在此集合中（即使纯读命令），
+ * 因为 shell 命令可执行任意操作，无法静态判断是否为只读。
+ * 这是保守的安全设计：所有 shell 命令被视为写操作，
+ * 与任何有路径依赖的工具串行执行。
+ */
 const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'file_read', 'file_grep', 'file_glob', 'file_ls',
   'git_diff', 'git_status', 'git_log',

@@ -310,6 +310,7 @@ export class ContextManager {
       }
     } catch {
       // LLM 摘要失败 → 返回空摘要（静默降级）
+      console.warn('[context] LLM summarizeSegment failed, returning empty summary');
     }
 
     return {
@@ -506,6 +507,24 @@ export class ContextManager {
         },
       ];
 
+      // ★ 保留最后一条 assistant 消息的 reasoning_content
+      //   Stage 4 压缩删除了所有 assistant 消息，导致 reasoning_content 链断裂。
+      //   DeepSeek 要求：后续请求中任何有 tool_calls 的 assistant 消息
+      //   必须携带 reasoning_content，否则 400 错误。
+      //   这里从原始消息中提取最后一条有 reasoning_content 的 assistant 消息，
+      //   将其作为最小占位消息插入压缩结果，保证链不中断。
+      const lastAssistantWithRC = findLast(
+        session.messages,
+        (m) => m.role === MESSAGE_ROLE.ASSISTANT && m.reasoning_content !== undefined,
+      );
+      if (lastAssistantWithRC) {
+        result.unshift({
+          role: MESSAGE_ROLE.ASSISTANT,
+          content: '',
+          reasoning_content: lastAssistantWithRC.reasoning_content,
+        });
+      }
+
       return {
         messages: result,
         result: {
@@ -517,8 +536,23 @@ export class ContextManager {
       };
     } catch {
       // LLM 压缩失败 → 极端降级：保留 state window + 用户输入
+      console.warn('[context] LLM fullCompact failed, falling back to extreme degradation');
       const windowContext = this.buildWindowContext(session);
       const fallbackMessages: Message[] = [];
+
+      // ★ 保留 reasoning_content 链（同上）
+      const lastAssistantWithRC = findLast(
+        session.messages,
+        (m) => m.role === MESSAGE_ROLE.ASSISTANT && m.reasoning_content !== undefined,
+      );
+      if (lastAssistantWithRC) {
+        fallbackMessages.push({
+          role: MESSAGE_ROLE.ASSISTANT,
+          content: '',
+          reasoning_content: lastAssistantWithRC.reasoning_content,
+        });
+      }
+
       if (windowContext) {
         fallbackMessages.push({
           role: MESSAGE_ROLE.SYSTEM,
@@ -641,7 +675,8 @@ export class ContextManager {
    * 单段文本的 token 估算——根据 CJK 占比加权
    */
   private estimateTextTokens(text: string): number {
-    const cjkCount = (text.match(/[一-鿿㐀-䶿　-〿＀-￯]/g) || []).length;
+    // ★ 覆盖 CJK 汉字 + 韩文 + 日文假名，防止日韩文本 token 估算偏高
+    const cjkCount = (text.match(/[一-鿿㐀-䶿　-〿＀-￯가-힣ぁ-んァ-ヶ]/g) || []).length;
     const otherCount = text.length - cjkCount;
     // CJK: ~1.5 chars/token, 非 CJK: ~3.5 chars/token
     return cjkCount / 1.5 + otherCount / 3.5;
@@ -697,6 +732,16 @@ function findLastIndex<T>(
     if (predicate(arr[i]!)) return i;
   }
   return -1;
+}
+
+function findLast<T>(
+  arr: T[],
+  predicate: (item: T) => boolean,
+): T | undefined {
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (predicate(arr[i]!)) return arr[i];
+  }
+  return undefined;
 }
 
 /**

@@ -325,8 +325,13 @@ fn run_test(
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // Best-effort: kill and reap timed-out test runner.
+                    if let Err(e) = child.kill() {
+                        eprintln!("[test_feedback] failed to kill timed-out runner: {}", e);
+                    }
+                    if let Err(e) = child.wait() {
+                        eprintln!("[test_feedback] failed to reap runner: {}", e);
+                    }
                     return TestFeedbackResult::ExecutionError {
                         message: "Test runner timed out after 90s".to_string(),
                     };
@@ -341,12 +346,24 @@ fn run_test(
         }
     };
 
-    // Collect output
+    // Collect output — best-effort reads after process exit
     let stdout = child.stdout.as_mut()
-        .map(|s| { let mut buf = String::new(); let _ = std::io::Read::read_to_string(s, &mut buf); buf })
+        .map(|s| {
+            let mut buf = String::new();
+            if let Err(e) = std::io::Read::read_to_string(s, &mut buf) {
+                eprintln!("[test_feedback] read stdout error: {}", e);
+            }
+            buf
+        })
         .unwrap_or_default();
     let stderr = child.stderr.as_mut()
-        .map(|s| { let mut buf = String::new(); let _ = std::io::Read::read_to_string(s, &mut buf); buf })
+        .map(|s| {
+            let mut buf = String::new();
+            if let Err(e) = std::io::Read::read_to_string(s, &mut buf) {
+                eprintln!("[test_feedback] read stderr error: {}", e);
+            }
+            buf
+        })
         .unwrap_or_default();
     let combined = format!("{}\n{}", stdout, stderr);
 

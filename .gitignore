@@ -12,3 +12,9 @@ Thumbs.db
 crates/comdr-tools/target/
 # Rust lockfile (generated)
 Cargo.lock
+# VS Code Fork (external dep, not part of Comdr)
+vscode-fork/
+# VS Code Extension package output
+*.vsix
+# Vite build cache
+.vite/

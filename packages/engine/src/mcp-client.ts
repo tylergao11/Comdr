@@ -13,7 +13,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { validateJSONSchemaProperty, SERVER_STATUS, TOOL_PERMISSION } from '@comdr/core';
+import { validateJSONSchemaProperty, SERVER_STATUS, TOOL_PERMISSION, SYSTEM } from '@comdr/core';
 import type { ToolDefinition, MCPServerConfig, JSONSchema, JSONSchemaProperty, MCPServerStatus } from '@comdr/core/types';
 
 // ============================================================================
@@ -143,10 +143,13 @@ export class MCPClient {
         });
       }
 
-      // stderr 日志（静默丢弃，生产环境可记录到日志）
+      // stderr 日志——记录到 logger，不静默丢弃
       if (proc.stderr) {
-        proc.stderr.on('data', () => {
-          // stderr 仅用于调试
+        proc.stderr.on('data', (chunk: Buffer) => {
+          const text = chunk.toString('utf-8').trim();
+          if (text) {
+            console.warn(`[Comdr] MCP [${cfg.name}] stderr: ${text}`);
+          }
         });
       }
 
@@ -361,7 +364,7 @@ export class MCPClient {
       const timer = setTimeout(() => {
         pending.delete(id);
         reject(new Error(`MCP request timeout: ${method}`));
-      }, 30_000);
+      }, SYSTEM.MCP_DEFAULT_TIMEOUT_MS);
 
       // ★ 注册 resolver（自动清除超时）
       pending.set(id, (response) => {
@@ -370,7 +373,12 @@ export class MCPClient {
       });
 
       try {
-        proc.stdin!.write(JSON.stringify(request) + '\n');
+        if (proc.stdin) {
+          proc.stdin.write(JSON.stringify(request) + '\n');
+        } else {
+          reject(new Error('MCP process stdin is not available'));
+          return;
+        }
       } catch (err) {
         clearTimeout(timer);
         pending.delete(id);
@@ -463,7 +471,7 @@ export class MCPClient {
       description: typeof t?.description === 'string' ? t.description : '',
       parameters,
       permission: TOOL_PERMISSION.REQUIRES_APPROVAL,
-      timeoutMs: 30_000,
+      timeoutMs: SYSTEM.MCP_DEFAULT_TIMEOUT_MS,
     };
   }
 
@@ -487,7 +495,8 @@ export class MCPClient {
     // 至少需要 3 段: mcp, server, tool
     if (parts.length < 3 || parts[0] !== 'mcp') return null;
 
-    const tool = parts[parts.length - 1]!;
+    // 使用 .at(-1) 替代 [parts.length - 1]!: 空数组时返回 undefined，不会产生 undefined!
+    const tool = parts.at(-1);
     // server 名 = 中间所有段用 "__" 连接
     const serverName = parts.slice(1, -1).join('__');
 
@@ -503,18 +512,30 @@ export class MCPClient {
     if (!result || typeof result !== 'object') return null;
 
     const r = result as Record<string, unknown>;
-    // MCP content array: [{ type: 'text', text: '...' }]
+    // MCP content array: [{ type: 'text', text: '...' }, { type: 'image', ... }, ...]
     if (Array.isArray(r.content)) {
-      const texts = r.content
-        .filter(
-          (c: unknown) =>
-            typeof c === 'object' &&
-            c !== null &&
-            (c as Record<string, unknown>).type === 'text',
-        )
-        .map((c: unknown) => (c as Record<string, unknown>).text as string)
-        .filter(Boolean);
-      return texts.join('\n') || null;
+      const parts: string[] = [];
+      for (const c of r.content as Array<Record<string, unknown>>) {
+        if (!c || typeof c !== 'object') continue;
+        if (c.type === 'text' && typeof c.text === 'string') {
+          parts.push(c.text);
+        } else if (c.type === 'image' && typeof c.data === 'string') {
+          // ★ 保留 image——描述 MIME 类型和数据长度，不丢弃
+          const mime = typeof c.mimeType === 'string' ? c.mimeType : 'image';
+          parts.push(`[${mime} data: ${c.data.length} bytes]`);
+        } else if (c.type === 'resource' || c.type === 'embedded_resource') {
+          // ★ 保留 resource URI 引用
+          const uri = typeof c.uri === 'string' ? c.uri : 'unknown';
+          // ★ 截断到 200 字符：MCP resource 文本可能极大（整个文件内容），
+          //    prompt 中只保留开头片段作为上下文指纹，完整内容通过后续工具调用获取。
+          const text = typeof c.text === 'string' ? `: ${c.text.slice(0, 200)}` : '';
+          parts.push(`[resource: ${uri}${text}]`);
+        } else if (c.type) {
+          // ★ 未知类型保留类型名，不静默丢弃
+          parts.push(`[${c.type}]`);
+        }
+      }
+      return parts.join('\n') || null;
     }
 
     return JSON.stringify(r);

@@ -1,0 +1,70 @@
+{
+  "name": "@comdr/vscode",
+  "version": "0.1.0",
+  "publisher": "comdr",
+  "private": true,
+  "type": "module",
+  "displayName": "Comdr",
+  "description": "DeepSeek-powered coding agent — VS Code integration",
+  "main": "./dist/extension.cjs",
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:comdr.chatView"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "comdr",
+          "title": "Comdr",
+          "icon": "$(hubot)"
+        }
+      ]
+    },
+    "views": {
+      "comdr": [
+        {
+          "type": "webview",
+          "id": "comdr.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "comdr.openChat",
+        "title": "Comdr: Open Chat"
+      },
+      {
+        "command": "comdr.newTask",
+        "title": "Comdr: New Task"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/extension.cjs --external:vscode --external:typescript --external:electron --tsconfig=tsconfig.json && vite build",
+    "typecheck": "tsc --noEmit",
+    "watch:webview": "vite build --watch",
+    "package": "vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "@comdr/core": "workspace:*",
+    "@comdr/engine": "workspace:*",
+    "@comdr/llm": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "@types/vscode": "^1.92.0",
+    "@vscode/vsce": "^3.6.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "esbuild": "^0.28.0",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "typescript": "^5.8.0",
+    "vite": "^5.0.0"
+  }
+}

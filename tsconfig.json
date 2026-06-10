@@ -4,6 +4,7 @@
     { "path": "packages/core" },
     { "path": "packages/llm" },
     { "path": "packages/engine" },
-    { "path": "packages/ui" }
+    { "path": "packages/ui" },
+    { "path": "packages/vscode" }
   ]
 }

@@ -10,6 +10,7 @@
  */
 
 import type { ToolDefinition, JSONSchema, JSONSchemaProperty } from '@comdr/core/types';
+import { SYSTEM, TOOL_PERMISSION } from '@comdr/core';
 
 // ============================================================================
 // §1 类型
@@ -38,10 +39,11 @@ export interface ToolDecl {
 // §2 createTool — 工厂函数
 // ============================================================================
 
+/** 默认超时——来自 SYSTEM 常量（单真理源） */
 const DEFAULT_TIMEOUTS: Record<string, number> = {
-  read_only: 10000,
-  destructive: 30000,
-  requires_approval: 60000,
+  read_only: SYSTEM.DEFAULT_TIMEOUT_READ_ONLY,
+  destructive: SYSTEM.DEFAULT_TIMEOUT_DESTRUCTIVE,
+  requires_approval: SYSTEM.DEFAULT_TIMEOUT_REQUIRES_APPROVAL,
 };
 
 /**

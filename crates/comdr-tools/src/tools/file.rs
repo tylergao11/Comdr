@@ -108,8 +108,22 @@ impl Tool for FileReadTool {
 // file_read helpers
 // ============================================================================
 
+/// Maximum in-memory file size for read operations (10 MB).
+/// Files larger than this are rejected to prevent OOM.
+const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Full-mode read — existing offset/limit behavior extracted into a free function.
 fn exec_full(path: &str, args: &Value) -> ToolOutput {
+    // ★ OOM 保护：大于 10MB 的文件拒绝全量读取
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_READ_SIZE {
+            return ToolOutput::err("file_read", "FILE_TOO_LARGE",
+                &[("path", path), ("size_bytes", &meta.len().to_string())],
+                Some(&format!("File is {} MB — use offset/limit or summary mode", meta.len() / 1_048_576)),
+            );
+        }
+    }
+
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => return ToolOutput::err("file_read", "EXECUTION_FAILED", &[("path", path)], Some(&e.to_string())),
@@ -140,19 +154,29 @@ fn exec_full(path: &str, args: &Value) -> ToolOutput {
 /// Summary mode — uses the same pattern-based extractors as bootstrap
 /// to return a structured symbol list instead of full file content.
 fn exec_summary(path: &str) -> ToolOutput {
+    // ★ OOM 保护：大于 10MB 的文件拒绝 summary 模式
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_READ_SIZE {
+            return ToolOutput::err("file_read", "FILE_TOO_LARGE",
+                &[("path", path), ("size_bytes", &meta.len().to_string())],
+                Some("File too large for summary mode"),
+            );
+        }
+    }
+
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => return ToolOutput::err("file_read", "EXECUTION_FAILED", &[("path", path)], Some(&e.to_string())),
     };
 
-    let lang = language_from_ext(path);
-    if lang.is_none() {
-        let total = content.lines().count();
-        let preview: String = content.lines().take(40).collect::<Vec<_>>().join("\n");
-        return ToolOutput::ok("file_read", &[("path", path), ("mode", "summary"), ("lines", &total.to_string())], Some(&preview));
-    }
-
-    let lang = lang.unwrap();
+    let lang = match language_from_ext(path) {
+        Some(l) => l,
+        None => {
+            let total = content.lines().count();
+            let preview: String = content.lines().take(40).collect::<Vec<_>>().join("\n");
+            return ToolOutput::ok("file_read", &[("path", path), ("mode", "summary"), ("lines", &total.to_string())], Some(&preview));
+        }
+    };
     let (symbols, references) = extract_symbols(path, &content, lang);
     let total_lines = content.lines().count();
 
@@ -239,7 +263,7 @@ fn exec_selector(path: &str, symbol_name: &str) -> ToolOutput {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let header = format!(
+    let _header = format!(
         "File: {} | Symbol: {}() @ line {} (lines {}-{} of {})\n\n",
         path, symbol_name, line_num, start + 1, end, total,
     );
@@ -311,7 +335,7 @@ fn exec_blueprint(path: &str) -> ToolOutput {
     let vars: Vec<_> = symbols.iter().filter(|s| s.kind == "variable").collect();
     if !vars.is_empty() {
         out.push_str("\n📌 Constants/Variables:\n");
-        for v in &vars.iter().take(5) {
+        for v in vars.iter().take(5) {
             out.push_str(&format!("  - {}\n", v.name));
         }
     }
@@ -322,7 +346,7 @@ fn exec_blueprint(path: &str) -> ToolOutput {
         .collect();
     if !project_refs.is_empty() {
         out.push_str("\n⬆️ Depends on:\n");
-        for r in &project_refs.iter().take(5) {
+        for r in project_refs.iter().take(5) {
             out.push_str(&format!("  - {}\n", r.to_file.as_deref().unwrap_or("?")));
         }
     }
@@ -371,6 +395,34 @@ fn language_from_ext(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Cached regex patterns for symbol extraction.
+mod regex_cache {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    macro_rules! cached_regex {
+        ($name:ident, $pattern:expr) => {
+            pub fn $name() -> &'static Regex {
+                static RE: OnceLock<Regex> = OnceLock::new();
+                RE.get_or_init(|| Regex::new($pattern).unwrap())
+            }
+        };
+    }
+
+    cached_regex!(re_export_ts, r"export\s+(?:async\s+)?(?:function|class|interface|const|let|var|type|enum)\s+(\w+)");
+    cached_regex!(re_func_ts, r"^(?:async\s+)?(?:function|class|interface)\s+(\w+)");
+    cached_regex!(re_const_ts, r"^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=");
+    cached_regex!(re_import_named_ts, r#"import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]"#);
+    cached_regex!(re_import_default_ts, r#"import\s+(\w+)\s+from\s+['"]([^'"]+)['"]"#);
+    cached_regex!(re_def_py, r"def\s+(\w+)\s*\(");
+    cached_regex!(re_class_py, r"class\s+(\w+)\s*[:(]");
+    cached_regex!(re_from_import_py, r"from\s+(\S+)\s+import\s+(.+)");
+    cached_regex!(re_fn_rs, r"(?:pub(?:\s*\(\s*crate\s*\))?\s+)?(?:async\s+)?fn\s+(\w+)\s*[<(]");
+    cached_regex!(re_struct_rs, r"(?:pub\s+)?struct\s+(\w+)");
+    cached_regex!(re_enum_rs, r"(?:pub\s+)?enum\s+(\w+)");
+    cached_regex!(re_trait_rs, r"(?:pub\s+)?trait\s+(\w+)");
+}
+
 /// Extract symbols and references from source using regex (same patterns as bootstrap.rs).
 fn extract_symbols(path: &str, source: &str, lang: &str) -> (Vec<FileSymbol>, Vec<FileReference>) {
     let mut symbols = Vec::new();
@@ -387,80 +439,65 @@ fn extract_symbols(path: &str, source: &str, lang: &str) -> (Vec<FileSymbol>, Ve
 
         match lang {
             "typescript" => {
-                use regex::Regex;
-                // Quick inline regex — same patterns as bootstrap.rs
-                let re_export = Regex::new(r"export\s+(?:async\s+)?(?:function|class|interface|const|let|var|type|enum)\s+(\w+)").unwrap();
-                let re_func = Regex::new(r"^(?:async\s+)?(?:function|class|interface)\s+(\w+)").unwrap();
-                let re_const = Regex::new(r"^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=").unwrap();
-                let re_import_named = Regex::new(r"import\s+\{([^}]+)\}\s+from\s+['\"]([^'\"]+)['\"]").unwrap();
-                let re_import_default = Regex::new(r"import\s+(\w+)\s+from\s+['\"]([^'\"]+)['\"]").unwrap();
-
-                if let Some(caps) = re_export.captures(trimmed) {
+                if let Some(caps) = regex_cache::re_export_ts().captures(trimmed) {
                     let kind = if trimmed.contains("function") || trimmed.contains("async") { "function" }
                         else if trimmed.contains("class") { "class" }
                         else if trimmed.contains("interface") { "interface" }
                         else if trimmed.contains("type") || trimmed.contains("enum") { "class" }
                         else { "variable" };
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: kind.to_string(), location: loc, exported: true });
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: kind.to_string(), location: loc.clone(), exported: true });
                     continue;
                 }
-                if let Some(caps) = re_func.captures(trimmed) {
+                if let Some(caps) = regex_cache::re_func_ts().captures(trimmed) {
                     let kind = if trimmed.contains("function") { "function" } else if trimmed.contains("class") { "class" } else { "interface" };
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: kind.to_string(), location: loc, exported: false });
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: kind.to_string(), location: loc.clone(), exported: false });
                 }
-                if let Some(caps) = re_const.captures(trimmed) {
+                if let Some(caps) = regex_cache::re_const_ts().captures(trimmed) {
                     let name = caps[1].to_string();
                     if !symbols.iter().any(|s: &FileSymbol| s.name == name) {
-                        symbols.push(FileSymbol { name, kind: "variable".to_string(), location: loc, exported: trimmed.starts_with("export") });
+                        symbols.push(FileSymbol { name, kind: "variable".to_string(), location: loc.clone(), exported: trimmed.starts_with("export") });
                     }
                 }
-                if let Some(caps) = re_import_named.captures(trimmed) {
+                if let Some(caps) = regex_cache::re_import_named_ts().captures(trimmed) {
                     for name in caps[1].split(',').map(|s| s.trim()) {
                         references.push(FileReference { from_name: name.to_string(), to_file: Some(caps[2].to_string()) });
                     }
                 }
-                if let Some(caps) = re_import_default.captures(trimmed) {
+                if let Some(caps) = regex_cache::re_import_default_ts().captures(trimmed) {
                     references.push(FileReference { from_name: caps[1].to_string(), to_file: Some(caps[2].to_string()) });
                 }
             }
             "python" => {
-                let re_def = regex::Regex::new(r"def\s+(\w+)\s*\(").unwrap();
-                let re_class = regex::Regex::new(r"class\s+(\w+)\s*[:(]").unwrap();
-                let re_from_import = regex::Regex::new(r"from\s+(\S+)\s+import\s+(.+)").unwrap();
-                if let Some(caps) = re_def.captures(trimmed) {
+                if let Some(caps) = regex_cache::re_def_py().captures(trimmed) {
                     let name = caps[1].to_string();
                     if !name.starts_with('_') || name == "__init__" {
-                        symbols.push(FileSymbol { name, kind: "function".to_string(), location: loc, exported: !trimmed.starts_with('_') });
+                        symbols.push(FileSymbol { name, kind: "function".to_string(), location: loc.clone(), exported: !trimmed.starts_with('_') });
                     }
                 }
-                if let Some(caps) = re_class.captures(trimmed) {
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "class".to_string(), location: loc, exported: true });
+                if let Some(caps) = regex_cache::re_class_py().captures(trimmed) {
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "class".to_string(), location: loc.clone(), exported: true });
                 }
-                if let Some(caps) = re_from_import.captures(trimmed) {
+                if let Some(caps) = regex_cache::re_from_import_py().captures(trimmed) {
                     for name in caps[2].split(',').map(|s| s.split(" as ").next().unwrap_or(s).trim()) {
                         references.push(FileReference { from_name: name.to_string(), to_file: Some(caps[1].to_string()) });
                     }
                 }
             }
             "rust" => {
-                let re_fn = regex::Regex::new(r"(?:pub(?:\s*\(\s*crate\s*\))?\s+)?(?:async\s+)?fn\s+(\w+)\s*[<(]").unwrap();
-                let re_struct = regex::Regex::new(r"(?:pub\s+)?struct\s+(\w+)").unwrap();
-                let re_enum = regex::Regex::new(r"(?:pub\s+)?enum\s+(\w+)").unwrap();
-                let re_trait = regex::Regex::new(r"(?:pub\s+)?trait\s+(\w+)").unwrap();
-                if let Some(caps) = re_fn.captures(trimmed) {
+                if let Some(caps) = regex_cache::re_fn_rs().captures(trimmed) {
                     let is_pub = trimmed.contains("pub ");
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "function".to_string(), location: loc, exported: is_pub });
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "function".to_string(), location: loc.clone(), exported: is_pub });
                 }
-                if let Some(caps) = re_struct.captures(trimmed) {
+                if let Some(caps) = regex_cache::re_struct_rs().captures(trimmed) {
                     let is_pub = trimmed.contains("pub ");
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "class".to_string(), location: loc, exported: is_pub });
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "class".to_string(), location: loc.clone(), exported: is_pub });
                 }
-                if let Some(caps) = re_enum.captures(trimmed) {
+                if let Some(caps) = regex_cache::re_enum_rs().captures(trimmed) {
                     let is_pub = trimmed.contains("pub ");
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "class".to_string(), location: loc, exported: is_pub });
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "class".to_string(), location: loc.clone(), exported: is_pub });
                 }
-                if let Some(caps) = re_trait.captures(trimmed) {
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "interface".to_string(), location: loc, exported: true });
+                if let Some(caps) = regex_cache::re_trait_rs().captures(trimmed) {
+                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "interface".to_string(), location: loc.clone(), exported: true });
                 }
             }
             _ => {}
@@ -529,13 +566,27 @@ impl Tool for FileWriteTool {
             }
         }
 
-        match std::fs::write(&path, content) {
-            Ok(()) => ToolOutput::success(format!(
+        // ★ 原子写入：先写临时文件，再 rename 到目标。
+        //   避免崩溃或磁盘满时留下半截文件（直接 std::fs::write 会覆盖原文件）。
+        let tmp_path = format!("{}.comdr-tmp-{}", path, std::process::id());
+        match std::fs::write(&tmp_path, content) {
+            Ok(()) => match std::fs::rename(&tmp_path, &path) {
                 Ok(()) => ToolOutput::ok("file_write", &[("path", &path), ("bytes", &content.len().to_string())], None),
-                content.len(),
-                path
-            )),
-            Err(e) => ToolOutput::err("file_edit", "EXECUTION_FAILED", &[("path", &path)], Some(&e.to_string())),
+                Err(e) => {
+                    // Best-effort: clean up temp file after failed rename.
+                    if let Err(rm_err) = std::fs::remove_file(&tmp_path) {
+                        eprintln!("[file_write] failed to clean up temp file {}: {}", tmp_path, rm_err);
+                    }
+                    ToolOutput::err("file_write", "EXECUTION_FAILED", &[("path", &path)], Some(&e.to_string()))
+                }
+            },
+            Err(e) => {
+                // Best-effort: clean up temp file after failed write.
+                if let Err(rm_err) = std::fs::remove_file(&tmp_path) {
+                    eprintln!("[file_write] failed to clean up temp file {}: {}", tmp_path, rm_err);
+                }
+                ToolOutput::err("file_write", "EXECUTION_FAILED", &[("path", &path)], Some(&e.to_string()))
+            }
         }
     }
 }
@@ -751,11 +802,11 @@ impl Tool for FileGlobTool {
 
         let base_path = normalize_path(&base_path);
 
-        let full_pattern = if base_path.ends_with('/') {
-            format!("{}{}", base_path, pattern.trim_start_matches('/'))
-        } else {
-            format!("{}/{}", base_path, pattern.trim_start_matches('/'))
-        };
+        use std::path::Path;
+
+        let full_pattern = Path::new(&base_path).join(pattern.trim_start_matches('/'))
+            .to_string_lossy()
+            .replace('\\', "/");
 
         let results: Vec<String> = match glob::glob(&full_pattern) {
             Ok(paths) => paths
@@ -996,7 +1047,7 @@ impl Tool for FileLsTool {
         if listing.is_empty() {
             ToolOutput::ok("file_ls", &[("path", &dir_path), ("entries", "0")], None)
         } else {
-            let header = format!("Listing '{}' ({} entries):\n\n", dir_path, listing.len());
+            let _header = format!("Listing '{}' ({} entries):\n\n", dir_path, listing.len());
             ToolOutput::ok("file_ls", &[("path", &dir_path), ("entries", &listing.len().to_string())], Some(&listing.join("\n")))
         }
     }

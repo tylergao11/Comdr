@@ -15,6 +15,8 @@
  */
 
 // ===== 类型（type-only exports） =====
+// ★ @comdr/core 是类型的唯一真理源。types.ts 中所有类型均对外公开。
+//   废弃类型（如 ToolExecuteResult）应直接从 types.ts 中删除，而非在导出层隐藏。
 export type * from './types.js';
 
 // ===== 常量（runtime value exports） =====
@@ -36,6 +38,7 @@ export {
   MASKED_PREFIX,
   VALID_SCHEMA_TYPES,
   validateJSONSchemaProperty,
+  LSP_SEVERITY,
 } from './types.js';
 
 // ===== 契约接口 =====
@@ -45,6 +48,8 @@ export type {
   IEngine,
   IConfigLoader,
   IEventLogger,
+  IShadowWorkspace,
+  ILSPBridge,
   ContractVerification,
   ContractVerifier,
 } from './contracts.js';
@@ -54,6 +59,7 @@ export {
   DeepSeekAuthError,
   DeepSeekRetryError,
   ConfigValidationError,
+  LSPConnectionError,
 } from './contracts.js';
 
 // ===== 配置加载（Agent 1 实现 Contract D） =====
@@ -73,8 +79,10 @@ export {
 
 /**
  * Promise-based sleep
- * @param ms 毫秒
+ * @param ms 毫秒（clamp 到 [0, 60_000]，防止 Infinity/NaN/负数）
  */
 export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  const clamped = Math.max(0, Math.min(ms, 60_000));
+  if (!isFinite(clamped)) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, clamped));
 }

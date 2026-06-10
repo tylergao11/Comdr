@@ -569,69 +569,69 @@ fn check_diagnostics(content: &str, lang: Language) -> Vec<Diagnostic> {
 // TypeScript / JavaScript
 fn func_decl_ts() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:export\s+)?(?:async\s+)?function\s+(\w+)").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?:export\s+)?(?:async\s+)?function\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 fn class_decl_ts() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:export\s+)?(?:abstract\s+)?class\s+(\w+)").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?:export\s+)?(?:abstract\s+)?class\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 fn interface_decl_ts() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:export\s+)?interface\s+(\w+)").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?:export\s+)?interface\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 fn const_decl_ts() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:export\s+)?(?:const|let|var)\s+(\w+)\s*[:=]").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?:export\s+)?(?:const|let|var)\s+(\w+)\s*[:=]").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 fn type_decl_ts() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:export\s+)?type\s+(\w+)\s*=").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?:export\s+)?type\s+(\w+)\s*=").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 // Rust
 fn fn_decl_rs() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:pub(?:\s*\(\s*crate\s*\))?\s+)?fn\s+(\w+)").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?:pub(?:\s*\(\s*crate\s*\))?\s+)?fn\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 fn struct_decl_rs() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:pub\s+)?struct\s+(\w+)").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?:pub\s+)?struct\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 fn enum_decl_rs() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:pub\s+)?enum\s+(\w+)").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?:pub\s+)?enum\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 fn trait_decl_rs() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:pub\s+)?trait\s+(\w+)").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?:pub\s+)?trait\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 fn impl_decl_rs() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"impl\s+(\w+)").unwrap())
+    RE.get_or_init(|| Regex::new(r"impl\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 fn mod_decl_rs() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:pub\s+)?mod\s+(\w+)").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?:pub\s+)?mod\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 // Python
 fn func_decl_py() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"def\s+(\w+)").unwrap())
+    RE.get_or_init(|| Regex::new(r"def\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 fn class_decl_py() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"class\s+(\w+)").unwrap())
+    RE.get_or_init(|| Regex::new(r"class\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 // ============================================================================

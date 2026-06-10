@@ -91,11 +91,11 @@ fn extract_typescript(file_path: &str, source: &str) -> (Vec<BootstrapSymbol>, V
     static RE_IMPORT_NAMED: OnceLock<Regex> = OnceLock::new();
     static RE_IMPORT_DEFAULT: OnceLock<Regex> = OnceLock::new();
 
-    let re_export = RE_EXPORT.get_or_init(|| Regex::new(r"export\s+(?:async\s+)?(?:function|class|interface|const|let|var|type|enum)\s+(\w+)").unwrap());
-    let re_func = RE_FUNC.get_or_init(|| Regex::new(r"^(?:async\s+)?(?:function|class|interface)\s+(\w+)").unwrap());
-    let re_const = RE_CONST.get_or_init(|| Regex::new(r"^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=").unwrap());
-    let re_import_named = RE_IMPORT_NAMED.get_or_init(|| Regex::new(r"import\s+\{([^}]+)\}\s+from\s+['\"]([^'\"]+)['\"]").unwrap());
-    let re_import_default = RE_IMPORT_DEFAULT.get_or_init(|| Regex::new(r"import\s+(\w+)\s+from\s+['\"]([^'\"]+)['\"]").unwrap());
+    let re_export = RE_EXPORT.get_or_init(|| Regex::new(r"export\s+(?:async\s+)?(?:function|class|interface|const|let|var|type|enum)\s+(\w+)").unwrap()); // static pattern — panic on invalid regex is correct
+    let re_func = RE_FUNC.get_or_init(|| Regex::new(r"^(?:async\s+)?(?:function|class|interface)\s+(\w+)").unwrap()); // static pattern — panic on invalid regex is correct
+    let re_const = RE_CONST.get_or_init(|| Regex::new(r"^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=").unwrap()); // static pattern — panic on invalid regex is correct
+    let re_import_named = RE_IMPORT_NAMED.get_or_init(|| Regex::new(r#"import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]"#).unwrap()); // static pattern — panic on invalid regex is correct
+    let re_import_default = RE_IMPORT_DEFAULT.get_or_init(|| Regex::new(r#"import\s+(\w+)\s+from\s+['"]([^'"]+)['"]"#).unwrap()); // static pattern — panic on invalid regex is correct
 
     let mut symbols = Vec::new();
     let mut references = Vec::new();
@@ -118,7 +118,7 @@ fn extract_typescript(file_path: &str, source: &str) -> (Vec<BootstrapSymbol>, V
                 else if trimmed.contains("type") { "interface" }
                 else if trimmed.contains("enum") { "class" }
                 else { "variable" };
-            symbols.push(BootstrapSymbol { name, kind, file_path: file_path.to_string(), location: loc, exported: true });
+            symbols.push(BootstrapSymbol { name, kind: kind.to_string(), file_path: file_path.to_string(), location: loc.clone(), exported: true });
             continue;
         }
 
@@ -128,14 +128,14 @@ fn extract_typescript(file_path: &str, source: &str) -> (Vec<BootstrapSymbol>, V
             let kind = if trimmed.contains("function") { "function" }
                 else if trimmed.contains("class") { "class" }
                 else { "interface" };
-            symbols.push(BootstrapSymbol { name, kind, file_path: file_path.to_string(), location: loc, exported: false });
+            symbols.push(BootstrapSymbol { name, kind: kind.to_string(), file_path: file_path.to_string(), location: loc.clone(), exported: false });
         }
 
         // const/let/var declarations (top-level exports only, non-function/class)
         if let Some(caps) = re_const.captures(trimmed) {
             let name = caps[1].to_string();
             if !symbols.iter().any(|s| s.name == name && s.file_path == file_path) {
-                symbols.push(BootstrapSymbol { name, kind: "variable".to_string(), file_path: file_path.to_string(), location: loc, exported: trimmed.starts_with("export") });
+                symbols.push(BootstrapSymbol { name, kind: "variable".to_string(), file_path: file_path.to_string(), location: loc.clone(), exported: trimmed.starts_with("export") });
             }
         }
 
@@ -183,10 +183,10 @@ fn extract_python(file_path: &str, source: &str) -> (Vec<BootstrapSymbol>, Vec<B
     static RE_FROM_IMPORT: OnceLock<Regex> = OnceLock::new();
     static RE_IMPORT: OnceLock<Regex> = OnceLock::new();
 
-    let re_def = RE_DEF.get_or_init(|| Regex::new(r"def\s+(\w+)\s*\(").unwrap());
-    let re_class = RE_CLASS.get_or_init(|| Regex::new(r"class\s+(\w+)\s*[:(]").unwrap());
-    let re_from_import = RE_FROM_IMPORT.get_or_init(|| Regex::new(r"from\s+(\S+)\s+import\s+(.+)").unwrap());
-    let re_import = RE_IMPORT.get_or_init(|| Regex::new(r"^import\s+(\S+)").unwrap());
+    let re_def = RE_DEF.get_or_init(|| Regex::new(r"def\s+(\w+)\s*\(").unwrap()); // static pattern — panic on invalid regex is correct
+    let re_class = RE_CLASS.get_or_init(|| Regex::new(r"class\s+(\w+)\s*[:(]").unwrap()); // static pattern — panic on invalid regex is correct
+    let re_from_import = RE_FROM_IMPORT.get_or_init(|| Regex::new(r"from\s+(\S+)\s+import\s+(.+)").unwrap()); // static pattern — panic on invalid regex is correct
+    let re_import = RE_IMPORT.get_or_init(|| Regex::new(r"^import\s+(\S+)").unwrap()); // static pattern — panic on invalid regex is correct
 
     let mut symbols = Vec::new();
     let mut references = Vec::new();
@@ -203,13 +203,13 @@ fn extract_python(file_path: &str, source: &str) -> (Vec<BootstrapSymbol>, Vec<B
         if let Some(caps) = re_def.captures(trimmed) {
             let name = caps[1].to_string();
             if !name.starts_with('_') || name == "__init__" {
-                symbols.push(BootstrapSymbol { name, kind: "function".to_string(), file_path: file_path.to_string(), location: loc, exported: !trimmed.starts_with('_') });
+                symbols.push(BootstrapSymbol { name, kind: "function".to_string(), file_path: file_path.to_string(), location: loc.clone(), exported: !trimmed.starts_with('_') });
             }
         }
 
         if let Some(caps) = re_class.captures(trimmed) {
             let name = caps[1].to_string();
-            symbols.push(BootstrapSymbol { name, kind: "class".to_string(), file_path: file_path.to_string(), location: loc, exported: true });
+            symbols.push(BootstrapSymbol { name, kind: "class".to_string(), file_path: file_path.to_string(), location: loc.clone(), exported: true });
         }
 
         if let Some(caps) = re_from_import.captures(trimmed) {
@@ -256,11 +256,11 @@ fn extract_rust(file_path: &str, source: &str) -> (Vec<BootstrapSymbol>, Vec<Boo
     static RE_TRAIT: OnceLock<Regex> = OnceLock::new();
     static RE_USE: OnceLock<Regex> = OnceLock::new();
 
-    let re_fn = RE_FN.get_or_init(|| Regex::new(r"(?:pub(?:\s*\(\s*crate\s*\))?\s+)?(?:async\s+)?fn\s+(\w+)\s*[<\(]").unwrap());
-    let re_struct = RE_STRUCT.get_or_init(|| Regex::new(r"(?:pub\s+)?struct\s+(\w+)").unwrap());
-    let re_enum = RE_ENUM.get_or_init(|| Regex::new(r"(?:pub\s+)?enum\s+(\w+)").unwrap());
-    let re_trait = RE_TRAIT.get_or_init(|| Regex::new(r"(?:pub\s+)?trait\s+(\w+)").unwrap());
-    let re_use = RE_USE.get_or_init(|| Regex::new(r"use\s+(crate::\S+)").unwrap());
+    let re_fn = RE_FN.get_or_init(|| Regex::new(r"(?:pub(?:\s*\(\s*crate\s*\))?\s+)?(?:async\s+)?fn\s+(\w+)\s*[<\(]").unwrap()); // static pattern — panic on invalid regex is correct
+    let re_struct = RE_STRUCT.get_or_init(|| Regex::new(r"(?:pub\s+)?struct\s+(\w+)").unwrap()); // static pattern — panic on invalid regex is correct
+    let re_enum = RE_ENUM.get_or_init(|| Regex::new(r"(?:pub\s+)?enum\s+(\w+)").unwrap()); // static pattern — panic on invalid regex is correct
+    let re_trait = RE_TRAIT.get_or_init(|| Regex::new(r"(?:pub\s+)?trait\s+(\w+)").unwrap()); // static pattern — panic on invalid regex is correct
+    let re_use = RE_USE.get_or_init(|| Regex::new(r"use\s+(crate::\S+)").unwrap()); // static pattern — panic on invalid regex is correct
 
     let mut symbols = Vec::new();
     let mut references = Vec::new();
@@ -277,24 +277,24 @@ fn extract_rust(file_path: &str, source: &str) -> (Vec<BootstrapSymbol>, Vec<Boo
         if let Some(caps) = re_fn.captures(trimmed) {
             let name = caps[1].to_string();
             let is_pub = trimmed.contains("pub ");
-            symbols.push(BootstrapSymbol { name, kind: "function".to_string(), file_path: file_path.to_string(), location: loc, exported: is_pub });
+            symbols.push(BootstrapSymbol { name, kind: "function".to_string(), file_path: file_path.to_string(), location: loc.clone(), exported: is_pub });
         }
 
         if let Some(caps) = re_struct.captures(trimmed) {
             let name = caps[1].to_string();
             let is_pub = trimmed.contains("pub ");
-            symbols.push(BootstrapSymbol { name, kind: "class".to_string(), file_path: file_path.to_string(), location: loc, exported: is_pub });
+            symbols.push(BootstrapSymbol { name, kind: "class".to_string(), file_path: file_path.to_string(), location: loc.clone(), exported: is_pub });
         }
 
         if let Some(caps) = re_enum.captures(trimmed) {
             let name = caps[1].to_string();
             let is_pub = trimmed.contains("pub ");
-            symbols.push(BootstrapSymbol { name, kind: "class".to_string(), file_path: file_path.to_string(), location: loc, exported: is_pub });
+            symbols.push(BootstrapSymbol { name, kind: "class".to_string(), file_path: file_path.to_string(), location: loc.clone(), exported: is_pub });
         }
 
         if let Some(caps) = re_trait.captures(trimmed) {
             let name = caps[1].to_string();
-            symbols.push(BootstrapSymbol { name, kind: "interface".to_string(), file_path: file_path.to_string(), location: loc, exported: true });
+            symbols.push(BootstrapSymbol { name, kind: "interface".to_string(), file_path: file_path.to_string(), location: loc.clone(), exported: true });
         }
 
         if let Some(caps) = re_use.captures(trimmed) {

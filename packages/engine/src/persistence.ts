@@ -28,7 +28,7 @@ import { SYSTEM } from '@comdr/core';
 import { summarizeToolOutput } from './smart-truncate.js';
 
 /** 会话文件最大字节数（≈5MB），超过则压缩保存（剔除旧 tool result 内容） */
-const MAX_SESSION_FILE_SIZE = 5_000_000;
+const MAX_SESSION_FILE_SIZE = SYSTEM.MAX_SESSION_FILE_SIZE;
 
 // ============================================================================
 // §1 SessionStore 类
@@ -59,16 +59,32 @@ export class SessionStore {
 
     let json = JSON.stringify(session, null, 2);
     if (json.length > MAX_SESSION_FILE_SIZE && session.messages.length > 0) {
-      // 裁剪旧的 tool result 内容：保留最近 N 条完整输出
-      const KEEP = 20;
+      // 裁剪旧的大内容：保留最近 N 条完整输出。
+      // ★ tool/assistant/user 三类消息均需处理，防止用户输入过长导致文件超限。
+      const KEEP = SYSTEM.SESSION_KEEP_TOOL_RESULTS;
       const messages = session.messages;
       let toolResultCount = 0;
+      let assistantCount = 0;
+      let userCount = 0;
       for (let i = messages.length - 1; i >= 0; i--) {
         const msg = messages[i]!;
+        if (!msg.content || msg.content.length <= SYSTEM.SESSION_TRIM_CONTENT_THRESHOLD) continue;
+
         if (msg.role === 'tool') {
           toolResultCount++;
-          if (toolResultCount > KEEP && msg.content && msg.content.length > 200) {
-            msg.content = summarizeToolOutput(msg.content, undefined, 200);
+          if (toolResultCount > KEEP) {
+            msg.content = summarizeToolOutput(msg.content, undefined, SYSTEM.SESSION_TRIM_CONTENT_THRESHOLD);
+          }
+        } else if (msg.role === 'assistant') {
+          assistantCount++;
+          if (assistantCount > KEEP) {
+            // ★ assistant 消息同样使用 summarizeToolOutput（保留语义），而非硬截断
+            msg.content = summarizeToolOutput(msg.content, undefined, SYSTEM.SESSION_TRIM_CONTENT_THRESHOLD);
+          }
+        } else if (msg.role === 'user') {
+          userCount++;
+          if (userCount > KEEP) {
+            msg.content = msg.content.slice(0, SYSTEM.SESSION_TRIM_CONTENT_THRESHOLD) + '…';
           }
         }
       }
@@ -264,7 +280,10 @@ export class SessionStore {
    * 会话 ID → 文件路径
    */
   private sessionPath(sessionId: string): string {
-    // 防止路径遍历攻击
+    // 防止路径遍历攻击 + 空 ID 保护
+    if (!sessionId) {
+      throw new Error('Session ID must not be empty');
+    }
     const safe = sessionId.replace(/[<>:"/\\|?*]/g, '_');
     return join(this.sessionsDir, `${safe}.json`);
   }

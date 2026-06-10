@@ -42,6 +42,7 @@ export { PromptConstructor, emptyAnchor, anchorFromWindows } from './prompt.js';
 export { ContextManager } from './context.js';
 export { TaskPlanner } from './planner.js';
 export { ReflectionEngine } from './reflection.js';
+export type { LSPCorrectionDecision } from './reflection.js';
 export { ProgressMeter } from './progress.js';
 export { SkillsLoader } from './skills.js';
 
@@ -62,6 +63,10 @@ export { SemanticMemory, createSemanticMemory } from './memory/semantic.js';
 export { ProceduralMemory } from './memory/procedural.js';
 export type { ProceduralPattern } from './memory/procedural.js';
 
+// ===== 自检管线 =====
+export { builtinRules, siblingConsistencyRule, fileSizeGuardRule } from './self-check.js';
+export type { CheckRule, CheckIssue, CheckContext } from './self-check.js';
+
 // ===== 持久化 =====
 export { SessionStore, createSessionStore } from './persistence.js';
 
@@ -71,7 +76,7 @@ export type { MCPServerStatus } from '@comdr/core/types';
 export type { MCPToolResult } from './mcp-client.js';
 
 // ===== World Model（COMDR.md 多源自动发现） =====
-export { discoverComdrMd, discoverAndRetrieve } from './world-model.js';
+export { discoverComdrMd, discoverAndRetrieve, buildLSPWorldChunks, extractKeyFiles } from './world-model.js';
 export type { WorldModelChunk, WorldModelResult } from './world-model.js';
 
 // ===== 检索模块（BM25 + Contextual Prefix） =====

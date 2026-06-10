@@ -169,7 +169,7 @@ impl Tool for GitStatusTool {
     }
 
     fn description(&self) -> &str {
-        "Show working tree status. Modes: "blueprint" (default, file count summary), "full" (porcelain format)."
+        "Show working tree status. Modes: \"blueprint\" (default, file count summary), \"full\" (porcelain format)."
     }
 
     fn parameters(&self) -> Value {
@@ -293,7 +293,7 @@ impl Tool for GitLogTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let repo = match open_repo(&ctx.project_path) {
             Ok(r) => r,
-            Err(e) => return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e)),
+            Err(e) => return ToolOutput::err("git_log", "EXECUTION_FAILED", &[], Some(&e)),
         };
 
         let count = args
@@ -307,7 +307,9 @@ impl Tool for GitLogTool {
             Err(e) => return ToolOutput::err("git_log", "EXECUTION_FAILED", &[], Some(&e.to_string())),
         };
 
-        revwalk.push_head().map_err(|e| format!("Push head error: {}", e)).unwrap_or(());
+        if let Err(e) = revwalk.push_head() {
+            return ToolOutput::err("git_log", "EXECUTION_FAILED", &[], Some(&format!("Push head error: {}", e)));
+        }
 
         let mut output = String::new();
         for (i, oid) in revwalk.take(count).enumerate() {
@@ -343,12 +345,8 @@ impl Tool for GitLogTool {
         if output.is_empty() {
             ToolOutput::ok("git_log", &[("commits", "0")], None)
         } else {
-            if mode == "blueprint" {
-            let cnt = statuses.len();
-            ToolOutput::ok("git_status", &[("files", &cnt.to_string())], Some(&format!("{} files", cnt)))
-        } else {
-            ToolOutput::ok("git_status", &[("files", &statuses.len().to_string())], Some(&output))
-        }
+            let line_count = output.lines().count();
+            ToolOutput::ok("git_log", &[("commits", &line_count.to_string())], Some(&output))
         }
     }
 }
@@ -391,7 +389,7 @@ impl Tool for GitAddTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let repo = match open_repo(&ctx.project_path) {
             Ok(r) => r,
-            Err(e) => return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e)),
+            Err(e) => return ToolOutput::err("git_add", "EXECUTION_FAILED", &[], Some(&e)),
         };
 
         let files_val = match args.get("files") {
@@ -415,7 +413,7 @@ impl Tool for GitAddTool {
 
         let mut index = match repo.index() {
             Ok(i) => i,
-            Err(e) => return ToolOutput::err("git_commit", "EXECUTION_FAILED", &[], Some(&e.to_string())),
+            Err(e) => return ToolOutput::err("git_add", "EXECUTION_FAILED", &[], Some(&e.to_string())),
         };
 
         let mut added = 0;
@@ -477,7 +475,7 @@ impl Tool for GitCommitTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let repo = match open_repo(&ctx.project_path) {
             Ok(r) => r,
-            Err(e) => return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e)),
+            Err(e) => return ToolOutput::err("git_commit", "EXECUTION_FAILED", &[], Some(&e)),
         };
 
         let message = match args.get("message").and_then(|v| v.as_str()) {
@@ -567,7 +565,7 @@ impl Tool for GitRevertTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let repo = match open_repo(&ctx.project_path) {
             Ok(r) => r,
-            Err(e) => return ToolOutput::err("git_diff", "EXECUTION_FAILED", &[], Some(&e)),
+            Err(e) => return ToolOutput::err("git_revert", "EXECUTION_FAILED", &[], Some(&e)),
         };
 
         let commit_hash = match args.get("commit").and_then(|v| v.as_str()) {
@@ -603,9 +601,7 @@ impl Tool for GitRevertTool {
                 status_opts.include_untracked(false);
                 if let Ok(statuses) = repo.statuses(Some(&mut status_opts)) {
                     if statuses.iter().any(|s| s.status().contains(git2::Status::CONFLICTED)) {
-                        return ToolOutput::err("git_revert", "EXECUTION_FAILED", &[("commit", commit_hash)], Some("conflicts"))
-                                commit_hash
-                            )),
+                        return ToolOutput::err("git_revert", "EXECUTION_FAILED", &[("commit", commit_hash)], Some("conflicts"));
                     }
                 }
 
@@ -613,7 +609,7 @@ impl Tool for GitRevertTool {
                 let mut index = match repo.index() {
                     Ok(i) => i,
                     Err(e) => {
-                        return ToolOutput::err("git_commit", "EXECUTION_FAILED", &[], Some(&e.to_string()))
+                        return ToolOutput::err("git_revert", "EXECUTION_FAILED", &[], Some(&e.to_string()))
                     }
                 };
                 let tree_oid = match index.write_tree() {

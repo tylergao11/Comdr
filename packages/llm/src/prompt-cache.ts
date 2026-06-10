@@ -211,7 +211,8 @@ export function computeCacheHitRate(
  *   system: ~200 tokens
  *   tools:  ~50-200 tokens per tool
  */
-export function estimateCacheableTokens(toolCount: number): number {
+// ★ 当前未被调用——保留作为前缀缓存容量规划的参考文档
+function _estimateCacheableTokens(toolCount: number): number {
   const systemTokens = 200;
   const avgTokensPerTool = 100;
   return systemTokens + toolCount * avgTokensPerTool;

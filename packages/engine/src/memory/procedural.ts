@@ -18,7 +18,7 @@
  */
 
 import { readdirSync, existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import type { EpisodeSummary, StructuredSummary } from '@comdr/core/types';
 import { MESSAGE_ROLE, THINKING_TYPE, SYSTEM } from '@comdr/core';
@@ -53,6 +53,8 @@ export class ProceduralMemory {
   private patterns: Map<string, ProceduralPattern> = new Map();
   /** 存储路径 */
   private readonly storePath: string;
+  /** 跨项目 episodes 目录（从 storePath 所在目录派生） */
+  private readonly projectsDir: string;
   /** 跨项目 pattern 提取的最小 session 数 */
   private static readonly MIN_SESSIONS_FOR_PATTERN = 3;
   /** reinforce: 同模式再次出现 +0.1 */
@@ -66,6 +68,9 @@ export class ProceduralMemory {
 
   constructor(storePath?: string) {
     this.storePath = storePath ?? join(homedir(), '.comdr', 'procedural.json');
+    // ★ 从 storePath 所在目录派生 projectsDir，避免硬编码路径。
+    //   storePath 为 ~/.comdr/procedural.json → projectsDir 为 ~/.comdr/projects
+    this.projectsDir = join(dirname(this.storePath), 'projects');
   }
 
   // --------------------------------------------------------------------------
@@ -111,12 +116,16 @@ export class ProceduralMemory {
   /** 收集跨项目 episodic 数据 */
   private collectCrossProjectEpisodes(): EpisodeSummary[] {
     const all: EpisodeSummary[] = [];
-    const projectsDir = join(homedir(), '.comdr', 'projects');
-    if (!existsSync(projectsDir)) return all;
+    // ★ 目录不存在时静默返回空数组，这是预期的降级行为：
+    //   首次安装 Comdr 时 ~/.comdr/projects 尚未创建，
+    //   或用户未使用多项目工作流时该目录为空。
+    //   降级后 learn() 因 episodes < MIN_SESSIONS_FOR_PATTERN 直接返回，
+    //   不会产生任何副作用或告警。
+    if (!existsSync(this.projectsDir)) return all;
 
     try {
-      for (const dir of readdirSync(projectsDir)) {
-        const epPath = join(projectsDir, dir, 'temp', 'comdr', 'sessions', 'episodic.json');
+      for (const dir of readdirSync(this.projectsDir)) {
+        const epPath = join(this.projectsDir, dir, 'temp', 'comdr', 'sessions', 'episodic.json');
         if (!existsSync(epPath)) continue;
         try {
           const raw = JSON.parse(readFileSync(epPath, 'utf-8')) as {
@@ -126,8 +135,13 @@ export class ProceduralMemory {
             raw.episodes || '[]',
           ) as EpisodeSummary[];
           // 只取成功的 session
+          // ★ turns > 1 过滤已于 2026-06 移除：单轮 session（如 one-shot fix、简单查询）同样包含有价值模式。
+          //   ep.outcome === 'completed' 是当前唯一过滤条件，已确认合理：
+          //   - 'completed': 正常结束，模式有价值
+          //   - null/interrupted: 异常中断，模式不可靠，过滤掉
+          //   - 若未来引入更多 outcome 值，此处应同步评估是否保留
           for (const ep of episodes) {
-            if (ep.outcome === 'completed' && ep.turns > 1) {
+            if (ep.outcome === 'completed') {
               all.push(ep);
             }
           }
@@ -140,7 +154,7 @@ export class ProceduralMemory {
 
   /** 构建提取 prompt */
   private buildExtractionPrompt(episodes: EpisodeSummary[]): string {
-    const summaries = episodes.slice(0, 20).map((ep) => {
+    const summaries = episodes.slice(0, SYSTEM.PROCUDURAL_EXTRACTION_MAX_EPISODES).map((ep) => {
       const ss = ep.structuredSummary;
       const files = ss?.fileModifications?.map((f) => f.action + ' ' + f.path) ?? [];
       const decisions = ss?.decisions?.map((d) => d.what) ?? [];
@@ -218,9 +232,18 @@ export class ProceduralMemory {
       .sort((a, b) => b.trust - a.trust);
   }
 
+  /** 简单哈希: 前 50 字符 + 完整字符串的 FNV-1a hash 后缀 */
   private patternKey(pattern: string): string {
-    // 简单哈希: 取前 50 字符的稳定 key
-    return pattern.slice(0, 50).toLowerCase().replace(/\s+/g, '-');
+    const normalized = pattern.toLowerCase().replace(/\s+/g, ' ');
+    const base = normalized.slice(0, 50).replace(/\s+/g, '-');
+    // ★ 追加完整字符串的 hash 后缀，防止不同模式前 50 字符相同导致碰撞
+    let hash = 2166136261;
+    for (let i = 0; i < normalized.length; i++) {
+      hash ^= normalized.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    const suffix = (hash >>> 0).toString(36).slice(0, 6);
+    return `${base}_${suffix}`;
   }
 
   // --------------------------------------------------------------------------
@@ -229,7 +252,7 @@ export class ProceduralMemory {
 
   save(): void {
     try {
-      const dir = this.storePath.replace(/\/[^/]+$/, '');
+      const dir = dirname(this.storePath);
       mkdirSync(dir, { recursive: true });
       writeFileSync(this.storePath, JSON.stringify([...this.patterns.values()], null, 2), 'utf-8');
     } catch { /* 静默降级 */ }

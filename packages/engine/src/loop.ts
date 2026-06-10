@@ -50,6 +50,7 @@ import type {
   INativeTools,
   IEventLogger,
   IEngine,
+  ILSPBridge,
 } from '@comdr/core/contracts';
 import { DeepSeekAuthError, DeepSeekRetryError } from '@comdr/core/contracts';
 
@@ -68,9 +69,10 @@ import { SessionStore } from './persistence.js';
 import { MCPClient } from './mcp-client.js';
 import { safeParseArgs } from './utils.js';
 import { summarizeDiff } from './smart-truncate.js';
-import { discoverComdrMd, discoverAndRetrieve } from './world-model.js';
+import { discoverComdrMd, discoverAndRetrieve, buildLSPWorldChunks, extractKeyFiles } from './world-model.js';
 import { createToolRetriever } from './tool-retriever.js';
 import { generateRepoMap } from './repo-map.js';
+import { builtinRules, type CheckRule, type CheckContext } from './self-check.js';
 import { isAdvancedTool, executeAdvancedTool } from './tools/execute.js';
 import type { ToolExecContext } from './tools/execute.js';
 import { scheduleParallel } from './scheduler.js';
@@ -105,6 +107,9 @@ export class Engine implements IEngine {
   private readonly sessionStore: SessionStore;
   private readonly mcpClient: MCPClient | null;
 
+  /** ★ LSP 桥接（VS Code Extension 注入，CLI 模式下为 null 静默降级） */
+  private lspBridge: ILSPBridge | null = null;
+
   // 运行时状态
   private session: SessionState | null = null;
   private abortController: AbortController | null = null;
@@ -114,6 +119,14 @@ export class Engine implements IEngine {
   private skillsLog: string | null = null;
   /** ★ Bootstrap 结果——构造时完成，run() 时 yield 事件 */
   private bootstrapReport: BootstrapReport | null = null;
+  /** ★ 自检规则集 */
+  private readonly checkRules: CheckRule[];
+  /** ★ 已发出的自检消息——去重用（同文件同规则同偏离不重复） */
+  private readonly emittedIssues: Set<string> = new Set();
+  /** ★ 自检文件内容缓存——避免同 session 重复 IO */
+  private readonly fileCache: Map<string, string> = new Map();
+  /** ★ session 内新创建的文件路径——补充到 allFiles */
+  private sessionFiles: Set<string> = new Set();
 
   constructor(
     llm: IDeepSeekClient,
@@ -143,6 +156,9 @@ export class Engine implements IEngine {
     this.progress = new ProgressMeter();
     this.skillsLoader = new SkillsLoader();
     this.sessionStore = new SessionStore(config.project.projectPath);
+
+    // ★ 自检管线——内置规则（未来可从 COMDR.md / skills 加载）
+    this.checkRules = [...builtinRules];
 
     // ★ 从磁盘恢复跨会话记忆（不存在/损坏 → 静默降级）
     const epData = this.sessionStore.loadEpisodic();
@@ -395,6 +411,16 @@ export class Engine implements IEngine {
           relatedHistory,
           allReflections.length > 0 ? allReflections : undefined,
         );
+
+        // ★ LSP: 注入当前操作文件的语义上下文
+        if (this.lspBridge) {
+          const keyFiles = extractKeyFiles(this.workingMemory.getStateWindow());
+          if (keyFiles.length > 0) {
+            const lspContexts = await buildLSPWorldChunks(this.lspBridge, keyFiles);
+            this.prompt.setLSPContext(lspContexts);
+          }
+        }
+
         const promptMessages = this.prompt.build(session, tools, route, anchor);
 
         // ★ Cache monitoring: always use full tools for fingerprint stability
@@ -510,7 +536,9 @@ export class Engine implements IEngine {
           const toolResults: { call: ToolCall; result: ToolResult }[] = [];
 
                   // ★ 拓扑分层执行: 层内并行, 层间串行
-          const schedule = scheduleParallel(message.tool_calls!);
+          // hasToolCalls 已在上面保证 message.tool_calls 非空且 length > 0
+          const toolCalls = message.tool_calls!;
+          const schedule = scheduleParallel(toolCalls);
 
           for (const batch of schedule) {
             // ★ 收集并行执行中的事件（yield 不能在 Promise.all 内）
@@ -534,16 +562,65 @@ export class Engine implements IEngine {
                     tool_call_id: call.id,
                   };
                   session.messages.push(skipMsg);
-                  return { call, skip: true, result: { callId: call.id, toolName: call.function.name, ok: false, content: skipMsg.content! } as ToolResult };
+                  return { call, skip: true, result: { callId: call.id, toolName: call.function.name, ok: false, content: skipMsg.content!, diffSummary: undefined, snapshotId: undefined, testFeedback: undefined, errorCategory: undefined } };
                 }
 
                 pendingEvents.push({ type: AGENT_EVENT.TOOL_CALL, call });
+
+                // ★ LSP: 对 file_edit/file_write 工具调用，做诊断差值检查
+                const isFileEdit = call.function.name === 'file_edit' || call.function.name === 'file_write';
+                let lspBefore: import('@comdr/core/types').DiagnosticSnapshot | null = null;
+                if (this.lspBridge && isFileEdit) {
+                  const args = safeParseArgs(call.function.arguments);
+                  const filePath = typeof args.path === 'string' ? args.path : '';
+                  if (filePath) {
+                    lspBefore = await this.lspBridge.snapshotDiagnostics(filePath);
+                  }
+                }
 
                 const rawResult = await this.executeToolAsync(call);
                 const result: ToolResult = rawResult.diffSummary
                   ? { ...rawResult, diffSummary: summarizeDiff(rawResult.diffSummary) ?? rawResult.diffSummary }
                   : rawResult;
                 pendingEvents.push({ type: AGENT_EVENT.TOOL_RESULT, result });
+
+                // ★ LSP: 执行后诊断快照 + 纠正决策
+                if (this.lspBridge && isFileEdit && lspBefore) {
+                  const args = safeParseArgs(call.function.arguments);
+                  const filePath = typeof args.path === 'string' ? args.path : '';
+                  if (filePath) {
+                    const lspAfter = await this.lspBridge.snapshotDiagnostics(filePath);
+                    const lspDecision = this.reflection.correctByLSP(lspBefore, lspAfter);
+                    if (lspDecision.decision === 'rollback') {
+                      // 纯恶化 → 回滚 + 注入反馈
+                      if (result.snapshotId) this.tools?.rollback(result.snapshotId);
+                      session.messages.push({
+                        role: MESSAGE_ROLE.SYSTEM,
+                        content: `[lsp-check] ${lspDecision.feedback} Changes rolled back.`,
+                      });
+                      return {
+                        call,
+                        skip: false,
+                        result: {
+                          callId: result.callId,
+                          toolName: result.toolName,
+                          ok: false,
+                          content: `[lsp-check] ${result.toolName} changes rolled back due to LSP errors.`,
+                          diffSummary: result.diffSummary,
+                          snapshotId: result.snapshotId,
+                          testFeedback: result.testFeedback,
+                          errorCategory: result.errorCategory,
+                        },
+                      };
+                    } else if (lspDecision.decision === 'retry') {
+                      // 混合 → 注入反馈，让 Agent 再修
+                      session.messages.push({
+                        role: MESSAGE_ROLE.SYSTEM,
+                        content: `[lsp-check] ${lspDecision.feedback}`,
+                      });
+                    }
+                  }
+                }
 
                 session.messages.push({
                   role: MESSAGE_ROLE.TOOL,
@@ -584,6 +661,7 @@ export class Engine implements IEngine {
             for (const ev of pendingEvents) yield ev;
 
             for (const r of batchResults) {
+              // ★ skip: false 时保证 result 存在：（1）正常执行 → result 来自 executeToolAsync；（2）LSP rollback → result 显式构造
               if (!r.skip) toolResults.push({ call: r.call, result: r.result! });
               if (r.abort) {
                 return yield* this.finalize(r.reason ?? TERMINATION_REASON.LOOP_DETECTED, session);
@@ -593,14 +671,60 @@ export class Engine implements IEngine {
 
           // Post-loop: 更新内存 (按原始顺序)
           for (const { call, result } of toolResults) {
-            this.reflection.inter(call, result, session).then(postCheck => {
+            // L3 — LLM 语义审查（★ await 确保 feedback 注入在当前轮次内）
+            try {
+              const postCheck = await this.reflection.inter(call, result, session);
               if (postCheck.feedback) {
                 session.messages.push({
                   role: MESSAGE_ROLE.SYSTEM,
                   content: `[reflection] ${postCheck.feedback}`,
                 });
               }
-            });
+            } catch {
+              // reflection 调用失败 → 静默降级，不阻塞主流程
+              console.warn('[loop] reflection.inter() call failed, silently degrading');
+            }
+
+            // ★ L2 — 自检管线（确定性规则，不调 LLM）
+            const checkCtx = this.buildCheckContext();
+            for (const rule of this.checkRules) {
+              if (!rule.assess(call)) continue;
+              const issue = rule.check(call, result, checkCtx);
+              if (issue) {
+                // 去重：同文件同规则同偏离不重复
+                const args = safeParseArgs(call.function.arguments);
+                const targetPath = typeof args.path === 'string' ? args.path : '';
+                const dupKey = targetPath
+                  ? `${rule.id}:${targetPath}:${issue.message}`
+                  : `${rule.id}:${issue.message}`;
+                if (this.emittedIssues.has(dupKey)) continue;
+                // ★ 上限保护：超过 200 条清空旧记录
+                if (this.emittedIssues.size > 200) {
+                  this.emittedIssues.clear();
+                }
+                this.emittedIssues.add(dupKey);
+
+                // ★ 格式化：不使用 emoji（终端兼容性），截断时补 '...'
+                const hintSuffix = issue.hint ? ` | ${issue.hint}` : '';
+                let msg = `[self-check] ${issue.message}${hintSuffix}`;
+                if (msg.length > SYSTEM.SELF_CHECK_MAX_MESSAGE_LENGTH) {
+                  const cut = SYSTEM.SELF_CHECK_MAX_MESSAGE_LENGTH - 4;
+                  // ★ Array.from 保证不切在 surrogate pair 中间（emoji 等）
+                  msg = [...msg].slice(0, Math.max(0, cut)).join('') + '...';
+                }
+                session.messages.push({
+                  role: MESSAGE_ROLE.SYSTEM,
+                  content: msg,
+                });
+              }
+            }
+
+            // ★ 跟踪 session 内新文件——补充 bootstrap 文件列表
+            if (call.function.name === 'file_write') {
+              const args = safeParseArgs(call.function.arguments);
+              if (typeof args.path === 'string') this.sessionFiles.add(args.path);
+            }
+
             this.workingMemory.updateStateWindow(result, call, session.turn);
             this.workingMemory.updateIntentWindow(call, result, session);
             this.semanticMemory.recordFileOperation(call, result, session.turn);
@@ -677,7 +801,12 @@ export class Engine implements IEngine {
         }
 
         // AbortError → 用户中断
-        if (err instanceof DOMException && err.name === 'AbortError') {
+        // ★ Node.js AbortController 可接受任意 reason 类型，
+        //   不能只匹配 DOMException。同时检查 name 属性和 instanceof。
+        if (
+          (err instanceof DOMException && err.name === 'AbortError') ||
+          (err instanceof Error && err.name === 'AbortError')
+        ) {
           return yield* this.finalize(TERMINATION_REASON.USER_ABORTED, session);
         }
 
@@ -770,6 +899,9 @@ export class Engine implements IEngine {
       this.reasoning.clear(); // reasoning cache 不能跨会话
       this.progress.reset();
       this.reflection.reset();
+      this.emittedIssues.clear();
+      this.fileCache.clear();
+      this.sessionFiles.clear();
 
       saved.currentInput = '(resumed session)';
       saved.outcome = null;
@@ -811,6 +943,25 @@ export class Engine implements IEngine {
     if (this.mcpClient) {
       await this.mcpClient.shutdown();
     }
+  }
+
+  /**
+   * ★ 设置 LSP 桥接——由 VS Code Extension (Terminal 2) 调用。
+   * CLI 模式下为 null → LSP 相关功能静默降级。
+   */
+  setLSPBridge(bridge: ILSPBridge | null): void {
+    this.lspBridge = bridge;
+  }
+
+  /**
+   * ★ 派生独立 Engine 实例，共享 LLM + tools + config + logger + contextLLM。
+   * 用于子 Agent 创建——每个子 Agent 有独立的 session/working memory/progress，
+   * 但调用的是同一底层 LLM 客户端和工具执行器。
+   *
+   * 替代 subagent.ts 中的 `(engine as any)` 反模式。
+   */
+  forkEngine(): Engine {
+    return new Engine(this.llm, this.config, this.tools, this.logger, this.contextLLM);
   }
 
   // ==========================================================================
@@ -861,6 +1012,9 @@ export class Engine implements IEngine {
     this.reflection.reset();
     this.context.reset();
     this.skillsLoader.reset();
+    this.emittedIssues.clear();
+    this.fileCache.clear();
+    this.sessionFiles.clear();
 
     return session;
   }
@@ -939,6 +1093,22 @@ export class Engine implements IEngine {
       toolRetriever: createToolRetriever(allToolDefs),
       nativeTools: this.tools,
       engine: this,
+    };
+  }
+
+  /**
+   * ★ 构建自检管线上下文。
+   */
+  private buildCheckContext(): CheckContext {
+    // ★ 合并 bootstrap 文件 + session 内新文件
+    const allFiles = [
+      ...(this.bootstrapReport?.files_scanned ?? []),
+      ...this.sessionFiles,
+    ];
+    return {
+      projectPath: this.config.project.projectPath,
+      allFiles,
+      fileCache: this.fileCache,
     };
   }
 
@@ -1052,10 +1222,17 @@ export class Engine implements IEngine {
    * ★ MCP 工具执行
    */
   private async executeMCPTool(call: ToolCall): Promise<ToolResult> {
+    // ★ 防御性 guard：调用方已检查 this.mcpClient 存在，但方法本身也做检查
+    if (!this.mcpClient) {
+      return {
+        callId: call.id, toolName: call.function.name, ok: false,
+        content: 'MCP client not available', errorCategory: 'execution_error',
+      };
+    }
     const args = safeParseArgs(call.function.arguments);
 
     try {
-      const result = await this.mcpClient!.callTool(
+      const result = await this.mcpClient.callTool(
         call.function.name,
         args,
       );

@@ -88,6 +88,16 @@ impl Tool for ShellBashTool {
             .map(|n| n as u32)
             .unwrap_or_else(|| self.timeout_ms());
 
+        // ★ 安全检查：拒绝含明显注入模式的命令
+        //   shell_bash 是工具链中最强大的工具，用户确认后才执行。
+        //   此检查作为 defense-in-depth，不替代 Agent 4 的权限关口。
+        if has_command_injection_risk(command_str) {
+            return ToolOutput::error(
+                "COMMAND_INJECTION_RISK",
+                "Command contains potentially dangerous patterns. ",
+            );
+        }
+
         // Choose shell based on platform
         let (shell, shell_arg) = if cfg!(target_os = "windows") {
             ("cmd", "/c")
@@ -132,8 +142,15 @@ impl Tool for ShellBashTool {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) => {
                     if start.elapsed() >= timeout {
-                        let _ = child.kill();
-                        let _ = child.wait(); // Reap the zombie
+                        // Best-effort: kill the timed-out child process and reap it.
+                        // Both are necessary to prevent zombies; failure is rare and
+                        // has no actionable recourse.
+                        if let Err(e) = child.kill() {
+                            eprintln!("[shell] failed to kill timed-out process: {}", e);
+                        }
+                        if let Err(e) = child.wait() {
+                            eprintln!("[shell] failed to reap timed-out process: {}", e);
+                        }
                         return ToolOutput::error(
                             "TIMEOUT",
                             format!(
@@ -158,10 +175,14 @@ impl Tool for ShellBashTool {
         let mut stderr_str = String::new();
 
         if let Some(ref mut stdout) = child.stdout {
-            let _ = stdout.read_to_string(&mut stdout_str);
+            if let Err(e) = stdout.read_to_string(&mut stdout_str) {
+                eprintln!("[shell] read stdout error: {}", e);
+            }
         }
         if let Some(ref mut stderr) = child.stderr {
-            let _ = stderr.read_to_string(&mut stderr_str);
+            if let Err(e) = stderr.read_to_string(&mut stderr_str) {
+                eprintln!("[shell] read stderr error: {}", e);
+            }
         }
 
         let exit_code = exit_status.and_then(|s| s.code()).unwrap_or(-1);
@@ -186,4 +207,69 @@ impl Tool for ShellBashTool {
             ToolOutput::ok("shell_bash", &[("exit_code", &exit_code.to_string())], Some(&result))
         }
     }
+}
+
+// ============================================================================
+// Defense-in-depth: command injection risk detection
+// ============================================================================
+
+/// Check for obvious shell injection / destructive command patterns.
+///
+/// This is NOT a security boundary — the real protection is Agent 4's
+/// `RequiresApproval` permission gate. This function catches the most
+/// obvious attacks (rm -rf /, fork bombs, pipe-to-shell) as defense-in-depth.
+fn has_command_injection_risk(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+
+    // Patterns that are almost certainly destructive / malicious
+    let dangerous_patterns = [
+        // Fork bomb
+        ":(){ :|:& };:",
+        // Recursive force delete from root
+        "rm -rf /",
+        "rm -rf ~",
+        "rm -fr /",
+        // Format / wipe filesystem
+        "mkfs.",
+        "dd if=/dev/zero",
+        "dd if=/dev/urandom",
+        // Fork bomb variants
+        "%0|%0",
+        // Shell exec of self
+        "$0 &",
+        // Write directly to block devices
+        "> /dev/sd",
+        "> /dev/hd",
+        "> /dev/nvme",
+    ];
+
+    for pattern in &dangerous_patterns {
+        if lower.contains(pattern) {
+            return true;
+        }
+    }
+
+    // Reject commands with suspicious semicolon-chaining of destructive ops
+    if lower.contains(';') {
+        let parts: Vec<&str> = cmd.split(';').collect();
+        let mut has_destructive = false;
+        let destructive_commands = [
+            "rm ", "shutdown", "reboot", "mkfs", "dd ", "format",
+            "fdisk", "del /f", "rd /s", "format c:",
+        ];
+        for part in &parts {
+            let p = part.trim().to_lowercase();
+            for dc in &destructive_commands {
+                if p.starts_with(dc) {
+                    has_destructive = true;
+                    break;
+                }
+            }
+        }
+        if has_destructive && parts.len() >= 2 {
+            return true; // Multiple chained commands with destructive ops
+        }
+    }
+
+    false
 }

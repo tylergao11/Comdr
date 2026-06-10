@@ -123,8 +123,12 @@ impl FileSnapshot {
                     let tmp = tmp_path(p)?;
                     fs::copy(temp_path, &tmp)?;
                     fs::rename(&tmp, p)?;
-                    // Clean up temp file
-                    let _ = fs::remove_file(temp_path);
+                    // Best-effort: clean up temp file.
+                    // Failure is acceptable — the temp file will be cleaned up
+                    // by the OS temp-dir policy eventually.
+                    if let Err(e) = fs::remove_file(temp_path) {
+                        eprintln!("[snapshot] failed to remove temp file {:?}: {}", temp_path, e);
+                    }
                 }
                 SnapshotEntry::DidNotExist => {
                     if p.exists() {

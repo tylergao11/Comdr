@@ -34,7 +34,9 @@ export function tokenize(text: string): Map<string, number> {
   if (!lower) return counts;
 
   // 策略 1: 词级 token——按非字母数字非 CJK 字符分割
-  const words = lower.split(/[^a-zA-Z0-9一-鿿㐀-䶿]+/);
+  // ★ 使用 Unicode property escape \p{sc=Han} 覆盖所有汉字（含 Extension B+），
+  //   用 /u 标志保证 surrogate pair 正确匹配
+  const words = lower.split(/[^a-zA-Z0-9\p{sc=Han}]+/u);
   for (const w of words) {
     if (w.length < 2) continue; // 跳过单字符（噪声大）
     if (/^[0-9]+$/.test(w) && w.length > 4) continue; // 跳过长数字串（UUID/hash 碎片——无检索价值）
@@ -122,6 +124,11 @@ export class BM25Scorer {
    * @param queryTokens  查询的分词结果
    * @param docTokens    文档的分词结果
    * @returns BM25 分数（非归一化，仅用于排序）
+   *
+   * ★ 注意：docTokens 应为完整文档 token 而非 queryTokens 本身。
+   *   若 docTokens 与 queryTokens 相同（文档本身也是查询），
+   *   文档长度 docLen = queryTokens 总频 → 长度归一化因子偏小 → 分数失准。
+   *   同步检索时（SQL 中 docTokens 可能丢失），调用方应对退化情况做检查。
    */
   score(queryTokens: Map<string, number>, docTokens: Map<string, number>): number {
     if (this.docCount === 0) return 0;
@@ -201,9 +208,11 @@ export function contextualPrefix(
   text: string,
   context: { source: string; heading?: string },
 ): string {
+  // ★ 转义 source/heading 中的 `[` `]`——否则破坏 `[label]` 格式
+  const escSource = context.source.replace(/[\[\]]/g, '\\$&');
   const label = context.heading
-    ? `${context.source} § ${context.heading}`
-    : context.source;
+    ? `${escSource} § ${context.heading.replace(/[\[\]]/g, '\\$&')}`
+    : escSource;
   return `[${label}] ${text}`;
 }
 
@@ -232,6 +241,7 @@ export function hashToDim(token: string, dims: number): number {
 export function cosineSimilarity(a: number[], b: number[]): number {
   let dot = 0;
   for (let i = 0; i < a.length; i++) {
+    // ★ 循环保证 0 <= i < a.length → a[i] 在 bounds 内
     dot += a[i]! * (b[i] ?? 0);
   }
   return dot;

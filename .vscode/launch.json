@@ -1,0 +1,49 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Comdr (no build)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath",
+        "${workspaceFolder}/packages/vscode"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/packages/vscode/dist/**/*.cjs"
+      ],
+      "env": {
+        "COMDR_API_KEY": "${env:COMDR_API_KEY}"
+      }
+    },
+    {
+      "name": "Launch Comdr Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "preLaunchTask": "Build Comdr VSCode",
+      "args": [
+        "--extensionDevelopmentPath",
+        "${workspaceFolder}/packages/vscode",
+        "--folder",
+        "${workspaceFolder}"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/packages/vscode/dist/**/*.cjs"
+      ],
+      "env": {
+        "COMDR_API_KEY": "${env:COMDR_API_KEY}"
+      }
+    },
+    {
+      "name": "Launch Comdr CLI (TUI)",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/packages/ui/dist/cli.js",
+      "args": [],
+      "console": "integratedTerminal",
+      "env": {
+        "COMDR_API_KEY": "${env:COMDR_API_KEY}"
+      }
+    }
+  ]
+}

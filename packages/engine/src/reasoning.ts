@@ -82,10 +82,20 @@ export class ReasoningManager {
       if (msg.role !== MESSAGE_ROLE.ASSISTANT) return msg;
       if (msg.reasoning_content !== undefined) return msg;
 
-      // 尝试从缓存恢复
-      const cached = msg.tool_calls && msg.tool_calls.length > 0
-        ? this.cache.get(msg.tool_calls[0]!.id) ?? ''
-        : this.lastReasoning;
+      // ★ 尝试从缓存恢复——遍历所有 tool_call IDs
+      //   不能只查 [0]：同一 assistant 消息可能含多个 tool_calls，
+      //   若首个 call_id 未被 capture（如跨会话恢复），后序 ID 仍有缓存命中可能
+      let cached = '';
+      if (msg.tool_calls && msg.tool_calls.length > 0) {
+        for (const tc of msg.tool_calls) {
+          const found = this.cache.get(tc.id);
+          if (found !== undefined) {
+            cached = found;
+            break;
+          }
+        }
+      }
+      if (!cached) cached = this.lastReasoning;
 
       return { ...msg, reasoning_content: cached };
     });
@@ -110,7 +120,8 @@ export class ReasoningManager {
         msg.role === MESSAGE_ROLE.ASSISTANT &&
         msg.tool_calls &&
         msg.tool_calls.length > 0 &&
-        msg.reasoning_content === undefined
+        // ★ == null 同时匹配 undefined 和 null（JSON 反序列化产物）
+        msg.reasoning_content == null
       ) {
         return { ...msg, reasoning_content: '' };
       }

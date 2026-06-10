@@ -150,8 +150,9 @@ export class EpisodicMemory {
    * 合并后新会话的 retrieve() 才能检索到本次会话的摘要。
    */
   /**
-   * ★ 只 commit 成功的会话——失败的、中断的、错误的不进入长期记忆。
-   * SuperLocalMemory (2026): Bayesian trust scoring，失败会话 trust -= 0.2。
+   * ★ Commit completed + interrupted 会话进入长期记忆。
+   *   失败/异常终止的会话不入 store（避免污染检索），但计入 reflection 统计。
+   *   SuperLocalMemory (2026): Bayesian trust scoring，失败会话 trust -= 0.2。
    */
   commit(): void {
     for (const [id, summary] of this.pendingStore) {
@@ -195,10 +196,13 @@ export class EpisodicMemory {
 
     const summaries = recent.map((ep) => {
       const ss = ep.structuredSummary;
-      return `[${ep.id}] ${ep.task} → ${ep.outcome ?? 'unknown'}
+      // ★ outcome 为 completed 表示会话正常结束；null 表示中断/异常
+      const hadIssues = ep.outcome !== 'completed' && ep.outcome !== null;
+      return `[${ep.id}] ${ep.task} → ${ep.outcome ?? 'interrupted'}
   Files: ${ss?.fileModifications.map(f => `${f.action} ${f.path}`).join(', ') ?? 'none'}
   Decisions: ${ss?.decisions.map(d => d.what).join('; ') ?? 'none'}
-  Failures: ${ss?.nextSteps.length === 0 ? 'none' : 'some'}`;
+  Issues: ${hadIssues ? 'yes (non-completed outcome)' : 'none apparent'}
+  Open: ${ss?.openQuestions.join('; ') ?? 'none'}`;
     }).join('\n\n');
 
     const prompt = `You are a reflection engine for a coding agent. Given summaries of past sessions,
@@ -244,7 +248,10 @@ ${summaries}`;
         }
       }
     } catch {
-      // LLM 反思失败 → 静默降级，下次再试
+      // LLM 反思失败 → 重置计数器，防止无限重试
+      // 不保持 sessionsSinceReflection 高位：若 LLM 持续不可用，
+      // shouldReflect() 会每轮都返回 true，每次 reflect() 都失败，形成空转循环。
+      this.sessionsSinceReflection = 0;
     }
 
     return [];
@@ -279,6 +286,11 @@ ${summaries}`;
 
     const scored = [...this.store.values()]
       .map((ep) => {
+        // ★ episodeTokens 缺失时返回 0 分：这是设计意图。
+        //   episodeTokens 由 commit() 写入 store 时同步建立。
+        //   若某摘要已存在于 store 但无对应 token（如旧版本持久化数据迁移后），
+        //   该 episode 应被 BM25 评分忽略而非报错——0 分使其排在底部，
+        //   降序排列后会被 slice 剔除，不会影响检索质量。
         const docTokens = this.episodeTokens.get(ep.id);
         const score = docTokens
           ? this.bm25.score(queryTokens, docTokens)
@@ -320,17 +332,25 @@ ${summaries}`;
   deserialize(episodeData: string, reflectionData?: string): void {
     try {
       const arr = JSON.parse(episodeData) as EpisodeSummary[];
+      // ★ 两阶段恢复：先建 BM25 索引（保证 IDF 一致），再算 embedding
+      //   否则第一份文档的 IDF 计算时索引为空，embedding 漂移
+      const summariesWithTokens: Array<{ summary: EpisodeSummary; tokens: Map<string, number> }> = [];
       for (const summary of arr) {
         const text = this.serializeForEmbedding(summary);
         const tokens = tokenize(text);
+        this.store.set(summary.id, summary);
+        this.episodeTokens.set(summary.id, tokens);
+        this.bm25.addDocument(tokens);
+        summariesWithTokens.push({ summary, tokens });
+      }
+      // 第二阶段：用完整的 BM25 索引计算 embedding
+      for (const { summary } of summariesWithTokens) {
+        const text = this.serializeForEmbedding(summary);
         summary.embedding = denseEmbed(
           text,
           SYSTEM.EPISODIC_EMBEDDING_DIMS,
           (term) => this.bm25.idf(term),
         );
-        this.store.set(summary.id, summary);
-        this.episodeTokens.set(summary.id, tokens);
-        this.bm25.addDocument(tokens);
       }
     } catch {
       // 数据损坏 → 静默跳过
@@ -344,8 +364,10 @@ ${summaries}`;
       }
     }
 
-    // ★ 恢复后的会话视为已持久化→重置计数器
-    this.sessionsSinceReflection = this.store.size % SYSTEM.EPISODIC_REFLECTION_INTERVAL;
+    // ★ 恢复后保守处理——session 计数从 0 开始
+    //   取模 store.size % INTERVAL 会引入偏差（不知道之前反射了多少次），
+    //   设为 0 确保恢复后至少等 INTERVAL 个新会话才触发第一次反射。
+    this.sessionsSinceReflection = 0;
   }
 
   /**

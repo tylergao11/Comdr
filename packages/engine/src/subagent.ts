@@ -19,8 +19,6 @@
 
 import type { RunResult, JSONSchema } from '@comdr/core/types';
 import { AGENT_EVENT } from '@comdr/core';
-import type { IDeepSeekClient, INativeTools, IEventLogger } from '@comdr/core/contracts';
-import type { AgentConfig } from '@comdr/core/types';
 import { Engine } from './loop.js';
 
 // ============================================================================
@@ -73,15 +71,10 @@ export async function runSubAgent(
   const mode = opts.mode ?? 'agent';
   const label = opts.label ?? `sub-${prompt.slice(0, 30)}`;
 
-  // ★ 创建独立 Engine 实例（共享 LLM + tools + logger + config）
-  const contextLLM = (engine as any).contextLLM as IDeepSeekClient | undefined;
-  const sub = new Engine(
-    (engine as any).llm as IDeepSeekClient,
-    (engine as any).config as AgentConfig,
-    (engine as any).tools as INativeTools | null,
-    (engine as any).logger as IEventLogger | null,
-    contextLLM,  // ★ 子 Agent 继承主 Engine 的 flash 模型
-  );
+  // ★ 派生独立 Engine 实例（共享 LLM + tools + logger + config）
+  //   使用 forkEngine() 替代 (engine as any) 反模式——
+  //   每个子 Agent 有独立的 session/working memory/progress，但调用同一底层依赖
+  const sub = engine.forkEngine();
 
   const toolCalls: string[] = [];
   let done: RunResult | null = null;
@@ -118,6 +111,11 @@ export async function runSubAgent(
       structured = parsed;
     } catch {
       // 非 JSON 输出 → structured 保持 undefined
+      // ★ 记录诊断信息——帮助排查为什么 LLM 未返回合法 JSON
+      console.warn(
+        `[Comdr] Sub-agent [${label}] returned non-JSON summary ` +
+        `(first 80 chars: "${done.summary.slice(0, 80)}")`,
+      );
     }
   }
 
@@ -153,6 +151,11 @@ export async function fanOut(
   const tasks = prompts.map((p, i) =>
     runSubAgent(p, engine, { ...opts, label: opts.label ?? `fan-${i + 1}` }),
   );
+  // ★ Promise.all 要求所有子任务都不能抛未捕获异常——否则整个批次被拒绝。
+  //   runSubAgent 内部有完整 try-catch 兜底（参见 §2 runSubAgent 实现），
+  //   创建 Engine 实例失败、LLM 调用失败、流式迭代中断等所有异常路径
+  //   均被捕获并返回 { ok: false, ... } 结果对象而非 throw。
+  //   因此这里的 Promise.all 是安全的：每个 task 必定 resolve，不会 reject。
   return Promise.all(tasks);
 }
 
@@ -178,6 +181,9 @@ export async function pipeline<T>(
   opts: SubAgentOpts = {},
 ): Promise<SubAgentResult[][]> {
   const results: SubAgentResult[][] = items.map(() => []);
+
+  // 空 stages 防护——stages[0]! 非空断言在空数组时会崩
+  if (stages.length === 0) return results;
 
   // Stage 1: 对每个 item 并行
   let prevResults: SubAgentResult[] = await Promise.all(

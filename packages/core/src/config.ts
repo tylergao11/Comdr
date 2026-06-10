@@ -54,6 +54,7 @@ const DEFAULTS: AgentConfig = {
     skillsDir: 'skills',
     mcpServers: [],
     comdrMdPath: 'COMDR.md',
+    contextModel: undefined, // ★ 显式 undefined → downstream 用 ?? MODEL_ROLE.CONTEXT 回退
   },
   agent: {
     maxTurns: 50,
@@ -170,7 +171,7 @@ function validateTomlThinking(
   if (typeof raw !== 'object' || raw === null) {
     throw new ConfigValidationError(
       `${sourcePath}: llm.thinking must be a table, got ${typeof raw}`,
-      ['llm.thinking'],
+      ['llm.thinking (must be a table)'],
     );
   }
   const t = raw as Record<string, unknown>;
@@ -178,7 +179,7 @@ function validateTomlThinking(
   if (type !== THINKING_TYPE.ENABLED && type !== THINKING_TYPE.DISABLED) {
     throw new ConfigValidationError(
       `${sourcePath}: llm.thinking.type must be '${THINKING_TYPE.ENABLED}' or '${THINKING_TYPE.DISABLED}', got '${String(type)}'`,
-      ['llm.thinking.type'],
+      [`llm.thinking.type (must be '${THINKING_TYPE.ENABLED}' or '${THINKING_TYPE.DISABLED}')`],
     );
   }
   if (type === THINKING_TYPE.ENABLED) {
@@ -186,7 +187,7 @@ function validateTomlThinking(
     if (effort !== THINKING_EFFORT.HIGH && effort !== THINKING_EFFORT.MAX) {
       throw new ConfigValidationError(
         `${sourcePath}: llm.thinking.effort must be '${THINKING_EFFORT.HIGH}' or '${THINKING_EFFORT.MAX}' when thinking is enabled, got '${String(effort)}'`,
-        ['llm.thinking.effort'],
+        [`llm.thinking.effort (must be '${THINKING_EFFORT.HIGH}' or '${THINKING_EFFORT.MAX}')`],
       );
     }
     return { type: THINKING_TYPE.ENABLED, effort };
@@ -211,9 +212,13 @@ function mergeTomlFile(config: AgentConfig, filePath: string): void {
   try {
     parsed = parseToml(raw) as ComdrToml;
   } catch (err) {
-    // TOML 解析失败——用户应该知道配置写错了
-    console.warn(`Comdr: failed to parse ${filePath}: ${String(err)}`);
-    return;
+    // TOML 解析失败——抛 ConfigValidationError 而非 console.warn。
+    // ★ console.warn 在 headless/CI 模式不可见，用户无法得知配置坏了。
+    //    改为 throw 后无论是 TUI 还是 headless 模式，调用方都能捕获且展示。
+    throw new ConfigValidationError(
+      `Comdr: failed to parse ${filePath}: ${String(err)}`,
+      [`${filePath} (TOML parse error)`],
+    );
   }
 
   if (parsed.llm) {
@@ -255,9 +260,8 @@ function mergeTomlFile(config: AgentConfig, filePath: string): void {
 function mergeEnvVars(config: AgentConfig): void {
   const env = process.env;
 
-  // API Key: COMDR_API_KEY > ANTHROPIC_AUTH_TOKEN (Claude runtime 透传)
+  // API Key: COMDR_API_KEY 优先
   if (env.COMDR_API_KEY) config.llm.apiKey = env.COMDR_API_KEY;
-  else if (env.ANTHROPIC_AUTH_TOKEN) config.llm.apiKey = env.ANTHROPIC_AUTH_TOKEN;
 
   if (env.COMDR_BASE_URL) config.llm.baseUrl = env.COMDR_BASE_URL;
   // ANTHROPIC_BASE_URL 指向 /anthropic 兼容端点，Comdr 用原生端点所以不采纳

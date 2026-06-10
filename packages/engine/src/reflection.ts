@@ -23,6 +23,8 @@ import type {
   Message,
   SessionState,
   Route,
+  LSPDiagnostic,
+  DiagnosticSnapshot,
 } from '@comdr/core/types';
 import type { IDeepSeekClient } from '@comdr/core/contracts';
 import {
@@ -45,6 +47,21 @@ export interface SelfCorrectResult {
   correctedArgs?: Record<string, unknown>;
   /** LLM 解释（为什么错了） */
   explanation?: string;
+}
+
+/**
+ * ★ LSP 诊断差值纠正决策——确定性、不调 LLM。
+ *
+ * decision 取值:
+ *   'accept'  → 纯改善或无变化，正常流程继续
+ *   'rollback' → 纯恶化，应回滚文件变更
+ *   'retry'    → 混合（有改善也有新错误），应将 feedback 注入 Agent 让它再修
+ */
+export interface LSPCorrectionDecision {
+  /** 决策类型 */
+  decision: 'accept' | 'rollback' | 'retry';
+  /** 给 Agent 的反馈文本 */
+  feedback: string;
 }
 
 // ============================================================================
@@ -193,13 +210,34 @@ export class ReflectionEngine {
   }
 
   /**
-   * 检测循环：相同签名连续出现 ≥3 次
+   * 检测循环：
+   *   1. 相同签名连续出现 ≥ LOOP_DETECTION_THRESHOLD 次
+   *   2. 两个签名严格交替 (A→B→A→B→A→B) — 也是循环
    */
   private detectLoop(signature: string): boolean {
-    // 只看最近的 N 个签名
     const threshold = SYSTEM.LOOP_DETECTION_THRESHOLD;
     const recent = this.recentCallSignatures.slice(-threshold);
-    return recent.length >= threshold && recent.every((s) => s === signature);
+
+    if (recent.length < threshold) return false;
+
+    // 模式 1: 全是同一个签名
+    if (recent.every((s) => s === signature)) return true;
+
+    // 模式 2: 两个签名严格交替 (A→B→A→B...)
+    // 至少有 2 个不同值，且每个奇数位置相同、每个偶数位置相同
+    if (threshold >= 3) {
+      const even = recent[0]!;
+      const odd = recent[1]!;
+      if (even === odd) return false; // 需要两个不同签名
+      let alternating = true;
+      for (let i = 0; i < recent.length; i++) {
+        const expected = i % 2 === 0 ? even : odd;
+        if (recent[i] !== expected) { alternating = false; break; }
+      }
+      if (alternating) return true;
+    }
+
+    return false;
   }
 
   /**
@@ -327,6 +365,7 @@ export class ReflectionEngine {
       };
     } catch {
       // LLM 调用失败 → 回退到规则判断
+      console.warn('[reflection] LLM analyzeFailure failed, falling back to rule-based judgment');
       return {
         acceptable: false,
         needsRollback: result.snapshotId !== undefined,
@@ -366,7 +405,7 @@ export class ReflectionEngine {
     const failedCount = result.testFeedback?.failed ?? 0;
     const passedCount = result.testFeedback?.passed ?? 0;
 
-    // ★ DeepSeek prefix 消息——强制进入纠正姿态
+    // ★ DeepSeek prefix message — forces correction posture
     const prefixContent =
       `I see the mistake. The test results show ${failedCount} failures ` +
       `(and ${passedCount} passing). The reasoning was correct but the ` +
@@ -462,6 +501,109 @@ export class ReflectionEngine {
         explanation: `Self-correct LLM call failed: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // LSP 诊断差值纠正（确定性，不调 LLM）
+  // --------------------------------------------------------------------------
+
+  /**
+   * ★ LSP 诊断差值纠正——确定性、不调 LLM。
+   *
+   * 和 selfCorrect() 的关系:
+   *   - correctByLSP(): 处理语法/类型错误（LSP 诊断差值 → 确定性决策）
+   *   - selfCorrect():  处理逻辑/测试错误（reasoning + prefix completion → LLM 决策）
+   *
+   * 调用顺序（在 loop.ts 中）:
+   *   1. snapshot before  →  D_before
+   *   2. tool execute     →  改文件
+   *   3. snapshot after   →  D_after
+   *   4. correctByLSP(D_before, D_after) → 决策
+   *      - 纯改善 → 接受
+   *      - 纯恶化 → 回滚
+   *      - 有改善有恶化 → 把新错误注入 Agent 反馈，让它再修
+   *   5. 如果仍有 test_failed → selfCorrect()（LLM 路径）
+   *
+   * ★ Lanser-CLI 论文: 这本质上就是过程奖励信号。
+   *   r = α*(errors_before - errors_after) + β*safety_check
+   *
+   * @returns 决策结果 + 反馈文本
+   */
+  correctByLSP(
+    before: DiagnosticSnapshot,
+    after: DiagnosticSnapshot,
+  ): LSPCorrectionDecision {
+    const delta = this.computeDiagnosticDelta(before, after);
+
+    // 计算分数（简化版 Lanser-CLI 奖励函数）
+    const score =
+      delta.fixed.length * 2    // 修复一个错误 = +2
+      - delta.introduced.length * 3;  // 引入新错误 = -3（惩罚更重）
+
+    if (score > 0 && delta.introduced.length === 0) {
+      // 纯改善: 修复了 N 个错误，没引入新错误
+      return {
+        decision: 'accept',
+        feedback: delta.fixed.length > 0
+          ? `Fixed ${delta.fixed.length} LSP issue(s):\n${this.formatDiagnostics(delta.fixed)}`
+          : 'No LSP issues introduced.',
+      };
+    }
+
+    if (score < 0 && delta.fixed.length === 0) {
+      // 纯恶化: 引入了 N 个新错误，没修复任何错误
+      return {
+        decision: 'rollback',
+        feedback:
+          `Introduced ${delta.introduced.length} new LSP issue(s):\n` +
+          this.formatDiagnostics(delta.introduced),
+      };
+    }
+
+    if (delta.introduced.length > 0) {
+      // 混合: 有改善也有恶化 → 把新错误反馈给 Agent
+      return {
+        decision: 'retry',
+        feedback:
+          (delta.fixed.length > 0
+            ? `Fixed ${delta.fixed.length} issue(s) but introduced ${delta.introduced.length} new one(s).\n`
+            : `Introduced ${delta.introduced.length} new LSP issue(s).\n`) +
+          `Please fix:\n${this.formatDiagnostics(delta.introduced)}`,
+      };
+    }
+
+    // 无变化
+    return { decision: 'accept', feedback: '' };
+  }
+
+  /**
+   * ★ 计算诊断差值——确定性纯函数。
+   * 可独立单元测试。
+   */
+  private computeDiagnosticDelta(
+    before: DiagnosticSnapshot,
+    after: DiagnosticSnapshot,
+  ): {
+    introduced: LSPDiagnostic[];
+    fixed: LSPDiagnostic[];
+  } {
+    // 用 (line, column, code, message) 作为诊断的唯一标识
+    const key = (d: LSPDiagnostic) =>
+      `L${d.line}:C${d.column}:${d.code ?? ''}:${d.message}`;
+
+    const beforeSet = new Set(before.diagnostics.map(key));
+    const afterSet = new Set(after.diagnostics.map(key));
+
+    return {
+      introduced: after.diagnostics.filter(d => !beforeSet.has(key(d))),
+      fixed: before.diagnostics.filter(d => !afterSet.has(key(d))),
+    };
+  }
+
+  private formatDiagnostics(diags: LSPDiagnostic[]): string {
+    return diags
+      .map(d => `  L${d.line}:C${d.column} [${d.severity}] ${d.message}`)
+      .join('\n');
   }
 
   // --------------------------------------------------------------------------

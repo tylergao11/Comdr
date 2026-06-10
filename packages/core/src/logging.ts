@@ -11,6 +11,7 @@
  */
 
 import { mkdirSync, writeFileSync, appendFileSync, readFileSync, statSync } from 'node:fs';
+import { join as pathJoin } from 'node:path';
 
 import type { AgentEvent, TokenUsage } from './types.js';
 import { SYSTEM } from './types.js';
@@ -46,12 +47,12 @@ export class EventLogger {
   private tokenPath: string;
 
   constructor(projectPath: string) {
-    this.logDir = `${projectPath}/temp/comdr`;
+    this.logDir = pathJoin(projectPath, 'temp', 'comdr');
     ensureDir(this.logDir);
 
     const dateStr = formatDate(new Date());
-    this.logPath = `${this.logDir}/execution-${dateStr}.jsonl`;
-    this.tokenPath = `${this.logDir}/latest-tokens.json`;
+    this.logPath = pathJoin(this.logDir, `execution-${dateStr}.jsonl`);
+    this.tokenPath = pathJoin(this.logDir, 'latest-tokens.json');
   }
 
   // --------------------------------------------------------------------------
@@ -92,10 +93,10 @@ export class EventLogger {
 
     if (size <= SYSTEM.LOG_ROTATION_SIZE) return;
 
-    // 读取末 1000 行
+    // 读取末 LOG_RETAIN_LINES 行
     const content = readFileSync(this.logPath, 'utf-8');
     const lines = content.split('\n').filter((l) => l.length > 0);
-    const kept = lines.slice(-1000);
+    const kept = lines.slice(-SYSTEM.LOG_RETAIN_LINES);
 
     // 加标记行
     kept.unshift(
@@ -135,6 +136,7 @@ export class EventLogger {
   readLatestTokens(): TokenUsage | null {
     try {
       const raw = readFileSync(this.tokenPath, 'utf-8');
+      // ★ 读取的是本程序写入的 latest-tokens.json → 信任格式
       return JSON.parse(raw) as TokenUsage;
     } catch {
       return null;

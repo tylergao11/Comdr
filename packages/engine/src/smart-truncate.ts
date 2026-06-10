@@ -51,9 +51,6 @@ const MEANINGLESS_FIRST_LINE: readonly RegExp[] = [
   /^\[mock\]/,
 ];
 
-/** 内容过长时在省略号后保留的尾部字符数 */
-const TAIL_KEEP_CHARS = 60;
-
 /**
  * 对 tool output 做智能摘要。
  *
@@ -176,6 +173,7 @@ function extractTestSummary(
   if (combined.length <= maxChars) return combined;
 
   // 太多 → 只保留首尾
+  // L169 已保证 results.length > 0 → results[0] 非空
   return results[0]! + `\n…及 ${results.length - 1} 条测试结果`;
 }
 
@@ -399,14 +397,14 @@ export function deriveStableKey(
 
     // 如果 key 已足够区分，直接返回
     if (!maxLen || base.length <= maxLen) {
-      // 但 cmd 确实可能导致碰撞 → 追加短 hash
-      const shortHash = fnv1a(cleanCmd).toString(36).slice(0, 4);
+      // 追加 6 字符 hash（36^6 = 2.18B 空间，碰撞风险极低）
+      const shortHash = fnv1a(cleanCmd).toString(36).slice(0, 6);
       return `${base}_${shortHash}`;
     }
 
     // key 太长 → 截断命令部分 + hash
-    const truncatedBase = wordBoundaryTruncate(base, maxLen - 6);
-    const hash = fnv1a(cleanCmd).toString(36).slice(0, 4);
+    const truncatedBase = wordBoundaryTruncate(base, maxLen - 8);
+    const hash = fnv1a(cleanCmd).toString(36).slice(0, 6);
     return `${truncatedBase}_${hash}`;
   }
 
@@ -504,12 +502,22 @@ export function extractIntent(
  * 支持中英文标点：`.`, `。`, `!`, `！`, `?`, `？`, `\n`
  */
 function findSentenceEnd(text: string): number {
-  const ends = ['.', '。', '!', '！', '?', '？', '\n'];
+  // ★ 对英文句点 `.` 做上下文检查——避免 "v2.0" / "file.ts" 被误判为句子结束
+  // 合法句子结束：`.` 后跟空格或换行或字符串结尾，不是数字/字母
+  const sentenceEnds = [
+    { char: '.', check: (t: string, i: number) => {
+      const next = t[i + 1];
+      return next === undefined || next === ' ' || next === '\n' || next === '\r';
+    }},
+    { char: '。' }, { char: '!' }, { char: '！' }, { char: '?' }, { char: '？' }, { char: '\n' },
+  ];
   let earliest = -1;
-  for (const end of ends) {
-    const idx = text.indexOf(end);
+  for (const end of sentenceEnds) {
+    const idx = text.indexOf(end.char);
     if (idx >= 0 && (earliest < 0 || idx < earliest)) {
-      earliest = idx;
+      if (!end.check || end.check(text, idx)) {
+        earliest = idx;
+      }
     }
   }
   return earliest;

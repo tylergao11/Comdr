@@ -29,6 +29,7 @@ import type {
   SessionState,
   SessionAnchor,
   Route,
+  LSPFileContext,
 } from '@comdr/core/types';
 import { MESSAGE_ROLE, THINKING_TYPE, THINKING_EFFORT, SYSTEM } from '@comdr/core';
 import { serializeTools } from '@comdr/llm';
@@ -73,6 +74,13 @@ export class PromptConstructor {
    * ★ L4.5 — Context Anchor 压缩摘要（每轮更新）。
    */
   private compactSummary: string = '';
+
+  /**
+   * ★ L7 — LSP 结构化上下文（当前操作文件的类型图/调用链/诊断）。
+   * 每轮由 loop.ts 在 prompt.build() 之前调用 setLSPContext() 更新。
+   * 同文件内容未改时不变 → 前缀缓存友好。
+   */
+  private lspContext: string = '';
 
   /**
    * 设置项目专属指令内容。Engine 构造时调用。
@@ -128,6 +136,99 @@ export class PromptConstructor {
    */
   setCompactSummary(text: string): void {
     this.compactSummary = text;
+  }
+
+  /**
+   * ★ 设置 LSP 结构化上下文（注入到 L7 动态区）。
+   *
+   * 由 loop.ts 在每轮 prompt.build() 之前调用。
+   * 参数来自 ILSPBridge.getFileContext() 的结果。
+   *
+   * 缓存策略: LSP 上下文基于文件内容——
+   *   文件没改 → LSP 上下文不变 → 前缀缓存友好
+   *   文件改了 → LSP 上下文更新（但其他静态区不变，只 miss 少量 tokens）
+   *
+   * @param fileContexts 当前轮次涉及的关键文件的 LSP 上下文
+   *                     （来自 stateWindow 中最近操作的文件）
+   */
+  setLSPContext(fileContexts: LSPFileContext[]): void {
+    if (fileContexts.length === 0) {
+      this.lspContext = '';
+      return;
+    }
+
+    // ★ 格式化为 Agent 友好的 Markdown（参考 JetBrains PSI 论文的输出格式）
+    const blocks: string[] = [];
+
+    for (const ctx of fileContexts) {
+      const fileName = ctx.file.split('/').pop() ?? ctx.file;
+
+      const lines: string[] = [];
+      lines.push(`### ${fileName}`);
+
+      // Exports
+      if (ctx.exports.length > 0) {
+        const items = ctx.exports.map(
+          e => `- \`${e.name}\` (${e.kind}) → ${e.signature || '(no signature)'}`,
+        );
+        lines.push('**Exports:**', ...items);
+      }
+
+      // Imports
+      if (ctx.imports.length > 0) {
+        const items = ctx.imports.map(
+          i => `- \`${i.name}\` from \`${i.from}\``,
+        );
+        lines.push('**Imports:**', ...items);
+      }
+
+      // Callers (谁调用了这个文件)
+      if (ctx.callers.length > 0) {
+        const items = ctx.callers.map(
+          c => `- \`${c.symbol}\` in \`${c.file}\`:${c.line}`,
+        );
+        lines.push('**Callers:**', ...items);
+      }
+
+      // Callees (这个文件调用了谁)
+      if (ctx.callees.length > 0) {
+        const items = ctx.callees.map(
+          c => `- \`${c.symbol}\` → \`${c.file}\``,
+        );
+        lines.push('**Callees:**', ...items);
+      }
+
+      // Type Dependencies
+      if (ctx.typeDependencies.length > 0) {
+        const items = ctx.typeDependencies.map(
+          t => `- \`${t.name}\` (${t.relation})`,
+        );
+        lines.push('**Type Dependencies:**', ...items);
+      }
+
+      // Diagnostics
+      if (ctx.diagnostics.length > 0) {
+        const errors = ctx.diagnostics.filter(d => d.severity === 'error');
+        const warnings = ctx.diagnostics.filter(d => d.severity === 'warning');
+        if (errors.length > 0) {
+          lines.push(`**Errors (${errors.length}):**`);
+          errors.forEach(e => lines.push(`- L${e.line}: ${e.message} [${e.code ?? e.source ?? '?'}]`));
+        }
+        if (warnings.length > 0) {
+          lines.push(`**Warnings (${warnings.length}):**`);
+          warnings.forEach(w => lines.push(`- L${w.line}: ${w.message}`));
+        }
+      }
+
+      blocks.push(lines.join('\n'));
+    }
+
+    this.lspContext = blocks.join('\n\n---\n\n');
+    // ★ 保留 LSP 上限：虽然语义信息高密度，但超大项目可能有数百个文件，
+    //   每个上下文 2KB+ 会严重膨胀 prompt。50K 字符是合理上界。
+    if (this.lspContext.length > 50_000) {
+      this.lspContext = this.lspContext.slice(0, 50_000) + '\n\n... (truncated)';
+    }
   }
 
   /**
@@ -323,17 +424,18 @@ export class PromptConstructor {
     // ★ 防御性保证：每条 assistant + tool_calls 消息必须有 reasoning_content
     // DeepSeek V4 要求：缺失 = 400 错误。正常情况下 reasoning.inject() 已在调用方处理，
     // 但如果未来有其他代码路径绕过 inject()，这里作为最后防线。
-    const flat = turns.flat();
-    for (const msg of flat) {
+    // 不原地修改原对象——使用 map 创建新数组，避免污染 session.messages。
+    const flat = turns.flat().map((msg) => {
       if (
         msg.role === MESSAGE_ROLE.ASSISTANT &&
         msg.tool_calls &&
         msg.tool_calls.length > 0 &&
         msg.reasoning_content === undefined
       ) {
-        msg.reasoning_content = '';
+        return { ...msg, reasoning_content: '' };
       }
-    }
+      return msg;
+    });
 
     return flat;
   }
@@ -388,6 +490,9 @@ export class PromptConstructor {
     if (this.compactSummary) {
       extras.push(`<c>\n${this.compactSummary}\n</c>`);
     }
+    if (this.lspContext) {
+      extras.push(`<lsp>\n${this.lspContext}\n</lsp>`);
+    }
     if (extras.length > 0) blocks.push(extras.join('\n'));
 
     return blocks.length > 0 ? blocks.join('\n') : null;
@@ -438,7 +543,7 @@ export function anchorFromWindows(
   relatedHistory: string[] = [],
   reflections?: string[],
 ): SessionAnchor {
-  // ★ State/Intent summaries are now in L7 context suffix — NOT in L3.
+  // ★ stateSummary/intentSummary 已移到 L7 注入，此处保留类型但不再使用
   // L3 should only contain truly static data (relatedHistory, reflections)
   // to keep the prefix cache boundary clean.
   return {

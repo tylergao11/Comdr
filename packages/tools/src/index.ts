@@ -15,6 +15,23 @@
 import { createRequire } from 'node:module';
 
 import { validateJSONSchemaProperty, TOOL_PERMISSION, ERROR_CATEGORY } from '@comdr/core';
+
+// ============================================================================
+// §0 CJS 兼容——createRequire 安全包装
+// ============================================================================
+// esbuild 以 CJS 格式打包时 import.meta.url 为空，createRequire(undefined) 会抛
+// "The argument 'filename' must be a file URL object..."。
+// 这里在 CJS 环境下回退到 __filename（esbuild CJS bundle 中可用）。
+function createSafeRequire(): NodeRequire {
+  try {
+    return createRequire(import.meta.url);
+  } catch {
+    // CJS bundle fallback
+    const file = (typeof __filename !== 'undefined' && __filename)
+      || `${process.cwd()}/noop.js`;
+    return createRequire(file);
+  }
+}
 import type {
   INativeTools,
   ToolExecuteOptions,
@@ -28,7 +45,7 @@ import type {
 // §1 加载原生模块
 // ============================================================================
 
-const require = createRequire(import.meta.url);
+const require = createSafeRequire();
 
 /**
  * napi-rs 原生模块导出:

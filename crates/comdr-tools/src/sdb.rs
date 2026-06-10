@@ -343,7 +343,10 @@ impl SdbGate {
         // Join any previous orphaned timeout thread before spawning a new one.
         if let Ok(mut guard) = self.prev_thread.lock() {
             if let Some(handle) = guard.take() {
-                let _ = handle.join(); // Ignore result — old thread is done or panicked
+                // Ignore old thread result — it is either done or has panicked.
+                if let Err(e) = handle.join() {
+                    eprintln!("[sdb] previous timeout thread panicked: {:?}", e);
+                }
             }
             // Ensure the lock is dropped before spawning (avoid holding across spawn).
             drop(guard);
@@ -358,13 +361,18 @@ impl SdbGate {
 
         let handle = std::thread::spawn(move || {
             let result = tool.execute(&args_owned, &ctx_owned);
-            let _ = tx.send(result); // Ignore error if receiver dropped (timeout)
+            // Receiver may have dropped due to timeout — this is expected.
+            if let Err(e) = tx.send(result) {
+                eprintln!("[sdb] tool result send failed (receiver dropped): {:?}", e);
+            }
         });
 
         let output = match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
             Ok(output) => {
                 // Tool completed within timeout — join the thread to clean up.
-                let _ = handle.join();
+                if let Err(e) = handle.join() {
+                    eprintln!("[sdb] tool thread panicked after completion: {:?}", e);
+                }
                 output
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -378,7 +386,9 @@ impl SdbGate {
                 )
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = handle.join();
+                if let Err(e) = handle.join() {
+                    eprintln!("[sdb] tool thread panicked: {:?}", e);
+                }
                 ToolOutput::error("EXECUTION_FAILED", "Tool thread panicked")
             }
         };

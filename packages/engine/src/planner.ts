@@ -57,7 +57,7 @@ const MODE_RULES: ModeRule[] = [
       '设计', '分析', '评估', '架构', '方案', '规划',
       'architecture', 'design', 'plan', 'evaluate', 'assess',
     ],
-    topK: 5,
+    topK: 7, // ★ ARCHITECT 需理解更多工具上下文，比 QUERY(5) 多
   },
   {
     taskType: TASK_TYPE.REFACTOR,
@@ -126,7 +126,9 @@ export class TaskPlanner {
     // ── 策略 2: 短输入（≤20 字符且不含破坏性动词）→ query ──
     if (lower.length <= 20) {
       const destructive = ['修改', '改', '创建', '新建', '删除', '写',
-        'change', 'fix', 'create', 'delete', 'write', 'edit', 'remove'];
+        '初始化', '生成', '构建', '安装', '添加', '重构',
+        'change', 'fix', 'create', 'delete', 'write', 'edit', 'remove',
+        'init', 'generate', 'scaffold', 'build', 'install', 'add', 'refactor'];
       const hasDestructive = destructive.some((w) => lower.includes(w));
       if (!hasDestructive) {
         return this.makeRoute(input, MODE_RULES[0]!, availableTools);
@@ -187,7 +189,12 @@ export class TaskPlanner {
       }
     }
 
-    return TASK_TYPE.EDIT; // ★ 默认 edit（非 orchestrate——classify 偏保守）
+    // ★ 默认 edit（而非 orchestrate）——偏保守：
+    //   classify() 用于快速判断，调用方通常需要的是"聚焦的工具子集"，
+    //   而非"全量工具"的 orchestrate。EDIT 的 topK=7 提供了足够覆盖范围，
+    //   但不会像 orchestrate（全量）那样让 LLM 面临过多选择。
+    //   如果默认值不够，调用方可以手动指定 taskType。
+    return TASK_TYPE.EDIT;
   }
 
   /**

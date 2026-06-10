@@ -156,10 +156,7 @@ export function startAppServer(opts: AppServerOptions): () => void {
           for await (const event of engine.run(parsed.request, mode, sessionId)) {
             res.write(`data: ${JSON.stringify(event)}\n\n`);
           }
-          res.write(`data: ${JSON.stringify({
-            type: AGENT_EVENT.DONE,
-            result: { ok: true, turns: 0, tokensUsed: 0, summary: 'SSE stream complete', sessionId },
-          })}\n\n`);
+          // ★ 引擎 finalize() 已发射 DONE 事件，不在此处伪造（避免覆盖真实 turns/tokensUsed）
         } catch (err) {
           res.write(`data: ${JSON.stringify({
             type: AGENT_EVENT.ERROR,

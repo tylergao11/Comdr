@@ -125,6 +125,9 @@ export class SkillsLoader {
       body: body ?? null,
       createdAt: Date.now(),
     });
+
+    // ★ 重建语义索引——确保运行时 skill 可被 BM25 语义检索召回
+    this.rebuildSemanticIndex();
   }
 
   /**
@@ -132,6 +135,7 @@ export class SkillsLoader {
    */
   unregisterRuntimeSkill(name: string): void {
     this.runtimeSkills.delete(name);
+    this.rebuildSemanticIndex();
   }
 
   // --------------------------------------------------------------------------
@@ -315,8 +319,8 @@ export class SkillsLoader {
     // 简单 YAML-style frontmatter 解析（无需 yaml 依赖）
     const fm = this.parseFrontmatter(fmText);
 
-    const name = (fm.name as string | undefined) ?? basename(dirname(filePath));
-    const description = (fm.description as string | undefined) ?? `${name} skill`;
+    const name = typeof fm.name === 'string' ? fm.name : basename(dirname(filePath));
+    const description = typeof fm.description === 'string' ? fm.description : `${name} skill`;
 
     // 解析 triggers（逗号分隔字符串或 YAML 数组）
     let triggers: string[] = [];
@@ -532,7 +536,8 @@ export class SkillsLoader {
    * ★ 重建 BM25 语义索引（registerSkill 后调用）。
    */
   private rebuildSemanticIndex(): void {
-    if (this.registry.size === 0) {
+    const totalSkills = this.registry.size + this.runtimeSkills.size;
+    if (totalSkills === 0) {
       this.semanticIndex = null;
       this.semanticDocTokens.clear();
       return;
@@ -541,11 +546,22 @@ export class SkillsLoader {
     const bm25 = new BM25Scorer();
     const docTokens = new Map<string, Map<string, number>>();
 
+    // ★ 索引静态 skill (registry)
     for (const [name, skill] of this.registry) {
-      // ★ 用 Contextual Prefix 构建检索文本
       const text = contextualPrefix(
         `${skill.description} ${skill.triggers.join(' ')}`,
         { source: `skill:${name}` },
+      );
+      const tokens = tokenize(text);
+      bm25.addDocument(tokens);
+      docTokens.set(name, tokens);
+    }
+
+    // ★ 索引运行时 skill (runtimeSkills)
+    for (const [name, skill] of this.runtimeSkills) {
+      const text = contextualPrefix(
+        skill.definition.description,
+        { source: `runtime:${name}` },
       );
       const tokens = tokenize(text);
       bm25.addDocument(tokens);

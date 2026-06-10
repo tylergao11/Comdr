@@ -222,24 +222,11 @@ export function uiReducer(state: UIState, action: UIAction): UIState {
           };
 
         case AGENT_EVENT.DONE: {
-          let msgs = state.messages;
-          if (state.streamingThinking.trim()) {
-            const segments = countThinkingSegmentsLocal(state.streamingThinking);
-            msgs = [...msgs, {
-              id: `think-${uid()}`, type: 'thinking' as const,
-              content: state.streamingThinking.trim(),
-              detail: `${segments.length} 段思考`,
-              timestamp: Date.now(),
-            }];
-          }
-          if (state.streamingText.trim()) {
-            msgs = [...msgs, {
-              id: `text-${uid()}`, type: 'text' as const,
-              content: state.streamingText.trim(), timestamp: Date.now(),
-            }];
-          }
+          // ★ 复用 flushStreaming 而非手动追加——避免与 TOOL_RESULT 行为不一致
+          const flushed = flushStreaming(state);
           return {
-            ...state, messages: msgs,
+            ...state,
+            messages: [...state.messages, ...flushed],
             streamingText: '', streamingThinking: '',
             running: false, finished: true,
             summary: event.result.summary,
@@ -272,7 +259,13 @@ export function uiReducer(state: UIState, action: UIAction): UIState {
 
     // ── Lifecycle actions ────────────────────────────────────
     case 'RUN_START':
-      return { ...state, running: true, finished: false, fatalError: null, summary: '', runStartedAt: Date.now() };
+      return {
+        ...state,
+        running: true, finished: false, fatalError: null, summary: '',
+        streamingText: '', streamingThinking: '',
+        activeToolCalls: new Map(),
+        runStartedAt: Date.now(),
+      };
 
     case 'RESET':
       return createInitialState(action.sessionId, state.status.mode);

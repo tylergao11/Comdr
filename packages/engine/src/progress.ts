@@ -34,9 +34,12 @@ import { SYSTEM } from '@comdr/core';
 
 /**
  * 多维 Progress Signal 公式（与 README / types.ts §8 注释同步）:
- *   增益 = diffChanges*2 + max(0, testDelta)*5 + infoGained*1 + toolSuccesses*2
+ *   增益 = diffChanges*2 + testDelta*5 + infoGained*1 + toolSuccesses*2
  *   罚分 = loopPattern? -5 : 0 + sameFileRepeat>3? -3 : 0 + emptyOutputCount* -2
  *   score = 增益 + 罚分
+ *
+ *   ★ testDelta 不加 Math.max(0, ...) 包裹——测试通过数骤降是强负信号，
+ *     应直接拉低 score 触发 stall detection，不应被静默掩码为 0。
  */
 const SCORE_WEIGHTS = {
   DIFF_CHANGES: 2,
@@ -110,7 +113,7 @@ export class ProgressMeter {
     // 综合得分
     const score =
       diffChanges * SCORE_WEIGHTS.DIFF_CHANGES +
-      Math.max(0, testDelta) * SCORE_WEIGHTS.TEST_DELTA +
+      testDelta * SCORE_WEIGHTS.TEST_DELTA +
       infoGained * SCORE_WEIGHTS.INFO_GAINED +
       toolSuccesses * SCORE_WEIGHTS.TOOL_SUCCESSES -
       (loopPattern ? SCORE_WEIGHTS.LOOP_PENALTY : 0) -

@@ -7,7 +7,8 @@
  * @agent Agent 4 — 此文件由 Agent 4 维护
  */
 
-import type { ToolCall, ToolResult } from '@comdr/core/types';
+import type { ToolCall, ToolResult, ErrorCategory } from '@comdr/core/types';
+import { SYSTEM, RUN_MODE, ERROR_CATEGORY } from '@comdr/core';
 import type { EpisodicMemory } from '../memory/episodic.js';
 import type { SemanticMemory } from '../memory/semantic.js';
 import type { ToolRetriever } from '../tool-retriever.js';
@@ -86,17 +87,20 @@ export async function executeAdvancedTool(
           ctx,
         )) };
       case 'shell_test':
-        return { ...base, ...execShellTest(
-          typeof args.path === 'string' ? args.path : undefined,
-          typeof args.filter === 'string' ? args.filter : undefined,
-          ctx,
-        ) };
+        return {
+          ...base,
+          ...execShellTest(
+            typeof args.path === 'string' ? args.path : undefined,
+            typeof args.filter === 'string' ? args.filter : undefined,
+            ctx,
+          ),
+        };
       default:
         return {
           ...base,
           ok: false,
           content: `Unknown advanced tool: ${call.function.name}`,
-          errorCategory: 'execution_error',
+          errorCategory: ERROR_CATEGORY.EXECUTION_ERROR,
         };
     }
   } catch (err) {
@@ -104,7 +108,7 @@ export async function executeAdvancedTool(
       ...base,
       ok: false,
       content: `Tool execution error: ${err instanceof Error ? err.message : String(err)}`,
-      errorCategory: 'execution_error',
+      errorCategory: ERROR_CATEGORY.EXECUTION_ERROR,
     };
   }
 }
@@ -115,7 +119,7 @@ export async function executeAdvancedTool(
 
 /** 1. tool_search — BM25 检索工具描述 */
 /** Helper: return only ok+content (base fields filled by caller) */
-type ExecResult = { ok: boolean; content: string };
+type ExecResult = { ok: boolean; content: string; errorCategory?: ErrorCategory };
 
 function execToolSearch(
   query: string,
@@ -143,7 +147,7 @@ function execFileSearch(
   const q = query.trim();
   if (!q) return { ok: true, content: 'No query provided.' };
 
-  const files = scanProjectFiles(ctx.projectPath, 200);
+  const files = scanProjectFiles(ctx.projectPath, SYSTEM.SCAN_PROJECT_MAX_FILES);
   if (files.length === 0) {
     return { ok: true, content: 'No files found to search.' };
   }
@@ -152,9 +156,9 @@ function execFileSearch(
   const docTokens: Map<string, number>[] = [];
   const docPaths: string[] = [];
 
-  for (const file of files.slice(0, 100)) {
+  for (const file of files.slice(0, SYSTEM.SCAN_PROJECT_MAX_FILES / 2)) {
     try {
-      const text = readFileSync(file, 'utf-8').slice(0, 8000);
+      const text = readFileSync(file, 'utf-8').slice(0, SYSTEM.FILE_INDEX_TRUNCATE_CHARS);
       const tokens = tokenize(text);
       bm25.addDocument(tokens);
       docTokens.push(tokens);
@@ -259,13 +263,14 @@ function execShellTest(
   if (!ctx.nativeTools) {
     return {
       ok: false,
-      content: 'Native tools not available (pnpm build:tools not run). Error: execution_error',
+      content: 'Native tools not available (pnpm build:tools not run).',
+      errorCategory: ERROR_CATEGORY.EXECUTION_ERROR,
     };
   }
 
   // 通过 shell_bash 执行测试，解析输出为结构化数据
   const testRunner = detectTestRunner(ctx.projectPath);
-  const cmd = buildTestCommand(testRunner, testPath, filter);
+  const cmd = buildTestCommand(ctx.projectPath, testRunner, testPath, filter);
 
   const result = ctx.nativeTools.execute({
     name: 'shell_bash',
@@ -302,12 +307,12 @@ async function execTaskSpawn(
   prompt: string,
   mode: string,
   ctx: ToolExecContext,
-): Promise<{ ok: boolean; content: string }> {
+): Promise<ExecResult> {
   const p = prompt.trim();
-  if (!p) return { ok: false, content: 'task_spawn requires a prompt.' };
+  if (!p) return { ok: false, content: 'task_spawn requires a prompt.', errorCategory: ERROR_CATEGORY.EXECUTION_ERROR };
 
-  const validModes = ['agent', 'plan', 'yolo'];
-  const subMode = validModes.includes(mode) ? (mode as 'agent' | 'plan' | 'yolo') : 'plan';
+  const validModes = [RUN_MODE.AGENT, RUN_MODE.PLAN, RUN_MODE.YOLO] as string[];
+  const subMode = (validModes.includes(mode) ? mode : RUN_MODE.PLAN) as 'agent' | 'plan' | 'yolo';
 
   const startTime = Date.now();
   // ★ Dynamic import to avoid circular dependency (loop.ts → execute.ts → subagent.ts → loop.ts)
@@ -321,6 +326,12 @@ async function execTaskSpawn(
     `Tools used: ${result.toolCalls.length > 0 ? result.toolCalls.join(', ') : 'none'}`,
     '',
     'Result:',
+    // ★ 截断到 4000 字符：子 Agent 输出可能极大（如整个代码审查报告），
+    //   prompt token 预算有限，保留完整结果会撑爆上下文窗口。
+    //   4000 字符（约 1000-2000 token，取决于中英文混合度）是经验值：
+    //   - 足够容纳子 Agent 的最终总结（包含关键结论、文件列表、错误信息）
+    //   - 不会占满主 Agent 的 token 预算
+    //   - 若需要完整结果，主 Agent 可再调用 task_spawn 获取细节
     result.summary.slice(0, 4000),
   ];
 
@@ -378,16 +389,27 @@ function detectTestRunner(projectPath: string): string {
   return 'unknown';
 }
 
+/** 检测 package.json 中的包管理器 */
+function detectPackageManager(projectPath: string): string {
+  try {
+    const lockFiles = readdirSync(projectPath);
+    if (lockFiles.includes('pnpm-lock.yaml')) return 'pnpm';
+    if (lockFiles.includes('yarn.lock')) return 'yarn';
+  } catch { /* fallback to npx */ }
+  return 'npx';
+}
+
 /** 根据测试运行器构建测试命令 */
-function buildTestCommand(runner: string, testPath?: string, filter?: string): string {
+function buildTestCommand(projectPath: string, runner: string, testPath?: string, filter?: string): string {
   const path = testPath ?? '';
+  const pm = detectPackageManager(projectPath);
   switch (runner) {
-    case 'vitest': return filter ? `npx vitest run ${path} -t "${filter}"` : `npx vitest run ${path}`;
-    case 'jest': return filter ? `npx jest ${path} -t "${filter}"` : `npx jest ${path}`;
+    case 'vitest': return filter ? `${pm} vitest run ${path} -t "${filter}"` : `${pm} vitest run ${path}`;
+    case 'jest': return filter ? `${pm} jest ${path} -t "${filter}"` : `${pm} jest ${path}`;
     case 'cargo': return filter ? `cargo test ${filter}` : 'cargo test';
     case 'pytest': return filter ? `python -m pytest ${path} -k "${filter}"` : `python -m pytest ${path}`;
     case 'go': return filter ? `go test ${path} -run "${filter}"` : `go test ${path} ./...`;
-    default: return filter ? `npm test -- ${path} --grep "${filter}"` : `npm test ${path}`;
+    default: return filter ? `${pm} test -- ${path} --grep "${filter}"` : `${pm} test ${path}`;
   }
 }
 
@@ -396,20 +418,31 @@ function parseTestOutput(
   output: string,
   _runner: string,
 ): { passed: number; failed: number } | null {
-  // Vitest/Jest: "Tests: 5 passed, 2 failed, 7 total"
-  const vitestMatch = output.match(/Tests?:\s*(\d+)\s*(?:passed|passing).*?(\d+)\s*(?:failed|failing)/i);
-  if (vitestMatch) {
-    return { passed: parseInt(vitestMatch[1]!, 10), failed: parseInt(vitestMatch[2]!, 10) };
+  // ★ 同时尝试 passed-before-failed 和 failed-before-passed 两种顺序
+  //   vitest "Tests: 2 failed, 5 passed, 7 total" → failed 在前
+  //   vitest "Tests: 5 passed, 2 failed, 7 total" → passed 在前
+
+  // 模式 1: "Tests: N passed/passing ... M failed/failing" (passed 在前)
+  let match = output.match(/Tests?:\s*(\d+)\s*(?:passed|passing).*?(\d+)\s*(?:failed|failing)/i);
+  if (match) {
+    return { passed: parseInt(match[1]!, 10), failed: parseInt(match[2]!, 10) };
   }
+
+  // 模式 2: "Tests: N failed/failing ... M passed/passing" (failed 在前)
+  match = output.match(/Tests?:\s*(\d+)\s*(?:failed|failing).*?(\d+)\s*(?:passed|passing)/i);
+  if (match) {
+    return { failed: parseInt(match[1]!, 10), passed: parseInt(match[2]!, 10) };
+  }
+
   // Pytest: "3 passed, 1 failed"
-  const pytestMatch = output.match(/(\d+)\s*passed.*?(\d+)\s*failed/i);
-  if (pytestMatch) {
-    return { passed: parseInt(pytestMatch[1]!, 10), failed: parseInt(pytestMatch[2]!, 10) };
+  match = output.match(/(\d+)\s*passed.*?(\d+)\s*failed/i);
+  if (match) {
+    return { passed: parseInt(match[1]!, 10), failed: parseInt(match[2]!, 10) };
   }
   // Cargo: "test result: ok. 5 passed; 1 failed"
-  const cargoMatch = output.match(/test result:.*?(\d+)\s*passed.*?(\d+)\s*failed/i);
-  if (cargoMatch) {
-    return { passed: parseInt(cargoMatch[1]!, 10), failed: parseInt(cargoMatch[2]!, 10) };
+  match = output.match(/test result:.*?(\d+)\s*passed.*?(\d+)\s*failed/i);
+  if (match) {
+    return { passed: parseInt(match[1]!, 10), failed: parseInt(match[2]!, 10) };
   }
   return null;
 }

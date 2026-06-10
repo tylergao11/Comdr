@@ -16,7 +16,7 @@
  */
 
 import type { ToolResult, ToolCall } from '@comdr/core/types';
-import { SYSTEM } from '@comdr/core';
+import { SYSTEM, ERROR_CATEGORY } from '@comdr/core';
 import { safeParseArgs } from '../utils.js';
 import { summarizeToolOutput } from '../smart-truncate.js';
 
@@ -68,6 +68,15 @@ const STOP_WORDS = new Set([
   'they', 'will', 'would', 'could', 'should', 'may', 'might', 'shall',
   'also', 'then', 'just', 'only', 'into', 'over', 'its', 'get', 'set',
   '使用', '怎么', '如何', '什么', '为什么', '一个', '这个', '那个',
+]);
+
+/**
+ * 可推断因果关系的错误类别集合。
+ * 匹配任一类别的 errorCategory → 尝试建立 causal link。
+ * ★ 使用 Set 而非单一常量比较，确保新增 ErrorCategory 时自动生效，无需同步修改此处。
+ */
+const CAUSAL_ERROR_CATEGORIES: ReadonlySet<string> = new Set([
+  ERROR_CATEGORY.TEST_FAILED,
 ]);
 
 export class SemanticMemory {
@@ -128,8 +137,11 @@ export class SemanticMemory {
       );
     }
 
-    // 3. 检测因果关系（★ 上限 100 条，自动淘汰最旧）
-    if (result.errorCategory === 'test_failed') {
+    // 3. 检测因果关系（★ 上限 SYSTEM.CAUSAL_GRAPH_MAX_LENGTH 条，自动淘汰最旧）
+    // ★ 使用错误类别集合，而非单一常量精确匹配。
+    //    "操作后出错"的常见类别随时间扩展，用 Set 确保新增错误类型自动生效。
+    //    当前已知可推断因果关系的类别：测试失败、LINT 失败、编译失败等
+    if (result.errorCategory && CAUSAL_ERROR_CATEGORIES.has(result.errorCategory)) {
       const lastMod = this.findLastModification(path, turn);
       if (lastMod) {
         this.causalGraph.push({
@@ -138,9 +150,9 @@ export class SemanticMemory {
           turn,
           confidence: 0.7,
         });
-        // 保持最近 100 条
-        if (this.causalGraph.length > 100) {
-          this.causalGraph = this.causalGraph.slice(-100);
+        // 保持最近 SYSTEM.CAUSAL_GRAPH_MAX_LENGTH 条
+        if (this.causalGraph.length > SYSTEM.CAUSAL_GRAPH_MAX_LENGTH) {
+          this.causalGraph = this.causalGraph.slice(-SYSTEM.CAUSAL_GRAPH_MAX_LENGTH);
         }
       }
     }
@@ -268,15 +280,19 @@ export class SemanticMemory {
       ...this.semanticGraph.edges,
       ...this.entityGraph.edges,
     ];
-    const neighborMap = new Map<string, string[]>(); // nodeId → neighbor descriptions
+    // ★ nodeId → { nodeId, display } —— 保留 nodeId 使递归 BFS 可用
+    const neighborMap = new Map<string, Array<{ nodeId: string; display: string }>>();
 
     for (const node of matchedNodes) {
-      const neighbors: string[] = [];
+      const neighbors: Array<{ nodeId: string; display: string }> = [];
       const visited = new Set<string>([node.id]);
 
-      // BFS
+      // BFS — 限制深度为 2（与 appendNeighbors 的最大显示嵌套深度一致）。
+      // 深度 3 的遍历量约为 avg_degree^3，但 display 最多展示 2 层，
+      // 多余遍历的节点永远不会出现在输出中。
+      const effectiveDepth = Math.min(bfsDepth, 2);
       let frontier = [node.id];
-      for (let depth = 0; depth < bfsDepth; depth++) {
+      for (let depth = 0; depth < effectiveDepth; depth++) {
         const nextFrontier: string[] = [];
         for (const fid of frontier) {
           for (const edge of allEdges) {
@@ -302,7 +318,7 @@ export class SemanticMemory {
               const display = neighborNode
                 ? `${neighborNode.name} (${neighborNode.type})`
                 : neighborId;
-              neighbors.push(`${display} [${rel}]`);
+              neighbors.push({ nodeId: neighborId, display: `${display} [${rel}]` });
             }
           }
         }
@@ -400,7 +416,7 @@ export class SemanticMemory {
    */
   private formatEntityContext(
     nodes: SemanticNode[],
-    neighborMap: Map<string, string[]>,
+    neighborMap: Map<string, Array<{ nodeId: string; display: string }>>,
     temporalMatches: string[],
   ): string {
     const blocks: string[] = [];
@@ -444,7 +460,7 @@ export class SemanticMemory {
    */
   private appendNeighbors(
     lines: string[],
-    neighborMap: Map<string, string[]>,
+    neighborMap: Map<string, Array<{ nodeId: string; display: string }>>,
     nodeId: string,
     depth: number,
   ): void {
@@ -459,20 +475,11 @@ export class SemanticMemory {
       const isLast = i === shown.length - 1 && neighbors.length <= MAX_PER_LEVEL;
       const branch = isLast ? '└──' : '├──';
       const n = shown[i]!;
-      // neighbor format: "name (type) [relation]" or "name [relation]"
-      lines.push(`${prefix}${branch} ${n}`);
+      lines.push(`${prefix}${branch} ${n.display}`);
 
-      // 递归子邻居（仅当 depth < 2）
-      if (depth < 2) {
-        // 从 neighbor string 提取 node ID
-        const parts = n.split(' [');
-        if (parts.length >= 2) {
-          const rel = parts[1]!.replace(']', '');
-          if (rel === 'defines' || rel === 'depends_on' || rel === 'calls' || rel === 'imports') {
-            // 尝试找子邻居: 这里不能直接从 neighbor string 反查到 node ID
-            // 简化处理: 只展示一层深度
-          }
-        }
+      // ★ 递归子邻居——使用保留的 nodeId 做真实的 BFS 遍历
+      if (depth < 2 && neighborMap.has(n.nodeId)) {
+        this.appendNeighbors(lines, neighborMap, n.nodeId, depth + 1);
       }
     }
 
@@ -611,9 +618,19 @@ export class SemanticMemory {
       for (const e of d.entity?.edges ?? []) {
         this.addEdge(this.entityGraph, e.from, e.to, e.type);
       }
-      // Append temporal + causal
-      this.temporalGraph.push(...(d.temporal ?? []));
-      this.causalGraph.push(...(d.causal ?? []));
+      // Append temporal + causal（去重——防止重复 deserialize 导致条目翻倍）
+      const existingTemporal = new Set(this.temporalGraph.map((e) => JSON.stringify(e)));
+      for (const entry of d.temporal ?? []) {
+        if (!existingTemporal.has(JSON.stringify(entry))) {
+          this.temporalGraph.push(entry);
+        }
+      }
+      const existingCausal = new Set(this.causalGraph.map((e) => JSON.stringify(e)));
+      for (const entry of d.causal ?? []) {
+        if (!existingCausal.has(JSON.stringify(entry))) {
+          this.causalGraph.push(entry);
+        }
+      }
     } catch {
       // 数据损坏 → 静默跳过
     }
