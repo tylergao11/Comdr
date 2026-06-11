@@ -1,26 +1,20 @@
 /**
  * subagent-adapter.ts — @comdr/cocos-engine 子智能体适配器
  *
- * ★ 实现 ISubAgent 契约，暴露 Cocos Creator 场景编辑能力给主 Comdr 引擎。
- *   工具以 "cocos__*" 形式注册。
- *
- * ★ scene_probe 直接读取 .prefab/.scene JSON，走 compileSceneTree 编译
- *   component_catalog 加载本地组件缓存 + 知识库
+ * ★ 只暴露 cocos-ask。cocos-engine 本身是完整 agent（Commander + DSL + Bridge），
+ *   此适配器只做直连——把主引擎 LLM 的问题直接交给 AssemblyGateway。
  *
  * @agent Agent 6 — cocos-engine 子智能体
  */
 
 import type { ToolDefinition, ToolResult } from '@comdr/core/types';
 import type { ISubAgent, SubAgentManifest } from '@comdr/core/contracts';
-import {
-  resolveProjectContext,
-  discoverCandidates,
-} from './context/project-context.js';
-import { compileSceneTree } from './context/scene-compiler.js';
-import { ComponentCatalog } from './model/component-catalog.js';
-import { readJsonUtf8, normalizeSlash } from './foundation/value-kit.js';
-import * as path from 'node:path';
-import * as fs from 'node:fs';
+import { runAssemblyProcess } from './gateway/assembly-gateway.js';
+import { loadGatewayConfig, getActiveProvider, resolveCommanderModel } from './config/config-store.js';
+import { CommanderState } from './memory/session-memory.js';
+import { AssetCache } from './memory/asset-cache.js';
+import { DocumentState } from './memory/document-state.js';
+import type { CommanderSnapshot } from './memory/session-store.js';
 
 // ============================================================================
 // §1 Manifest
@@ -28,47 +22,37 @@ import * as fs from 'node:fs';
 
 const MANIFEST: SubAgentManifest = {
   name: 'cocos-engine',
-  description:
-    'Cocos Creator 3.x scene editing — Blueprint Pattern, LLM-driven node/component manipulation via DSL',
-  version: '0.1.0',
+  description: 'Cocos Creator 3.x scene expert. Ask in natural language — it reads/writes scenes, manipulates nodes, manages components, and edits prefabs.',
+  version: '0.3.0',
   toolPrefix: 'cocos',
 };
 
 // ============================================================================
-// §2 Tool Definitions
+// §2 Tool Definition — just one
 // ============================================================================
 
-function t(name: string, desc: string, params: Record<string, unknown>, ms: number): ToolDefinition {
-  return {
-    name,
-    description: desc,
+const TOOLS: ToolDefinition[] = [
+  {
+    name: 'ask',
+    description:
+      'Ask cocos-engine to do something in the Cocos Creator project. ' +
+      'Use natural language — it handles scene probing, node creation, component editing, ' +
+      'prefab manipulation, and anything else Cocos-related. ' +
+      'Examples: "add a Button to MainScene", "list all UI nodes in the current scene", ' +
+      '"change the Label text on the login panel", "what scripts are available".',
     parameters: {
       type: 'object',
-      properties: params as Record<string, any>,
-      ...(Object.keys(params).length > 0 ? { required: Object.keys(params) } : {}),
+      properties: {
+        prompt: {
+          type: 'string',
+          description: 'What to do — in natural language.',
+        },
+      },
+      required: ['prompt'],
     } as ToolDefinition['parameters'],
     permission: 'read_only' as const,
-    timeoutMs: ms,
-  };
-}
-
-const TOOLS: ToolDefinition[] = [
-  t('project_info',
-    'Discover Cocos Creator project structure: assets, scenes, scripts, prefabs.',
-    { path: { type: 'string', description: 'Project root directory path' } },
-    10000),
-  t('scene_probe',
-    'Query Cocos scene/prefab structure. Returns compiled blueprint (node hierarchy tree, component summary).',
-    {
-      target: { type: 'string', description: 'Scene or prefab file path (absolute or relative to project root)' },
-      mode: { type: 'string', description: 'structure (default) | components | references' },
-      depth: { type: 'number', description: 'Max tree depth (default 3, use large number for full)' },
-    },
-    15000),
-  t('component_catalog',
-    'List available Cocos Creator components with property schemas. Filter by category.',
-    { filter: { type: 'string', description: 'all (default) | engine | scripts | ui | physics' } },
-    5000),
+    timeoutMs: 300000, // 5 min — AssemblyGateway may run multiple turns
+  },
 ];
 
 // ============================================================================
@@ -76,20 +60,20 @@ const TOOLS: ToolDefinition[] = [
 // ============================================================================
 
 let seq = 0;
-function okResult(toolName: string, data: unknown): ToolResult {
+function ok(data: unknown): ToolResult {
   return {
     ok: true,
     callId: `cocos-${++seq}`,
-    toolName: `cocos__${toolName}`,
-    content: JSON.stringify(data, null, 2),
+    toolName: 'cocos__ask',
+    content: typeof data === 'string' ? data : JSON.stringify(data, null, 2),
   };
 }
 
-function errResult(toolName: string, msg: string): ToolResult {
+function err(msg: string): ToolResult {
   return {
     ok: false,
     callId: `cocos-${++seq}`,
-    toolName: `cocos__${toolName}`,
+    toolName: 'cocos__ask',
     content: msg,
     errorCategory: 'execution_error',
   };
@@ -97,151 +81,70 @@ function errResult(toolName: string, msg: string): ToolResult {
 
 export class CocosSubAgent implements ISubAgent {
   private projectRoot: string;
-  private _catalog: ComponentCatalog | null = null;
+  private sessionMemory: CommanderState;
+  private assetCache: AssetCache;
+  private documentState: DocumentState;
+  private commanderSnapshot: CommanderSnapshot | undefined;
 
   constructor(projectRoot: string) {
     this.projectRoot = projectRoot;
+    this.sessionMemory = new CommanderState();
+    this.assetCache = new AssetCache(projectRoot);
+    this.documentState = new DocumentState();
   }
 
   get manifest(): SubAgentManifest { return MANIFEST; }
-
   getTools(): ToolDefinition[] { return TOOLS; }
 
-  async executeTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
-    switch (toolName) {
-      case 'project_info': {
-        try {
-          const ctx = resolveProjectContext({ projectPath: String(args.path ?? this.projectRoot) });
-          const candidates = discoverCandidates(ctx);
-          return okResult('project_info', {
-            projectPath: (ctx as any).projectPath,
-            candidates: candidates.slice(0, 50),
-          });
-        } catch (err) {
-          return errResult('project_info',
-            `Failed to probe project: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
+  async executeTool(_toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    const prompt = String(args.prompt ?? '');
 
-      case 'scene_probe': {
-        try {
-          const target = String(args.target ?? '');
-          const mode = String(args.mode ?? 'structure');
-          const depth = args.depth !== undefined ? Number(args.depth) : 3;
-
-          // Resolve path: absolute or relative to project root
-          const resolved = path.isAbsolute(target)
-            ? target
-            : path.resolve(this.projectRoot, target);
-
-          if (!fs.existsSync(resolved)) {
-            return errResult('scene_probe', `File not found: ${resolved}`);
-          }
-
-          const raw = fs.readFileSync(resolved, 'utf-8');
-          let json: unknown[];
-          try {
-            json = JSON.parse(raw);
-          } catch {
-            return errResult('scene_probe', `Invalid JSON in: ${resolved}`);
-          }
-
-          if (!Array.isArray(json)) {
-            return errResult('scene_probe', `Expected a Cocos prefab/scene JSON array, got ${typeof json}`);
-          }
-
-          const detail = mode === 'components' ? 'full' : 'structure';
-          const tree = compileSceneTree(json, { detail, depth });
-
-          if (!tree) {
-            return okResult('scene_probe', {
-              status: 'empty',
-              message: 'No nodes found in scene/prefab.',
-            });
-          }
-
-          return okResult('scene_probe', tree);
-        } catch (err) {
-          return errResult('scene_probe',
-            `Failed to probe scene: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-
-      case 'component_catalog': {
-        try {
-          const filter = String(args.filter ?? 'all');
-          const catalog = this.getCatalog();
-
-          // Fallback: no cached data available
-          if (!catalog.isLoaded || catalog.count === 0) {
-            return okResult('component_catalog', {
-              status: 'minimal',
-              message: 'Component cache not available. Run Cocos Creator with Bridge to populate.',
-              commonComponents: [
-                { type: 'cc.Node', category: 'engine' },
-                { type: 'cc.UITransform', category: 'ui' },
-                { type: 'cc.Sprite', category: 'ui' },
-                { type: 'cc.Label', category: 'ui' },
-                { type: 'cc.Button', category: 'ui' },
-                { type: 'cc.Layout', category: 'ui' },
-                { type: 'cc.Widget', category: 'ui' },
-                { type: 'cc.RigidBody2D', category: 'physics' },
-                { type: 'cc.BoxCollider2D', category: 'physics' },
-                { type: 'cc.CircleCollider2D', category: 'physics' },
-                { type: 'cc.Animation', category: 'engine' },
-                { type: 'cc.ParticleSystem', category: 'engine' },
-                { type: 'cc.Camera', category: 'engine' },
-                { type: 'cc.Canvas', category: 'engine' },
-                { type: 'cc.Prefab', category: 'engine' },
-              ],
-            });
-          }
-
-          // Get entries based on filter
-          let entries: any[];
-          switch (filter) {
-            case 'engine':
-              entries = catalog.listEngine();
-              break;
-            case 'scripts':
-              entries = catalog.listScripts();
-              break;
-            default:
-              entries = catalog.list().map((name: string) => catalog.get(name)).filter(Boolean);
-              break;
-          }
-
-          return okResult('component_catalog', {
-            filter,
-            count: entries.length,
-            components: entries.slice(0, 100).map((e: any) => ({
-              type: e.identity?.fullType ?? e.type,
-              schema: e.schema?.map((s: any) => ({ name: s.name, type: s.type })),
-              knowledge: e.knowledge ? 'available' : undefined,
-            })),
-          });
-        } catch (err) {
-          return errResult('component_catalog',
-            `Failed to load catalog: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-
-      default:
-        return errResult(toolName, `Unknown cocos-engine tool: ${toolName}`);
-    }
-  }
-
-  private getCatalog(): ComponentCatalog {
-    if (this._catalog) return this._catalog;
-    const catalog = new ComponentCatalog();
     try {
-      catalog.load(this.projectRoot);
-    } catch {
-      // Catalog load may fail if temp/comdr/component-cache.json doesn't exist
-      // Return empty catalog — component list falls back to hardcoded defaults
+      const config = loadGatewayConfig();
+      const provider = getActiveProvider(config);
+      const model = resolveCommanderModel(provider, 'fast'); // Flash
+
+      const result = await runAssemblyProcess({
+        request: prompt,
+        projectPath: this.projectRoot,
+        sessionMemory: this.sessionMemory,
+        assetCache: this.assetCache,
+        documentState: this.documentState,
+        provider: provider.provider,
+        model,
+        baseUrl: provider.baseUrl,
+        apiKey: provider.apiKey,
+        commanderSnapshot: this.commanderSnapshot,
+      });
+
+      // Save snapshot for next call (session continuity)
+      if (result.commanderSnapshot) {
+        this.commanderSnapshot = result.commanderSnapshot;
+      }
+
+      if (!result.ok) {
+        return err(result.error ?? 'AssemblyGateway returned !ok');
+      }
+
+      // Commander has a question for the user
+      if (result.ask) {
+        return ok({ status: 'ask', ...result.ask });
+      }
+
+      return ok({
+        status: result.status ?? 'completed',
+        round: result.round,
+        report: result.doneReport ?? null,
+        results: result.results?.map((r) => ({
+          command: r.command,
+          ok: r.result.ok,
+          data: r.result.data,
+        })),
+        diffs: result.diffs ?? [],
+      });
+    } catch (e) {
+      return err(`cocos-ask failed: ${e instanceof Error ? e.message : String(e)}`);
     }
-    this._catalog = catalog;
-    return catalog;
   }
 }
 
