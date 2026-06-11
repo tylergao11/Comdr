@@ -1,118 +1,58 @@
 // ============================================================
 // Unified Configuration — single source of truth
-// Replaces scattered DEFAULT_*_CONFIG across the codebase.
 // ============================================================
 
 import * as fs from "fs";
 import * as path from "path";
 import type { Severity } from "./finding.js";
+import type { PhaseConfig } from "./dialectic/types.js";
+import { DEFAULT_PHASE_CONFIG } from "./dialectic/types.js";
 
 // ---- Pipeline ----
 
 export interface PipelineConfig {
-  /** Which tiers to run: "static", "heuristic", "dialectic" */
-  tiers: string[];
   /** Exit code 1 if any finding at or above this severity */
   failOnSeverity: Severity;
-}
-
-// ---- Scanner ----
-
-export interface ScannerConfig {
-  includeDirs: string[];
-  excludeDirs: string[];
-  extensions: string[];
-  maxFileSize: number;
-}
-
-// ---- Rules ----
-
-export interface RulesConfig {
-  /** Rule IDs to skip entirely */
-  disabled: string[];
-  /** Override severity for specific rules */
-  severityOverrides: Record<string, Severity>;
 }
 
 // ---- Dialectic Verifier ----
 
 export interface DialecticConfig {
   enabled: boolean;
-  triggerConditions: {
-    minSeverity: Severity;
-    minRuleConfidence: number; // Trigger when confidence is BELOW this
-  };
+  /** Max findings to return per run (cost control) */
   maxFindingsPerRun: number;
-  codeContext: {
-    surroundingLines: number;
-    includeCallChain: boolean;
-  };
-}
-
-// ---- LLM ----
-
-export interface LLMConfig {
-  provider: "anthropic" | "openai";
-  apiKey?: string;
-  baseUrl?: string;
-  models: {
-    dialectic: string;   // Haiku-level for attack/defense
-    adjudicator: string; // Sonnet-level for final verdict
-  };
-  defaults: {
-    maxTokens: number;
-    temperature: number;
-  };
+  /** Max findings per LLM batch call */
+  maxFindingsPerBatch: number;
+  /** Per-phase configuration */
+  phases: PhaseConfig;
 }
 
 // ---- Unified Config ----
 
 export interface ComdrConfig {
-  srcDir: string;
-  excludeDirs: string[];
+  /** File extensions to include in audit scope */
   extensions: string[];
+  /** Directories to exclude */
+  excludeDirs: string[];
   pipeline: PipelineConfig;
-  scanner: ScannerConfig;
-  rules: RulesConfig;
   dialectic: DialecticConfig;
-  llm?: LLMConfig;
 }
 
 // ---- Defaults ----
 
 export const DEFAULT_COMDR_CONFIG: ComdrConfig = {
-  srcDir: "packages",
+  extensions: [".ts", ".tsx", ".js", ".jsx", ".py", ".go"],
   excludeDirs: ["node_modules", "dist", "build", ".git", "coverage", "temp", "overlay", "__pycache__"],
-  extensions: [".ts", ".tsx", ".js", ".jsx"],
 
   pipeline: {
-    tiers: ["heuristic", "dialectic"],
     failOnSeverity: "high",
-  },
-
-  scanner: {
-    includeDirs: ["src", "packages", "lib", "app"],
-    excludeDirs: ["node_modules", "dist", "build", ".git", "coverage", "temp", "__pycache__"],
-    extensions: [".ts", ".tsx", ".js", ".jsx", ".py", ".go"],
-    maxFileSize: 500_000,
-  },
-
-  rules: {
-    disabled: [],
-    severityOverrides: {},
   },
 
   dialectic: {
     enabled: true,
-    triggerConditions: {
-      minSeverity: "medium",
-      minRuleConfidence: 0.8,
-    },
-    maxFindingsPerRun: 20,
-    codeContext: {
-      surroundingLines: 30,
-      includeCallChain: true,
-    },
+    maxFindingsPerRun: 50,
+    maxFindingsPerBatch: 10,
+    phases: DEFAULT_PHASE_CONFIG,
   },
 };
 
@@ -120,11 +60,10 @@ export const DEFAULT_COMDR_CONFIG: ComdrConfig = {
 
 /**
  * Load ComdrConfig from comdr-audit.json, merged with defaults.
- * All config consumers should call this once at startup.
  */
 export function loadConfig(rootDir?: string): ComdrConfig {
   const base = rootDir || process.cwd();
-  const cfgPath = path.join(base, "comdr-audit.json");
+  const cfgPath = path.resolve(base, "comdr-audit.json");
 
   let fileCfg: Partial<ComdrConfig> = {};
   if (fs.existsSync(cfgPath)) {
@@ -138,18 +77,22 @@ export function loadConfig(rootDir?: string): ComdrConfig {
   return deepMerge(DEFAULT_COMDR_CONFIG, fileCfg);
 }
 
-function deepMerge(base: ComdrConfig, override: Partial<ComdrConfig>): ComdrConfig {
-  const result = { ...base };
-  for (const key of Object.keys(override) as (keyof ComdrConfig)[]) {
+/**
+ * ★ Recursive deep merge — nested objects (e.g. dialectic.phases) are merged
+ *   key-by-key rather than replaced wholesale.
+ */
+export function deepMerge<T extends object>(base: T, override: Partial<T>): T {
+  const result: any = { ...base };
+  for (const key of Object.keys(override as object) as (keyof T)[]) {
     const baseVal = result[key];
     const overrideVal = override[key];
     if (isObject(baseVal) && isObject(overrideVal)) {
-      (result as Record<string, unknown>)[key] = { ...(baseVal as Record<string, unknown>), ...(overrideVal as Record<string, unknown>) };
+      result[key] = deepMerge(baseVal, overrideVal);
     } else if (overrideVal !== undefined) {
-      (result as Record<string, unknown>)[key] = overrideVal;
+      result[key] = overrideVal;
     }
   }
-  return result;
+  return result as T;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {

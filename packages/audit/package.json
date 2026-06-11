@@ -2,7 +2,7 @@
   "name": "@comdr/audit",
   "version": "0.1.0",
   "private": true,
-  "description": "Agent 5: Code Audit Sub-Agent — heuristic scan + dialectic verification",
+  "description": "Agent 5: Code Audit — LLM-driven discovery + adjudication with read-only tools",
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
@@ -11,7 +11,8 @@
     "./tools": "./src/index.ts"
   },
   "dependencies": {
-    "@comdr/core": "workspace:*"
+    "@comdr/core": "workspace:*",
+    "@comdr/llm": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.0.0"

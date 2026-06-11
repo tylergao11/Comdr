@@ -60,6 +60,9 @@ import { ContextManager } from './context.js';
 import { WorkingMemory } from './memory/working.js';
 import { EpisodicMemory } from './memory/episodic.js';
 import { SemanticMemory } from './memory/semantic.js';
+import { ToolExperienceMemory } from './memory/tool-experience.js';
+import type { ToolExperience } from './memory/tool-experience.js';
+import { SkillEvolution } from './memory/skill-evolution.js';
 import { TaskPlanner } from './planner.js';
 import { SubAgentRegistry } from './subagent-registry.js';
 import { ReflectionEngine } from './reflection.js';
@@ -69,12 +72,14 @@ import { SessionStore } from './persistence.js';
 import { MCPClient } from './mcp-client.js';
 import { safeParseArgs } from './utils.js';
 import { summarizeDiff } from './smart-truncate.js';
-import { discoverComdrMd, discoverAndRetrieve } from './world-model.js';
+import { discoverComdrMd } from './world-model.js';
 import { generateRepoMap } from './repo-map.js';
-import { builtinRules, type CheckRule, type CheckContext } from './self-check.js';
+import { builtinRules, type CheckRule, type CheckContext, invalidateFileCache } from './self-check.js';
 import { isAdvancedTool, executeAdvancedTool } from './tools/execute.js';
 import type { ToolExecContext } from './tools/execute.js';
 import { scheduleParallel } from './scheduler.js';
+import { compileBlueprint } from './tool-blueprint/index.js';
+import type { ToolBlueprint } from '@comdr/core';
 import { bootstrapProject } from '@comdr/tools';
 import type { BootstrapReport } from '@comdr/tools';
 import { resolve as pathResolve } from 'node:path';
@@ -98,6 +103,8 @@ export class Engine implements IEngine {
   private readonly workingMemory: WorkingMemory;
   private readonly episodicMemory: EpisodicMemory;
   private readonly semanticMemory: SemanticMemory;
+  private readonly toolExperience: ToolExperienceMemory;
+  private readonly skillEvolution: SkillEvolution;
   private readonly planner: TaskPlanner;
   private readonly subAgentRegistry: SubAgentRegistry;
   private readonly reflection: ReflectionEngine;
@@ -126,6 +133,12 @@ export class Engine implements IEngine {
   private readonly fileCache: Map<string, string> = new Map();
   /** ★ session 内新创建的文件路径——补充到 allFiles */
   private sessionFiles: Set<string> = new Set();
+  /** ★ Tool Blueprint——工具世界模型拓扑图，同会话内静态 */
+  private blueprint: ToolBlueprint | null = null;
+  /** ★ 最近一次收集的完整工具列表——tool_explore 展开时查找 */
+  private allTools: import('@comdr/core/types').ToolDefinition[] = [];
+  /** ★ 待确认的工具调用——key=callId, value=resolve(approved) */
+  private pendingConfirms: Map<string, (approved: boolean) => void> = new Map();
 
   constructor(
     llm: IDeepSeekClient,
@@ -148,6 +161,8 @@ export class Engine implements IEngine {
     this.workingMemory = new WorkingMemory();
     this.episodicMemory = new EpisodicMemory();
     this.semanticMemory = new SemanticMemory();
+    this.toolExperience = new ToolExperienceMemory();
+    this.skillEvolution = new SkillEvolution();
     this.planner = new TaskPlanner();
     this.subAgentRegistry = new SubAgentRegistry();
     this.reflection = new ReflectionEngine(llm);
@@ -177,6 +192,9 @@ export class Engine implements IEngine {
         config.project.comdrMdPath || 'COMDR.md',
       ),
     );
+
+    // ★ Project path — 告诉 LLM 项目在哪，不再幻觉路径
+    this.prompt.setProjectPath(config.project.projectPath);
 
     // ★ 扫描 skills 目录，注册所有 SKILL.md（渐进式加载）
     const skillsDir = pathResolve(
@@ -214,9 +232,8 @@ export class Engine implements IEngine {
       }
     }
 
-    // ★ Repository Map: Aider-style 仓库拓扑视图（L1.5，同会话静态 → 缓存友好）
-    const repoMap = generateRepoMap(this.bootstrapReport);
-    if (repoMap) this.prompt.setRepoMap(repoMap);
+    // ★ Repo map 已从静态区移到 L7 动态区——每轮 run() 中生成带 PageRank 个性化的版本
+    //   此处不再注入，改为每轮动态生成（见 prompt.setRepoMapPerTurn()）
   }
 
   // ==========================================================================
@@ -269,25 +286,6 @@ export class Engine implements IEngine {
         type: AGENT_EVENT.MCP_STATUS,
         servers: this.mcpClient.getStatuses(),
       };
-    }
-
-    // ★ World Model trigram 检索
-    const worldModel = discoverAndRetrieve(
-      userInput,
-      this.config.project.projectPath,
-      this.config.project.comdrMdPath || 'COMDR.md',
-    );
-    if (worldModel.relevantChunks.length > 0) {
-      const chunksText = worldModel.relevantChunks
-        .map((c) => c.content)
-        .join('\n\n---\n\n');
-      this.prompt.setWorldModelContext(chunksText);
-      if (worldModel.didChunk) {
-        yield {
-          type: AGENT_EVENT.THINKING_DELTA,
-          content: `[Comdr] World model: ${worldModel.relevantChunks.length} relevant sections loaded`,
-        };
-      }
     }
 
     // ★ Emit bootstrap done（如果有）
@@ -360,33 +358,76 @@ export class Engine implements IEngine {
         if (this.subAgentRegistry.size > 0) {
           tools = [...tools, ...this.subAgentRegistry.getAllTools()];
         }
+
+        // ★ 1d-2. 子 Agent 防递归——移除 task_spawn，禁止 spawn 孙子 Agent
+        if ((this as any).__isSubAgent) {
+          tools = tools.filter((t) => t.name !== 'task_spawn');
+        }
+
+        // ★ 1d-3. 编译 Tool Blueprint——工具世界模型拓扑图
+        this.allTools = tools;
+        const blueprint = compileBlueprint(tools);
+        this.blueprint = blueprint;
+        this.prompt.setBlueprint(blueprint);
+
         let thinking = this.planner.defaultThinking();
 
-        // ★ 反馈闭环: 信用过滤的文件路径 + 搜索词 → 下轮自动进入检索
-        const currentTurn = session.turn;
-        const activePaths = this.workingMemory.getActivePaths(currentTurn);
-        const activeSearches = this.workingMemory.getActiveSearches(currentTurn);
-        const feedbackTerms = [...activePaths, ...activeSearches];
-        const enrichedQuery = feedbackTerms.length > 0
-          ? `${session.currentInput} ${feedbackTerms.join(' ')}`
-          : session.currentInput;
+        // 1e. ★ 每轮生成个性化 repo map（PageRank: chat files 100× boost, active files 50× boost）
+        if (this.bootstrapReport) {
+          const chatFiles = new Set<string>();
+          const activeFiles = new Set<string>();
+          for (const e of this.workingMemory.getStateWindow()) {
+            if (e.key.startsWith('file:')) {
+              const fp = e.key.slice(5);
+              const credit = e.successCount * 2 - e.failCount * 3;
+              if (credit >= 0) activeFiles.add(fp);
+              if (e.successCount > 0 || e.failCount > 0) chatFiles.add(fp);
+            }
+          }
+          const repoMap = generateRepoMap(this.bootstrapReport, { chatFiles, activeFiles });
+          this.prompt.setRepoMapPerTurn(repoMap);
+        }
 
-        // 1e. 构建 prompt（★ trigram 检索跨会话相关历史）
-        const episodicResults = this.episodicMemory
-          .retrieve(enrichedQuery, SYSTEM.EPISODIC_RETRIEVAL_TOPK);
-        const relatedHistory = episodicResults
-          .map((ep) => ep.structuredSummary?.sessionIntent ?? ep.task)
-          .filter(Boolean);
-        const reflections = this.episodicMemory.getReflections().map((r) => r.insight);
-        const allReflections = [...reflections];
+        // 1f. 构建 prompt（★ 编排层不预取历史——LLM 需要时自己调 memory_recall）
         const anchor = anchorFromWindows(
           this.workingMemory.getStateWindow(),
           this.workingMemory.getIntentWindow(),
-          relatedHistory,
-          allReflections.length > 0 ? allReflections : undefined,
         );
 
         const promptMessages = this.prompt.build(session, tools, anchor);
+
+        // ★ Tool Experience: 从最近工具调用中检索经验，追加到 prompt 末尾
+        //   不影响前缀缓存——追加在 L7 之后
+        const recentTools = session.messages
+          .filter((m) => m.role === MESSAGE_ROLE.ASSISTANT && m.tool_calls)
+          .slice(-2)
+          .flatMap((m) => m.tool_calls?.map((tc) => tc.function.name) ?? []);
+        const seenTools = new Set(recentTools);
+        const hints: string[] = [];
+        for (const toolName of seenTools) {
+          const exps = this.toolExperience.retrieve(toolName, undefined, 1);
+          for (const exp of exps) {
+            hints.push(`[exp] ${exp.insight}`);
+          }
+        }
+        if (hints.length > 0) {
+          promptMessages.push({
+            role: MESSAGE_ROLE.SYSTEM,
+            content: hints.join('\n'),
+          });
+        }
+
+        // ★ Self-Evolving Skills: 注入自动提炼的最佳实践
+        const evolvedSkills = this.skillEvolution.getActiveSkills();
+        if (evolvedSkills.length > 0) {
+          const skillLines = evolvedSkills.map(
+            (s) => `[evolved] ${s.description}`,
+          );
+          promptMessages.push({
+            role: MESSAGE_ROLE.SYSTEM,
+            content: skillLines.join('\n'),
+          });
+        }
 
         // ★ Cache monitoring: always use full tools for fingerprint stability
         const fp = this.prompt.computeStaticFingerprint(tools);
@@ -440,7 +481,16 @@ export class Engine implements IEngine {
             yield buffered.shift()!;
           } else if (!streamDone) {
             const event = await new Promise<AgentEvent | null>(
-              resolve => { waiter = resolve; },
+              resolve => {
+                waiter = resolve;
+                // ★ Defensive re-check: signalDone() 可能在 !streamDone 检查后、
+                // Promise 创建前触发。此时 waiter 已设但 streamDone=true，
+                // 直接 resolve(null) 避免永久挂起。
+                if (streamDone) {
+                  waiter = null;
+                  resolve(null);
+                }
+              },
             );
             if (event) yield event;
           }
@@ -506,18 +556,58 @@ export class Engine implements IEngine {
           const schedule = scheduleParallel(toolCalls);
 
           for (const batch of schedule) {
-            // ★ 收集并行执行中的事件（yield 不能在 Promise.all 内）
-            const pendingEvents: AgentEvent[] = [];
+            // ★ 需要确认的工具 → 先逐个 yield confirm event + await 用户响应
+            //   用户拒绝的从 batch 中移除（不执行），批准的保留进并行批
+            const permMode = this.config.agent?.permissionMode ?? 'confirm_destructive';
+            const deniedCallIds = new Set<string>();
+            for (const call of batch) {
+              const toolDef = this.allTools.find((t) => t.name === call.function.name);
+              if (toolDef?.permission === 'requires_approval' && permMode === 'confirm_destructive') {
+                yield {
+                  type: 'confirm_request',
+                  callId: call.id,
+                  toolName: call.function.name,
+                  args: safeParseArgs(call.function.arguments),
+                  reason: toolDef.description?.split('.')[0] ?? 'This tool may change files.',
+                } satisfies AgentEvent;
+                const approved = await new Promise<boolean>((r) => { this.pendingConfirms.set(call.id, r); });
+                if (!approved) {
+                  deniedCallIds.add(call.id);
+                  const denyMsg: Message = {
+                    role: MESSAGE_ROLE.TOOL,
+                    content: `[denied] User rejected execution of ${call.function.name}.`,
+                    tool_call_id: call.id,
+                  };
+                  session.messages.push(denyMsg);
+                  yield {
+                    type: AGENT_EVENT.TOOL_RESULT,
+                    result: { callId: call.id, toolName: call.function.name, ok: false, content: denyMsg.content!, diffSummary: undefined, snapshotId: undefined, testFeedback: undefined, errorCategory: undefined },
+                  } satisfies AgentEvent;
+                }
+              }
+            }
+
+            // ★ 并行执行——被拒的工具跳过
+            const pendingEventsByIndex = new Map<number, AgentEvent[]>();
+            let batchAborted = false;
             const batchResults = await Promise.all(
-              batch.map(async (call) => {
+              batch.map(async (call, callIndex) => {
+                if (deniedCallIds.has(call.id)) {
+                  return { call, skip: true, result: { callId: call.id, toolName: call.function.name, ok: false, content: '[denied]', diffSummary: undefined, snapshotId: undefined, testFeedback: undefined, errorCategory: undefined } };
+                }
+                if (batchAborted) return { call, skip: true, abort: true, reason: TERMINATION_REASON.LOOP_DETECTED };
+                if (batchAborted) return { call, skip: true, abort: true, reason: TERMINATION_REASON.LOOP_DETECTED };
+                const events: AgentEvent[] = [];
+                pendingEventsByIndex.set(callIndex, events);
                 const preCheck = this.reflection.intra(call, session);
                 if (preCheck.abort) {
-                  pendingEvents.push({
+                  events.push({
                     type: AGENT_EVENT.ERROR,
                     code: preCheck.abortReason ?? TERMINATION_REASON.LOOP_DETECTED,
                     message: preCheck.skipReason ?? 'Pre-execution check failed',
                     recoverable: false,
                   });
+                  batchAborted = true;
                   return { call, skip: true, abort: true, reason: preCheck.abortReason };
                 }
                 if (preCheck.skip) {
@@ -530,7 +620,7 @@ export class Engine implements IEngine {
                   return { call, skip: true, result: { callId: call.id, toolName: call.function.name, ok: false, content: skipMsg.content!, diffSummary: undefined, snapshotId: undefined, testFeedback: undefined, errorCategory: undefined } };
                 }
 
-                pendingEvents.push({ type: AGENT_EVENT.TOOL_CALL, call });
+                events.push({ type: AGENT_EVENT.TOOL_CALL, call });
 
                 // ★ LSP: 对 file_edit/file_write 工具调用，做诊断差值检查
                 const isFileEdit = call.function.name === 'file_edit' || call.function.name === 'file_write';
@@ -547,7 +637,7 @@ export class Engine implements IEngine {
                 const result: ToolResult = rawResult.diffSummary
                   ? { ...rawResult, diffSummary: summarizeDiff(rawResult.diffSummary) ?? rawResult.diffSummary }
                   : rawResult;
-                pendingEvents.push({ type: AGENT_EVENT.TOOL_RESULT, result });
+                events.push({ type: AGENT_EVENT.TOOL_RESULT, result });
 
                 // ★ LSP: 执行后诊断快照 + 纠正决策
                 if (this.lspBridge && isFileEdit && lspBefore) {
@@ -608,7 +698,7 @@ export class Engine implements IEngine {
                     const correctedResult: ToolResult = correctedRaw.diffSummary
                       ? { ...correctedRaw, diffSummary: summarizeDiff(correctedRaw.diffSummary) ?? correctedRaw.diffSummary }
                       : correctedRaw;
-                    pendingEvents.push({ type: AGENT_EVENT.TOOL_RESULT, result: correctedResult });
+                    events.push({ type: AGENT_EVENT.TOOL_RESULT, result: correctedResult });
                     session.messages.push({
                       role: MESSAGE_ROLE.TOOL,
                       content: correctedResult.content ?? 'ok',
@@ -622,8 +712,11 @@ export class Engine implements IEngine {
               })
             );
 
-            // ★ Yield all pending events in batch order
-            for (const ev of pendingEvents) yield ev;
+            // ★ Yield all pending events in batch order (by call index, deterministic)
+            for (let i = 0; i < batch.length; i++) {
+              const evs = pendingEventsByIndex.get(i);
+              if (evs) for (const ev of evs) yield ev;
+            }
 
             for (const r of batchResults) {
               // ★ skip: false 时保证 result 存在：（1）正常执行 → result 来自 executeToolAsync；（2）LSP rollback → result 显式构造
@@ -651,6 +744,14 @@ export class Engine implements IEngine {
             }
 
             // ★ L2 — 自检管线（确定性规则，不调 LLM）
+            // ★ write/edit 后清除文件缓存 + 增量更新 embedding 索引
+            if (call.function.name === 'file_write' || call.function.name === 'file_edit') {
+              const sargs = safeParseArgs(call.function.arguments);
+              const targetPath = typeof sargs.path === 'string' ? sargs.path : '';
+              if (targetPath) {
+                this.fileCache.delete(targetPath);
+              }
+            }
             const checkCtx = this.buildCheckContext();
             for (const rule of this.checkRules) {
               if (!rule.assess(call)) continue;
@@ -688,6 +789,23 @@ export class Engine implements IEngine {
             if (call.function.name === 'file_write') {
               const args = safeParseArgs(call.function.arguments);
               if (typeof args.path === 'string') this.sessionFiles.add(args.path);
+            }
+
+            // ★ Tool Experience: 记录每次工具调用的成败经验
+            {
+              const sargs = safeParseArgs(call.function.arguments);
+              const file = typeof sargs.path === 'string' ? sargs.path : undefined;
+              this.toolExperience.record(
+                call.function.name,
+                file,
+                result.ok,
+                result.errorCategory ?? undefined,
+                session.turn,
+              );
+
+              // ★ Self-Evolving Skills: 喂入经验，尝试提炼新 skill
+              const allExps = this.toolExperience.getAll();
+              this.skillEvolution.feed(allExps);
             }
 
             this.workingMemory.updateStateWindow(result, call, session.turn);
@@ -801,6 +919,10 @@ export class Engine implements IEngine {
           recoverable: true,
         };
 
+        // ★ 清除本轮 token 计数器，避免跨轮重复计数
+        this.reflection.getTokensSpentThisTurn();
+        this.context.getTokensSpentThisTurn();
+
         session.messages.push({
           role: MESSAGE_ROLE.SYSTEM,
           content: `[error] ${errorMsg}. Try a different approach.`,
@@ -812,6 +934,11 @@ export class Engine implements IEngine {
 
       // ★ 累加上下文压缩调用的 token 消耗
       session.tokensUsed += this.context.getTokensSpentThisTurn();
+
+      // ★ 轮末预算检查——捕获轮内超支，不等到下轮才发现
+      if (session.tokensUsed >= maxTokens) {
+        return yield* this.finalize(TERMINATION_REASON.TOKEN_BUDGET_EXCEEDED, session);
+      }
 
       // ★ 压缩后 reasoning_content 保护
       session.messages = this.reasoning.preserveAfterCompact(session.messages);
@@ -898,6 +1025,25 @@ export class Engine implements IEngine {
    */
   abort(): void {
     this.abortController?.abort();
+    // ★ abort 时拒绝所有待确认的工具调用
+    for (const [callId, resolve] of this.pendingConfirms) {
+      resolve(false);
+      this.pendingConfirms.delete(callId);
+    }
+  }
+
+  /**
+   * ★ 工具确认回调——用户在 UI 上点击 Approve/Deny 后调用。
+   *
+   * @param callId   工具调用 ID（来自 AgentEventConfirmRequest）
+   * @param approved true=批准执行，false=拒绝
+   */
+  confirm(callId: string, approved: boolean): void {
+    const resolve = this.pendingConfirms.get(callId);
+    if (resolve) {
+      this.pendingConfirms.delete(callId);
+      resolve(approved);
+    }
   }
 
   /**
@@ -933,15 +1079,39 @@ export class Engine implements IEngine {
   }
 
   /**
+   * ★ 供子 Agent 调用的工具执行入口。
+   *   子 Agent 用此方法走主引擎原生工具通路（repo-map 感知、Git 感知、ripgrep 等），
+   *   而非山寨 fs 实现。
+   */
+  async callTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+    return this.executeToolAsync({
+      id: `sub-${Date.now().toString(36)}`,
+      type: 'function',
+      function: { name, arguments: JSON.stringify(args) },
+    });
+  }
+
+  /**
    * ★ 派生独立 Engine 实例，共享 LLM + tools + config + logger + contextLLM。
    * 用于子 Agent 创建——每个子 Agent 有独立的 session/working memory/progress，
    * 但调用的是同一底层 LLM 客户端和工具执行器。
    *
    * 替代 subagent.ts 中的 `(engine as any)` 反模式。
    */
+  /**
+   * ★ 派生子 Engine 实例——用于 task_spawn 上下文隔离。
+   *
+   * 隔离策略（late-cli 2026）:
+   *   - 独立 session / working memory / progress
+   *   - 共享 LLM client / tools / config（但移除 task_spawn 防递归）
+   *   - 子 Agent session 不持久化——执行完即销毁
+   */
   forkEngine(): Engine {
     const sub = new Engine(this.llm, this.config, this.tools, this.logger, this.contextLLM);
+    // ★ 继承子智能体注册表（但不继承 task_spawn——防递归 spawn）
     this.subAgentRegistry.copyTo(sub['subAgentRegistry']);
+    // ★ 标记为子 Engine——prompt builder 会跳过全量上下文，只给任务描述
+    (sub as any).__isSubAgent = true;
     return sub;
   }
 
@@ -1023,10 +1193,6 @@ export class Engine implements IEngine {
       this.episodicMemory.commit();
       this.sessionStore.saveEpisodic(this.episodicMemory.serialize());
 
-      // ★ 跨会话反思（优先用 flash 模型）
-      const reflectLLM = this.contextLLM ?? this.llm;
-      this.episodicMemory.reflect([], reflectLLM).catch(() => {});
-
       this.sessionStore.saveSemantic(this.semanticMemory.serialize());
     }
 
@@ -1067,6 +1233,8 @@ export class Engine implements IEngine {
       semanticMemory: this.semanticMemory,
       nativeTools: this.tools,
       engine: this,
+      blueprint: this.blueprint ?? undefined,
+      allTools: this.allTools,
     };
   }
 

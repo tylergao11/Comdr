@@ -1,62 +1,86 @@
 // ============================================================
-// AuditPipeline — composes scan → filter → verify → report
+// AuditPipeline — rules → LLM discovers + adjudicates → report
 //
-// ★ Trigram-powered pipeline.
-//   Scanner builds TrigramIndex from code chunks,
-//   code-context and verifier reuse the same index for
-//   cross-file semantic retrieval.
+// ★ LLM gets rules + project root + read-only tools.
+//   Rules → Phase I discover → Phase II evidence → Phase III dialectic → Phase IV meta-audit.
 // ============================================================
 
-import { TrigramSemanticScanner } from "./scanner/index.js";
-import type { ScanResult, ScannerConfig } from "./scanner/index.js";
-import { DialecticVerifier } from "./dialectic/verifier.js";
-import { formatScanReport } from "./scanner/index.js";
-import { generateVerificationReport, formatVerifiedFinding } from "./dialectic/verifier.js";
-import { extractCodeContext } from "./code-context.js";
-import { loadConfig, type ComdrConfig } from "./config.js";
-import type { Finding, Verdict } from "./finding.js";
-import type { VerifyMode, AuditStats } from "./interfaces.js";
-import type { CodeChunk } from "./code-chunker.js";
+import { DialecticVerifier } from './dialectic/verifier.js';
+import { generateVerificationReport } from './dialectic/verifier.js';
+import { ALL_RULES, type RuleDefinition } from './dialectic/prompts.js';
+import { loadConfig, deepMerge, type ComdrConfig } from './config.js';
+import type { AuditedFinding } from './dialectic/types.js';
+import type { AuditStats } from './interfaces.js';
+import type { IToolExecutor } from './tools/executor.js';
+import { DeepSeekClient } from '@comdr/llm';
+import { THINKING_TYPE } from '@comdr/core';
 
 // ---- Pipeline Result ----
 
-export interface VerifiedFinding {
-  finding: Finding;
-  verdict: Verdict;
-  confidence: number;
-  decisiveEvidence: string[];
-  reasoning: string;
-  mode: "heuristic" | "llm";
-  tokenUsage?: { total: number };
-}
-
 export interface AuditReport {
-  scanResult: ScanResult;
-  verifiedFindings: VerifiedFinding[];
+  verifiedFindings: AuditedFinding[];
   stats: AuditStats;
   report: string;
 }
 
 export interface AuditOptions {
   targetDir?: string;
+  /** Specific files to audit (if omitted, audit entire directory) */
   files?: string[];
-  verifyMode?: VerifyMode;
+  /** Specific rules to audit (if omitted, all rules) */
+  rules?: RuleDefinition[];
   json?: boolean;
 }
 
 // ---- Pipeline ----
 
 export class AuditPipeline {
-  private scanner: TrigramSemanticScanner;
   private verifier: DialecticVerifier;
   private config: ComdrConfig;
 
-  constructor(config?: Partial<ComdrConfig>) {
-    this.config = config && Object.keys(config).length > 0
-      ? { ...loadConfig(), ...config } as ComdrConfig
-      : loadConfig();
-    this.scanner = new TrigramSemanticScanner(this.config.scanner);
-    this.verifier = new DialecticVerifier(this.config.dialectic);
+  /**
+   * @param configOrRoot  Partial config override, or project root string
+   * @param toolExecutor  ★ Injected from main engine. When provided, audit uses
+   *                      the main Agent's native tools instead of standalone fs.
+   *                      Omit for standalone CLI mode.
+   */
+  constructor(
+    configOrRoot?: Partial<ComdrConfig> | string,
+    toolExecutor?: IToolExecutor,
+  ) {
+    const projectRoot =
+      typeof configOrRoot === 'string' ? configOrRoot : process.cwd();
+    const configOverride =
+      typeof configOrRoot === 'string' ? undefined : configOrRoot;
+
+    this.config =
+      configOverride && Object.keys(configOverride).length > 0
+        ? deepMerge(loadConfig(projectRoot), configOverride)
+        : loadConfig(projectRoot);
+
+    const verifierConfig = {
+      enabled: this.config.dialectic.enabled,
+      maxFindingsPerRun: this.config.dialectic.maxFindingsPerRun,
+      maxFindingsPerBatch: this.config.dialectic.maxFindingsPerBatch,
+      phases: this.config.dialectic.phases,
+    };
+
+    if (toolExecutor) {
+      const apiKey = process.env.DEEPSEEK_API_KEY;
+      if (!apiKey) {
+        throw new Error('DEEPSEEK_API_KEY required.');
+      }
+      const llm = new DeepSeekClient({
+        apiKey,
+        model: 'deepseek-v4-pro',
+        baseUrl: 'https://api.deepseek.com',
+        maxTokens: 2000,
+        thinking: { type: THINKING_TYPE.DISABLED },
+      });
+      this.verifier = new DialecticVerifier(verifierConfig, llm, toolExecutor);
+    } else {
+      this.verifier = DialecticVerifier.fromEnv(projectRoot, verifierConfig);
+    }
   }
 
   /**
@@ -64,131 +88,74 @@ export class AuditPipeline {
    */
   async run(options: AuditOptions = {}): Promise<AuditReport> {
     const startTime = Date.now();
+    const targetDir = options.targetDir || process.cwd();
+    const rules = options.rules || ALL_RULES;
 
-    // ---- Tier 0.5: Trigram Semantic Scan ----
-    let scanResult: ScanResult;
-    if (options.files && options.files.length > 0) {
-      scanResult = this.scanner.scanFiles(options.files);
-    } else {
-      scanResult = this.scanner.scanDirectory(options.targetDir || process.cwd());
-    }
+    // LLM discovers + adjudicates findings from rules
+    const verifiedFindings = await this.verifier.discoverRules(
+      rules,
+      targetDir,
+      options.files,
+    );
 
-    // Build TrigramIndex from all chunks — shared across verifier calls
-    const index = this.scanner.getIndex(scanResult.chunks);
-
-    // ---- Tier 1: Filter for verification ----
-    let verifiedFindings: VerifiedFinding[] = [];
-    const toVerify = this.verifier.selectForVerification(scanResult.findings);
-
-    // ---- Tier 2: Dialectic verification ----
-    if (toVerify.length > 0) {
-      const mode = options.verifyMode || "heuristic";
-
-      // ★ Group by rule → same system prompt → DeepSeek KV Cache hits
-      const byRule = new Map<string, Finding[]>();
-      for (const f of toVerify) {
-        const list = byRule.get(f.rule) || [];
-        list.push(f);
-        byRule.set(f.rule, list);
-      }
-
-      for (const [, findings] of byRule) {
-        for (const finding of findings) {
-          const ctx = extractCodeContext(
-            finding,
-            index,
-            scanResult.chunks,
-            this.config.dialectic.codeContext.surroundingLines,
-          );
-
-          try {
-            const result = await this.verifier.verify({ finding, codeContext: ctx }, mode);
-            verifiedFindings.push({
-              finding: result.finding,
-              verdict: result.session.adjudication.verdict as Verdict,
-              confidence: result.session.adjudication.confidence,
-              decisiveEvidence: result.session.adjudication.decisiveEvidence,
-              reasoning: result.session.adjudication.reasoning,
-              mode: result.mode,
-              tokenUsage: result.tokenUsage,
-            });
-          } catch (err) {
-            verifiedFindings.push({
-              finding,
-              verdict: "warning",
-              confidence: 0.5,
-              decisiveEvidence: [`Verification error: ${String(err).slice(0, 100)}`],
-              reasoning: "Verification failed — marked as warning for manual review.",
-              mode: "heuristic",
-            });
-          }
-        }
-      }
-    }
-
-    // ---- Tier 3: Stats & Report ----
+    // Build stats
     const durationMs = Date.now() - startTime;
     const stats: AuditStats = {
-      filesScanned: scanResult.stats.filesScanned,
-      filesSkipped: scanResult.stats.filesSkipped,
-      rulesApplied: scanResult.stats.rulesApplied,
-      findingsTotal: scanResult.findings.length,
-      findingsBySeverity: { ...scanResult.stats.findingsBySeverity },
-      findingsByCategory: { ...scanResult.stats.findingsByCategory },
+      findingsTotal: verifiedFindings.length,
+      findingsConfirmed: verifiedFindings.filter((r) => r.verdict === 'confirmed').length,
+      findingsWarning: verifiedFindings.filter((r) => r.verdict === 'warning').length,
+      findingsDismissed: verifiedFindings.filter((r) => r.verdict === 'dismissed').length,
       durationMs,
-      mode: verifiedFindings.some(r => r.mode === "llm") ? "mixed" : "trigram",
+      mode: 'llm',
       tokenUsageTotal: verifiedFindings.reduce((s, r) => s + (r.tokenUsage?.total || 0), 0),
     };
 
-    const scanReport = formatScanReport(scanResult);
-    let verifyReport = "";
-    if (verifiedFindings.length > 0) {
-      verifyReport = generateVerificationReport(
-        verifiedFindings.map(r => ({
-          finding: r.finding,
-          session: {
-            factualBasis: { behavior: "", dataSources: [], sinks: [], visibleProtections: [], controlFlow: "" },
-            attackArguments: [],
-            defenseArguments: [],
-            adjudication: {
-              verdict: r.verdict,
-              confidence: r.confidence,
-              decisiveEvidence: r.decisiveEvidence,
-              reasoning: r.reasoning,
-            },
-          },
-          mode: r.mode,
-          tokenUsage: r.tokenUsage,
-        })),
-      );
-    }
+    // Generate report
+    const report = generateVerificationReport(verifiedFindings);
 
-    const report = [scanReport, verifyReport].filter(Boolean).join("\n\n");
-
-    return { scanResult, verifiedFindings, stats, report };
+    return { verifiedFindings, stats, report };
   }
 
   async runAndPrint(options: AuditOptions = {}): Promise<AuditReport> {
-    if (!options.verifyMode) {
-      options.verifyMode = "heuristic";
-    }
-
     const result = await this.run(options);
 
     if (options.json) {
-      console.log(JSON.stringify({
-        findings: result.scanResult.findings,
-        verified: result.verifiedFindings,
-        stats: result.stats,
-      }, null, 2));
+      console.log(
+        JSON.stringify(
+          {
+            verified: result.verifiedFindings,
+            stats: result.stats,
+          },
+          null,
+          2,
+        ),
+      );
     } else {
       console.log(result.report);
     }
 
-    const criticalCount = result.scanResult.findings.filter(f => f.severity === "critical").length;
-    const highCount = result.scanResult.findings.filter(f => f.severity === "high").length;
+    const criticalCount = result.verifiedFindings.filter(
+      (r) => r.finding.severity === 'critical' && r.verdict !== 'dismissed',
+    ).length;
+    const highCount = result.verifiedFindings.filter(
+      (r) => r.finding.severity === 'high' && r.verdict !== 'dismissed',
+    ).length;
+
     if (criticalCount + highCount > 0) {
-      console.log(`\n⚠ ${criticalCount} critical + ${highCount} high severity findings require attention.`);
+      console.log(
+        `\n⚠ ${criticalCount} critical + ${highCount} high severity findings require attention.`,
+      );
+    }
+
+    // ★ Enforce failOnSeverity: exit 1 if findings at or above threshold
+    const failThreshold = this.config.pipeline.failOnSeverity;
+    const sevOrder: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
+    const threshold = sevOrder[failThreshold] ?? 3;
+    const hasFailing = result.verifiedFindings.some(
+      (r) => r.verdict !== 'dismissed' && (sevOrder[r.finding.severity] ?? 0) >= threshold,
+    );
+    if (hasFailing) {
+      process.exitCode = 1;
     }
 
     return result;

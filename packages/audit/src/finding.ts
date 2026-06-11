@@ -1,12 +1,12 @@
 // ============================================================
-// Comdr-Audit Core Types — Finding & Dialectic Verification
+// Comdr-Audit Core Types — Finding & Verification Results
 // ============================================================
 
-// ---- Finding (extends PLAN.md definition) ----
+// ---- Finding ----
 
 export type Severity = "critical" | "high" | "medium" | "low" | "info";
 export type Category = "security" | "quality" | "perf" | "convention" | "bug";
-export type FindingSource = "static" | "rag" | "agent" | "dynamic";
+export type FindingSource = "static" | "rag" | "agent" | "dynamic" | "llm";
 export type Verdict = "confirmed" | "warning" | "dismissed";
 
 export interface Finding {
@@ -21,96 +21,13 @@ export interface Finding {
   snippet: string;
   rule: string;
   suggestion?: string;
-  confidence: number;       // 0–1, 规则/Agent 判定可信度
+  /** 0–1, LLM-assigned confidence */
+  confidence: number;
   source: FindingSource;
-  /** Dialectic verification result (populated after verification pass) */
-  verdict?: Verdict;
-  verdictReasoning?: string;
-  verdictEvidence?: string[];
-  verdictConfidence?: number;
 }
 
-// ---- Dialectic Verification Types ----
+// ---- Adjudication ----
 
-/** Reference to a code symbol extracted from AST */
-export interface SymbolRef {
-  name: string;
-  kind: "function" | "variable" | "class" | "import" | "type" | "method" | "parameter";
-  file: string;
-  line: number;
-  /** Brief description from JSDoc or inference */
-  description?: string;
-}
-
-/** A node in a simplified call chain */
-export interface CallNode {
-  functionName: string;
-  file: string;
-  line: number;
-  args?: string[];
-}
-
-/** Code context extracted around a finding for dialectic analysis */
-export interface CodeContext {
-  targetFile: string;
-  targetLine: number;
-  /** The exact problematic snippet */
-  targetSnippet: string;
-  /** Surrounding code (±N lines) */
-  surroundingCode: string;
-  /** AST-extracted related symbols (variables, functions, imports) */
-  relatedSymbols: SymbolRef[];
-  /** Simplified call chain if available */
-  callChain?: CallNode[];
-}
-
-/** Dialectic verification input */
-export interface DialecticInput {
-  finding: Finding;
-  codeContext: CodeContext;
-}
-
-// ---- Dialectic Session (Aegis 4-step protocol) ----
-
-/** Step 1: Factual understanding of the code */
-export interface FactualBasis {
-  /** What does this code do, factually */
-  behavior: string;
-  /** Identified data sources (user input, external data, internal) */
-  dataSources: string[];
-  /** Identified sinks (eval, SQL, filesystem, network, DOM) */
-  sinks: string[];
-  /** Any visible protection mechanisms */
-  visibleProtections: string[];
-  /** Relevant control flow summary */
-  controlFlow: string;
-}
-
-/** Step 2: Attack argument */
-export interface AttackArg {
-  /** The attack vector being argued */
-  vector: string;
-  /** Detailed exploit chain */
-  exploitChain: string;
-  /** Required conditions for exploitability */
-  preconditions: string[];
-  /** How confident is this attack argument (0-1) */
-  confidence: number;
-}
-
-/** Step 3: Defense argument */
-export interface DefenseArg {
-  /** Which attack argument this addresses (by index) */
-  targetsAttackIndex: number;
-  /** The defense mechanism or mitigating factor */
-  mitigation: string;
-  /** Evidence from the code */
-  evidence: string;
-  /** How confident is this defense (0-1) */
-  confidence: number;
-}
-
-/** Step 4: Evidence-weighted adjudication */
 export interface Adjudication {
   verdict: Verdict;
   /** Overall confidence in the verdict (0-1) */
@@ -121,47 +38,19 @@ export interface Adjudication {
   reasoning: string;
 }
 
-export interface DialecticSession {
-  factualBasis: FactualBasis;
-  attackArguments: AttackArg[];
-  defenseArguments: DefenseArg[];
-  adjudication: Adjudication;
+// ---- Verified Finding (Finding + Adjudication together) ----
+
+export interface VerifiedFinding {
+  finding: Finding;
+  verdict: Verdict;
+  confidence: number;
+  decisiveEvidence: string[];
+  reasoning: string;
+  mode: "llm";
+  tokenUsage?: { total: number };
 }
 
-// ---- DialecticVerifier Configuration ----
-
-export interface DialecticVerifierConfig {
-  enabled: boolean;
-  triggerConditions: {
-    /** Minimum severity to trigger dialectic verification */
-    minSeverity: Severity;
-    /** Trigger when rule confidence is BELOW this value */
-    minRuleConfidence: number;
-  };
-  /** Max findings to verify per run (cost control) */
-  maxFindingsPerRun: number;
-  codeContext: {
-    /** Lines of surrounding code to include */
-    surroundingLines: number;
-    /** Whether to trace and include call chain */
-    includeCallChain: boolean;
-  };
-}
-
-export const DEFAULT_DIALECTIC_CONFIG: DialecticVerifierConfig = {
-  enabled: true,
-  triggerConditions: {
-    minSeverity: "medium",
-    minRuleConfidence: 0.8,
-  },
-  maxFindingsPerRun: 20,
-  codeContext: {
-    surroundingLines: 30,
-    includeCallChain: true,
-  },
-};
-
-// ---- Severity ordering for comparisons ----
+// ---- Severity ordering ----
 
 const SEVERITY_ORDER: Record<Severity, number> = {
   critical: 4,
@@ -185,7 +74,3 @@ export function generateFindingId(rule: string): string {
   return `${rule}-${ts}-${rand}-${_idCounter}`;
 }
 
-/** Reset ID counter (for deterministic tests) */
-export function resetIdCounter(): void {
-  _idCounter = 0;
-}
