@@ -1,22 +1,26 @@
 /**
- * prompt.ts — 分层 Prompt 构造
+ * prompt.ts — 精简 Prompt 构造
  *
  * 来源：Claude Code 两区架构 + DeepSeek 自动前缀缓存
  *
- * 七层架构:
+ * 五层架构（编辑器执行器不需要通用 agent 的全量上下文灌注）:
  *   ZONE 1: STATIC (缓存友好，不变)
  *     L1: System Prompt (不含时间戳)
+ *     L1.x: COMDR.md + World Model + Repo Map
  *     L2: Tool Definitions (JSON.stringify sorted keys)
- *     L3: Session Anchor (会话摘要 + 持久记忆)
+ *     L3: Session Anchor (relatedHistory + reflections)
  *   ZONE 2: DYNAMIC (每轮变化)
- *     L4: State Window (最近 5 条 WHAT)
- *     L5: Intent Window (最近 5 条 WHY)
- *     L6: Recent History (最近 5 轮完整消息)
- *     L7: Current User Input
+ *     L6: Recent History (最近轮次完整消息)
+ *     L7: Current User Input + State Window (合并到 user 消息末尾)
+ *
+ * 已移除的膨胀层（2026-06）:
+ *   L4/L5: 独立 State/Intent 层 → State 已合并到 L7 后缀，Intent 无信息量
+ *   L4.5: Entity Context / Compact Summary → 子串匹配图召回率低；compacted summary 与消息数组重复
+ *   LSP 自动注入: 全量类型图每轮 2K-15K token，编辑器执行器不需要 → 保留 correctByLSP 执行后差值验证
  *
  * 关键设计:
  *   - L1-L3 保持绝对不变 → DeepSeek 全自动前缀缓存 100% 命中
- *   - L4-L7 每轮变化，但总量控制在 ~8K tokens 以内
+ *   - 动态上下文只保留 State Window 执行反馈 + Recent History，总量 ~2K tokens
  *   - System Prompt 不含任何时间戳、动态 ID、随机数
  *
  * @agent Agent 4 — 此文件由 Agent 4 维护
@@ -28,8 +32,6 @@ import type {
   ToolDefinition,
   SessionState,
   SessionAnchor,
-  Route,
-  LSPFileContext,
 } from '@comdr/core/types';
 import { MESSAGE_ROLE, THINKING_TYPE, THINKING_EFFORT, SYSTEM } from '@comdr/core';
 import { serializeTools } from '@comdr/llm';
@@ -63,25 +65,6 @@ export class PromptConstructor {
    */
   private worldModelContext: string = '';
 
-  // ---- 动态区跨轮数据 ----
-
-  /**
-   * ★ L4.5 — Semantic Memory 实体上下文（每轮更新）。
-   */
-  private entityContext: string = '';
-
-  /**
-   * ★ L4.5 — Context Anchor 压缩摘要（每轮更新）。
-   */
-  private compactSummary: string = '';
-
-  /**
-   * ★ L7 — LSP 结构化上下文（当前操作文件的类型图/调用链/诊断）。
-   * 每轮由 loop.ts 在 prompt.build() 之前调用 setLSPContext() 更新。
-   * 同文件内容未改时不变 → 前缀缓存友好。
-   */
-  private lspContext: string = '';
-
   /**
    * 设置项目专属指令内容。Engine 构造时调用。
    */
@@ -103,133 +86,11 @@ export class PromptConstructor {
    */
   private repoMap: string = '';
 
-  /**
-   * ★ 任务行为指令——从 L7 提到 L3 静态区。
-   * 同 route 内不变 → 缓存友好。route 切换时更新（罕见）。
-   */
-  private taskBehavior: string = '';
-
   /** 设置仓库地图。Engine 构造时调用一次。 */
   setRepoMap(text: string): void {
     this.repoMap = text;
   }
 
-  /** 设置任务行为指令。loop.ts 每轮调用——但内容只在 route 变化时更新。 */
-  setTaskBehavior(route: Route): void {
-    const hint = buildTaskHint(route);
-    if (hint !== this.taskBehavior) {
-      this.taskBehavior = hint;
-    }
-  }
-
-  /**
-   * ★ 设置 Semantic Memory 实体上下文（L4.5）。
-   * 每轮调用，反映最新的文件/实体关系。
-   */
-  setEntityContext(text: string): void {
-    this.entityContext = text;
-  }
-
-  /**
-   * ★ 设置 Context Anchor 压缩摘要（L4.5）。
-   * 每轮调用，反映压缩管线的最新摘要。
-   */
-  setCompactSummary(text: string): void {
-    this.compactSummary = text;
-  }
-
-  /**
-   * ★ 设置 LSP 结构化上下文（注入到 L7 动态区）。
-   *
-   * 由 loop.ts 在每轮 prompt.build() 之前调用。
-   * 参数来自 ILSPBridge.getFileContext() 的结果。
-   *
-   * 缓存策略: LSP 上下文基于文件内容——
-   *   文件没改 → LSP 上下文不变 → 前缀缓存友好
-   *   文件改了 → LSP 上下文更新（但其他静态区不变，只 miss 少量 tokens）
-   *
-   * @param fileContexts 当前轮次涉及的关键文件的 LSP 上下文
-   *                     （来自 stateWindow 中最近操作的文件）
-   */
-  setLSPContext(fileContexts: LSPFileContext[]): void {
-    if (fileContexts.length === 0) {
-      this.lspContext = '';
-      return;
-    }
-
-    // ★ 格式化为 Agent 友好的 Markdown（参考 JetBrains PSI 论文的输出格式）
-    const blocks: string[] = [];
-
-    for (const ctx of fileContexts) {
-      const fileName = ctx.file.split('/').pop() ?? ctx.file;
-
-      const lines: string[] = [];
-      lines.push(`### ${fileName}`);
-
-      // Exports
-      if (ctx.exports.length > 0) {
-        const items = ctx.exports.map(
-          e => `- \`${e.name}\` (${e.kind}) → ${e.signature || '(no signature)'}`,
-        );
-        lines.push('**Exports:**', ...items);
-      }
-
-      // Imports
-      if (ctx.imports.length > 0) {
-        const items = ctx.imports.map(
-          i => `- \`${i.name}\` from \`${i.from}\``,
-        );
-        lines.push('**Imports:**', ...items);
-      }
-
-      // Callers (谁调用了这个文件)
-      if (ctx.callers.length > 0) {
-        const items = ctx.callers.map(
-          c => `- \`${c.symbol}\` in \`${c.file}\`:${c.line}`,
-        );
-        lines.push('**Callers:**', ...items);
-      }
-
-      // Callees (这个文件调用了谁)
-      if (ctx.callees.length > 0) {
-        const items = ctx.callees.map(
-          c => `- \`${c.symbol}\` → \`${c.file}\``,
-        );
-        lines.push('**Callees:**', ...items);
-      }
-
-      // Type Dependencies
-      if (ctx.typeDependencies.length > 0) {
-        const items = ctx.typeDependencies.map(
-          t => `- \`${t.name}\` (${t.relation})`,
-        );
-        lines.push('**Type Dependencies:**', ...items);
-      }
-
-      // Diagnostics
-      if (ctx.diagnostics.length > 0) {
-        const errors = ctx.diagnostics.filter(d => d.severity === 'error');
-        const warnings = ctx.diagnostics.filter(d => d.severity === 'warning');
-        if (errors.length > 0) {
-          lines.push(`**Errors (${errors.length}):**`);
-          errors.forEach(e => lines.push(`- L${e.line}: ${e.message} [${e.code ?? e.source ?? '?'}]`));
-        }
-        if (warnings.length > 0) {
-          lines.push(`**Warnings (${warnings.length}):**`);
-          warnings.forEach(w => lines.push(`- L${w.line}: ${w.message}`));
-        }
-      }
-
-      blocks.push(lines.join('\n'));
-    }
-
-    this.lspContext = blocks.join('\n\n---\n\n');
-    // ★ 保留 LSP 上限：虽然语义信息高密度，但超大项目可能有数百个文件，
-    //   每个上下文 2KB+ 会严重膨胀 prompt。50K 字符是合理上界。
-    if (this.lspContext.length > 50_000) {
-      this.lspContext = this.lspContext.slice(0, 50_000) + '\n\n... (truncated)';
-    }
-  }
 
   /**
    * ★ 计算静态区的 SHA256 指纹——用于监控前缀缓存命中情况。
@@ -286,11 +147,10 @@ export class PromptConstructor {
   build(
     session: SessionState,
     tools: ToolDefinition[],
-    route: Route,
     anchor: SessionAnchor,
   ): Message[] {
     const staticZone = this.buildStaticZone(tools, anchor);
-    const dynamicZone = this.buildDynamicZone(session, route);
+    const dynamicZone = this.buildDynamicZone(session);
     return [...staticZone, ...dynamicZone];
   }
 
@@ -309,7 +169,6 @@ export class PromptConstructor {
     // ★ Merge L1.x + L1.5 + L1.6 + L1 project_instructions + L3 anchor
     // into ONE system message to save JSON wrapper overhead (~120B).
     const contextBlocks: string[] = [];
-    if (this.taskBehavior) contextBlocks.push(this.taskBehavior);
     if (this.comdrMd) contextBlocks.push(`<project>\n${this.comdrMd}\n</project>`);
     if (this.repoMap) contextBlocks.push(this.repoMap);
     if (this.worldModelContext) contextBlocks.push(`<world>\n${this.worldModelContext}\n</world>`);
@@ -373,19 +232,17 @@ export class PromptConstructor {
   /**
    * 构建动态区域 L6-L7
    *
-   * ★ 缓存优化：L4/L5/L4.5 不再作为独立消息（会切断 prefix cache）。
-   * 改为合并到 L7 用户消息末尾。动态消息顺序变为:
-   *   L6: Recent History → L7: User Input + State + Intent + Entity + Summary
+   * ★ 缓存优化: State Window 合并到 L7 用户消息末尾。
+   * 动态消息顺序: L6: Recent History → L7: User Input + State
    *
-   * 这样 L1-L3 的 ~3200 tokens 永远命中缓存。
+   * L1-L3 的 ~3200 tokens 永远命中缓存。
    */
   private buildDynamicZone(
     session: SessionState,
-    route: Route,
   ): Message[] {
     return [
       ...this.buildL6_RecentHistory(session),
-      this.buildL7_WithContext(session, route),
+      this.buildL7_WithContext(session),
     ];
   }
 
@@ -441,15 +298,13 @@ export class PromptConstructor {
   }
 
   /**
-   * L7: User Input + Dynamic Context (merged)
+   * L7: User Input + State Window (merged)
    *
-   * ★ 缓存优化: State Window, Intent Window, Entity Context, Compact Summary
-   * 不再作为独立消息，而是合并到用户消息末尾。这样 L1-L3 的 ~3200 tokens
-   * 永远命中前缀缓存。
+   * ★ 缓存优化: State Window 合并到用户消息末尾 → L1-L3 前缀缓存命中。
+   * 编辑器执行器只发执行反馈，不比通用 agent 需要全量上下文。
    */
   private buildL7_WithContext(
     session: SessionState,
-    _route: Route,
   ): Message {
     const parts: string[] = [];
 
@@ -470,58 +325,19 @@ export class PromptConstructor {
   }
 
   /**
-   * ★ 构建动态上下文后缀。标签已最小化以减少缓存外字节。
+   * ★ 构建动态上下文后缀。只保留 State Window——编辑器执行器只需知道执行反馈。
+   * Intent / Entity / Summary / LSP 的自动注入已移除——他们是通用 coding agent 的包袱。
    */
   private buildContextSuffix(session: SessionState): string | null {
-    const blocks: string[] = [];
-
-    if (session.stateWindow.length > 0) {
-      const lines = session.stateWindow.map(e => `- [${e.key}] ${e.text}`);
-      blocks.push(`<s>\n${lines.join('\n')}\n</s>`);
-    }
-    if (session.intentWindow.length > 0) {
-      const lines = session.intentWindow.map(e => `- [${e.key}] ${e.why}`);
-      blocks.push(`<i>\n${lines.join('\n')}\n</i>`);
-    }
-    const extras: string[] = [];
-    if (this.entityContext) {
-      extras.push(`<e>\n${this.entityContext}\n</e>`);
-    }
-    if (this.compactSummary) {
-      extras.push(`<c>\n${this.compactSummary}\n</c>`);
-    }
-    if (this.lspContext) {
-      extras.push(`<lsp>\n${this.lspContext}\n</lsp>`);
-    }
-    if (extras.length > 0) blocks.push(extras.join('\n'));
-
-    return blocks.length > 0 ? blocks.join('\n') : null;
+    if (session.stateWindow.length === 0) return null;
+    const lines = session.stateWindow.map(e => `- [${e.key}] ${e.text}`);
+    return `<s>\n${lines.join('\n')}\n</s>`;
   }
 }
 
 // ============================================================================
 // §3 辅助
 // ============================================================================
-
-/**
- * 构建任务行为提示（注入 L1.6 静态区）。
- * 同 route 内不变 → 缓存友好。
- */
-export function buildTaskHint(route: Route): string {
-  const mode = (() => {
-    switch (route.taskType) {
-      case 'query':       return '[r] answer directly, use tools only when asked';
-      case 'edit':        return '[e] minimal changes, read first, verify after';
-      case 'generate':    return '[g] plan structure, create files, handle imports';
-      case 'refactor':    return '[r!] read all callers, smallest safe steps, single-file';
-      case 'architect':   return '[a] design only, no impl, output decisions+tradeoffs+plan';
-      case 'orchestrate': return '[o] multi-step, parallel vs sequential, mcp/task_spawn';
-    }
-  })();
-  const think = route.thinking.type === 'enabled' && route.thinking.effort === 'max'
-    ? ' [think:max]' : '';
-  return mode + think;
-}
 
 /**
  * 构建空的会话锚点（新会话无历史）

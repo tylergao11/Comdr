@@ -38,7 +38,7 @@ import type {
 } from '@comdr/core/types';
 import type { IDeepSeekClient } from '@comdr/core/contracts';
 import { SYSTEM, MASKED_PREFIX, MESSAGE_ROLE, THINKING_TYPE } from '@comdr/core';
-import { summarizeToolOutput, summarizeSegmentText, compressByLevel } from './smart-truncate.js';
+import { summarizeToolOutput, summarizeSegmentText } from './smart-truncate.js';
 import { extractAndParseJSON } from './utils.js';
 
 // ============================================================================
@@ -160,7 +160,6 @@ export class ContextManager {
    * 从后往前分配 token 预算，超预算后剩余全部 squash。
    */
   applyObservationMask(messages: Message[]): Message[] {
-    // 收集 tool result 位置（从后往前）
     const toolIndices: number[] = [];
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i]!.role === MESSAGE_ROLE.TOOL) {
@@ -168,31 +167,22 @@ export class ContextManager {
       }
     }
 
-    // 最后 N*2 条无条件 preserve
+    // 最后 N*2 条无条件保留
     const alwaysKeep = SYSTEM.COMPACTION_OBSERVE_MASK_TURNS * 2;
     const preservedSet = new Set(toolIndices.slice(0, alwaysKeep));
     const maskTargets = toolIndices.slice(alwaysKeep);
 
     if (maskTargets.length === 0) return messages;
 
-    // ★ 差异化压缩：对每条目标消息打分
-    const compressed = new Map<number, { level: string; content: string }>();
-    for (const idx of maskTargets) {
-      const msg = messages[idx]!;
-      // 尝试从 tool_call_id 找到对应的 tool call name
-      const toolName = this.inferToolName(messages, msg);
-      const result = compressByLevel(msg.content ?? '', toolName);
-      compressed.set(idx, result);
-    }
-
+    // ★ 纯机械截断——超过阈值就截，不猜重要性
     return messages.map((msg, i) => {
       if (preservedSet.has(i)) return msg;
-      const c = compressed.get(i);
-      if (!c) return msg;
-      if (c.level === 'preserve') return msg;
+      if (!maskTargets.includes(i)) return msg;
+      const content = msg.content ?? '';
+      if (content.length <= SYSTEM.SUMMARY_MAX_LENGTH) return msg;
       return {
         ...msg,
-        content: c.level === 'squash' ? c.content : `${MASKED_PREFIX} ${c.content}`,
+        content: `${MASKED_PREFIX} ${summarizeToolOutput(content)}`,
       };
     });
   }
@@ -216,13 +206,7 @@ export class ContextManager {
     return 'unknown';
   }
 
-  /**
-   * 将 tool result 智能压缩——提取错误/测试结果/有意义的摘要，
-   * 而非盲取首行截断。
-   *
-   * @deprecated 替换为 compressByLevel()。保留用于向后兼容。
-   * @see smart-truncate.ts compressByLevel()
-   */
+  /** 机械截断 tool result——超过阈值就截首行。 */
   private summarizeToolResult(content: string): string {
     return summarizeToolOutput(content);
   }
@@ -691,24 +675,6 @@ export class ContextManager {
    */
   getPersistentSummary(): StructuredSummary | null {
     return this.persistentSummary;
-  }
-
-  /**
-   * ★ 将 persistentSummary 序列化为文本（用于 prompt 动态区注入）。
-   *
-   * 摘要已经很短（几百 token），不检索直接注入。
-   * 每轮压缩后可能更新，放在 L4.5 动态区。
-   */
-  getSummaryText(): string {
-    if (!this.persistentSummary) return '';
-    return this.serializeSummary(this.persistentSummary);
-  }
-
-  /**
-   * 设置持久化摘要（从 episodic memory 恢复）
-   */
-  setPersistentSummary(summary: StructuredSummary): void {
-    this.persistentSummary = summary;
   }
 
   /**

@@ -60,8 +60,8 @@ import { ContextManager } from './context.js';
 import { WorkingMemory } from './memory/working.js';
 import { EpisodicMemory } from './memory/episodic.js';
 import { SemanticMemory } from './memory/semantic.js';
-import { ProceduralMemory } from './memory/procedural.js';
 import { TaskPlanner } from './planner.js';
+import { SubAgentRegistry } from './subagent-registry.js';
 import { ReflectionEngine } from './reflection.js';
 import { ProgressMeter } from './progress.js';
 import { SkillsLoader } from './skills.js';
@@ -69,8 +69,7 @@ import { SessionStore } from './persistence.js';
 import { MCPClient } from './mcp-client.js';
 import { safeParseArgs } from './utils.js';
 import { summarizeDiff } from './smart-truncate.js';
-import { discoverComdrMd, discoverAndRetrieve, buildLSPWorldChunks, extractKeyFiles } from './world-model.js';
-import { createToolRetriever } from './tool-retriever.js';
+import { discoverComdrMd, discoverAndRetrieve } from './world-model.js';
 import { generateRepoMap } from './repo-map.js';
 import { builtinRules, type CheckRule, type CheckContext } from './self-check.js';
 import { isAdvancedTool, executeAdvancedTool } from './tools/execute.js';
@@ -99,8 +98,8 @@ export class Engine implements IEngine {
   private readonly workingMemory: WorkingMemory;
   private readonly episodicMemory: EpisodicMemory;
   private readonly semanticMemory: SemanticMemory;
-  private readonly proceduralMemory: ProceduralMemory;
   private readonly planner: TaskPlanner;
+  private readonly subAgentRegistry: SubAgentRegistry;
   private readonly reflection: ReflectionEngine;
   private readonly progress: ProgressMeter;
   private readonly skillsLoader: SkillsLoader;
@@ -149,9 +148,8 @@ export class Engine implements IEngine {
     this.workingMemory = new WorkingMemory();
     this.episodicMemory = new EpisodicMemory();
     this.semanticMemory = new SemanticMemory();
-    this.proceduralMemory = new ProceduralMemory();
-    this.proceduralMemory.load();
     this.planner = new TaskPlanner();
+    this.subAgentRegistry = new SubAgentRegistry();
     this.reflection = new ReflectionEngine(llm);
     this.progress = new ProgressMeter();
     this.skillsLoader = new SkillsLoader();
@@ -162,7 +160,7 @@ export class Engine implements IEngine {
 
     // ★ 从磁盘恢复跨会话记忆（不存在/损坏 → 静默降级）
     const epData = this.sessionStore.loadEpisodic();
-    if (epData) this.episodicMemory.deserialize(epData.episodes, epData.reflections);
+    if (epData) this.episodicMemory.deserialize(epData);
     const semData = this.sessionStore.loadSemantic();
     if (semData) this.semanticMemory.deserialize(semData);
 
@@ -188,12 +186,6 @@ export class Engine implements IEngine {
     const skillsCount = this.skillsLoader.scanDirectory(skillsDir);
     if (skillsCount > 0) {
       this.skillsLog = `Loaded ${skillsCount} skills from ${config.project.skillsDir || SYSTEM.DEFAULT_SKILLS_DIR}/`;
-    }
-
-    // ★ 初始化 TF-IDF 工具检索器——按语义匹配工具，替代固定白名单
-    const allToolDefs = this.skillsLoader.activeTools();
-    if (allToolDefs.length > 0) {
-      this.planner.setRetriever(createToolRetriever(allToolDefs));
     }
 
     // ★ Bootstrap: 静态分析项目符号和引用 → 填充 Semantic Memory
@@ -261,8 +253,6 @@ export class Engine implements IEngine {
       try {
         const mcpCount = await this.mcpClient.startAll();
         if (mcpCount > 0) {
-          // ★ 将 MCP 工具纳入 BM25 检索索引
-          this.planner.addToolsToRetriever(this.mcpClient.getTools());
           yield {
             type: AGENT_EVENT.THINKING_DELTA,
             content: `[Comdr] ${mcpCount} MCP servers connected`,
@@ -281,7 +271,7 @@ export class Engine implements IEngine {
       };
     }
 
-    // ★ World Model 分块检索（同会话不变 → L1.x 静态区缓存友好）
+    // ★ World Model trigram 检索
     const worldModel = discoverAndRetrieve(
       userInput,
       this.config.project.projectPath,
@@ -360,51 +350,35 @@ export class Engine implements IEngine {
         // 修复历史缺失的 reasoning_content
         session.messages = this.reasoning.repairHistory(injectedMessages);
 
-        // 1d. 任务路由（★ 先匹配 trigger 自动展开 skill，再获取工具列表）
-        const triggeredSkills = this.skillsLoader.matchTriggers(
-          session.currentInput,
-        );
-        if (triggeredSkills.length > 0) {
-          yield {
-            type: AGENT_EVENT.THINKING_DELTA,
-            content: `[Comdr] 自动激活 skill: ${triggeredSkills.join(', ')}`,
-          };
-        }
+        // 1d. 获取工具列表——LLM 自己决定何时调用 skill 工具
         let tools = this.skillsLoader.activeTools();
         // ★ 合并 MCP 工具
         if (this.mcpClient) {
           tools = [...tools, ...this.mcpClient.getTools()];
         }
-        let route = this.planner.route(session.currentInput, tools);
+        // ★ 合并子智能体工具
+        if (this.subAgentRegistry.size > 0) {
+          tools = [...tools, ...this.subAgentRegistry.getAllTools()];
+        }
+        let thinking = this.planner.defaultThinking();
 
-        // ★ 行为指令注入静态区——同 route 不变 = 缓存友好
-        this.prompt.setTaskBehavior(route);
-
-        // ★ L4.5 — KARMA-style State-Enriched Graph RAG
-        //   用 State Window 的活跃文件路径作为精确检索种子
-        const statePaths = session.stateWindow.map(e => e.key); // 纯文件路径
-        const enrichedQuery = statePaths.length > 0
-          ? `${session.currentInput} ${statePaths.join(' ')}`
+        // ★ 反馈闭环: 信用过滤的文件路径 + 搜索词 → 下轮自动进入检索
+        const currentTurn = session.turn;
+        const activePaths = this.workingMemory.getActivePaths(currentTurn);
+        const activeSearches = this.workingMemory.getActiveSearches(currentTurn);
+        const feedbackTerms = [...activePaths, ...activeSearches];
+        const enrichedQuery = feedbackTerms.length > 0
+          ? `${session.currentInput} ${feedbackTerms.join(' ')}`
           : session.currentInput;
-        const entityContext = this.semanticMemory.retrieveRelevantEntities(enrichedQuery);
-        this.prompt.setEntityContext(entityContext);
 
-        // ★ L4.5 — Context Anchor 压缩摘要（每轮更新）
-        const summaryText = this.context.getSummaryText();
-        this.prompt.setCompactSummary(summaryText);
-
-        // 1e. 构建 prompt（★ 每次构建时检索跨会话相关历史）
-        const relatedHistory = this.episodicMemory
-          .retrieve(session.currentInput)
+        // 1e. 构建 prompt（★ trigram 检索跨会话相关历史）
+        const episodicResults = this.episodicMemory
+          .retrieve(enrichedQuery, SYSTEM.EPISODIC_RETRIEVAL_TOPK);
+        const relatedHistory = episodicResults
           .map((ep) => ep.structuredSummary?.sessionIntent ?? ep.task)
           .filter(Boolean);
         const reflections = this.episodicMemory.getReflections().map((r) => r.insight);
         const allReflections = [...reflections];
-        // ★ 注入跨项目 confirmed 模式 (trust ≥ 0.7)
-        const patterns = this.proceduralMemory.getConfirmed();
-        if (patterns.length > 0) {
-          allReflections.push('Cross-project patterns:', ...patterns.map(p => `- ${p.pattern} (trust: ${p.trust.toFixed(2)})`));
-        }
         const anchor = anchorFromWindows(
           this.workingMemory.getStateWindow(),
           this.workingMemory.getIntentWindow(),
@@ -412,16 +386,7 @@ export class Engine implements IEngine {
           allReflections.length > 0 ? allReflections : undefined,
         );
 
-        // ★ LSP: 注入当前操作文件的语义上下文
-        if (this.lspBridge) {
-          const keyFiles = extractKeyFiles(this.workingMemory.getStateWindow());
-          if (keyFiles.length > 0) {
-            const lspContexts = await buildLSPWorldChunks(this.lspBridge, keyFiles);
-            this.prompt.setLSPContext(lspContexts);
-          }
-        }
-
-        const promptMessages = this.prompt.build(session, tools, route, anchor);
+        const promptMessages = this.prompt.build(session, tools, anchor);
 
         // ★ Cache monitoring: always use full tools for fingerprint stability
         const fp = this.prompt.computeStaticFingerprint(tools);
@@ -454,7 +419,7 @@ export class Engine implements IEngine {
           {
             messages: promptMessages,
             tools,  // ★ Always send all tools — stable JSON = max prefix cache hit
-            thinking: route.thinking,
+            thinking,  // ★ 默认 high，停滞时 replan 升级到 max
             signal: this.abortController.signal,
           },
           (event) => {
@@ -545,7 +510,7 @@ export class Engine implements IEngine {
             const pendingEvents: AgentEvent[] = [];
             const batchResults = await Promise.all(
               batch.map(async (call) => {
-                const preCheck = this.reflection.intra(call, session, route);
+                const preCheck = this.reflection.intra(call, session);
                 if (preCheck.abort) {
                   pendingEvents.push({
                     type: AGENT_EVENT.ERROR,
@@ -726,7 +691,13 @@ export class Engine implements IEngine {
             }
 
             this.workingMemory.updateStateWindow(result, call, session.turn);
-            this.workingMemory.updateIntentWindow(call, result, session);
+            // ★ 反馈闭环: 搜索词关联到文件
+            if (call.function.name === 'file_grep' || call.function.name === 'file_search') {
+              const sargs = safeParseArgs(call.function.arguments);
+              const query = typeof sargs.query === 'string' ? sargs.query : '';
+              const path = typeof sargs.path === 'string' ? sargs.path : undefined;
+              if (query) this.workingMemory.recordSearch(query, path);
+            }
             this.semanticMemory.recordFileOperation(call, result, session.turn);
           }
 
@@ -762,13 +733,13 @@ export class Engine implements IEngine {
             });
           }
 
-          // ★ 动态重规划 → 覆盖下一轮的路由
-          const newRoute = this.planner.replan(route, signal);
-          if (newRoute) {
-            route = newRoute;
+          // ★ 停滞升级 → 覆盖下一轮的 thinking 配置
+          const newThinking = this.planner.replan(thinking, signal);
+          if (newThinking) {
+            thinking = newThinking;
             yield {
               type: AGENT_EVENT.THINKING_DELTA,
-              content: `思维模式升级: ${newRoute.thinking.type === THINKING_TYPE.ENABLED ? `思考:${newRoute.thinking.effort}` : '标准'}`,
+              content: `思维模式升级: 思考:${newThinking.type === 'enabled' ? newThinking.effort : '标准'}`,
             };
           }
         } else {
@@ -954,6 +925,14 @@ export class Engine implements IEngine {
   }
 
   /**
+   * ★ 注册子智能体。外部（VS Code / CLI）在 Engine 启动后调用。
+   *   子智能体工具会以 `prefix__toolName` 格式暴露给 LLM。
+   */
+  registerSubAgent(agent: import('@comdr/core/contracts').ISubAgent): void {
+    this.subAgentRegistry.register(agent);
+  }
+
+  /**
    * ★ 派生独立 Engine 实例，共享 LLM + tools + config + logger + contextLLM。
    * 用于子 Agent 创建——每个子 Agent 有独立的 session/working memory/progress，
    * 但调用的是同一底层 LLM 客户端和工具执行器。
@@ -961,7 +940,9 @@ export class Engine implements IEngine {
    * 替代 subagent.ts 中的 `(engine as any)` 反模式。
    */
   forkEngine(): Engine {
-    return new Engine(this.llm, this.config, this.tools, this.logger, this.contextLLM);
+    const sub = new Engine(this.llm, this.config, this.tools, this.logger, this.contextLLM);
+    this.subAgentRegistry.copyTo(sub['subAgentRegistry']);
+    return sub;
   }
 
   // ==========================================================================
@@ -1039,18 +1020,13 @@ export class Engine implements IEngine {
     if (session.turn > 0) {
       const structuredSummary = this.context.getPersistentSummary();
       this.episodicMemory.consolidate(session, structuredSummary);
-      // ★ commit(): 将本会话快照合并进检索 store → 下次会话可检索
       this.episodicMemory.commit();
-
-      // ★ 跨会话反思——每 N 个会话触发一次（优先用 flash 模型）
-      if (this.episodicMemory.shouldReflect()) {
-        const reflectLLM = this.contextLLM ?? this.llm;
-        this.episodicMemory.reflect(reflectLLM).catch(() => {});
-        // ★ 跨项目模式提取——每 2 次反思触发一次（更稀有）
-        this.proceduralMemory.learn(reflectLLM).catch(() => {});
-      }
-
       this.sessionStore.saveEpisodic(this.episodicMemory.serialize());
+
+      // ★ 跨会话反思（优先用 flash 模型）
+      const reflectLLM = this.contextLLM ?? this.llm;
+      this.episodicMemory.reflect([], reflectLLM).catch(() => {});
+
       this.sessionStore.saveSemantic(this.semanticMemory.serialize());
     }
 
@@ -1085,12 +1061,10 @@ export class Engine implements IEngine {
    * ★ 构建 TS 层工具执行上下文。
    */
   private getToolExecContext(): ToolExecContext {
-    const allToolDefs = this.skillsLoader.activeTools();
     return {
       projectPath: this.config.project.projectPath,
       episodicMemory: this.episodicMemory,
       semanticMemory: this.semanticMemory,
-      toolRetriever: createToolRetriever(allToolDefs),
       nativeTools: this.tools,
       engine: this,
     };
@@ -1116,6 +1090,12 @@ export class Engine implements IEngine {
    * 执行工具（Agent 3 SDB 桥接或 mock）
    */
   private async executeToolAsync(call: ToolCall): Promise<ToolResult> {
+    // ★ 子智能体工具 → 路由到 SubAgentRegistry
+    if (this.subAgentRegistry.resolve(call.function.name)) {
+      const args = safeParseArgs(call.function.arguments);
+      return this.subAgentRegistry.executeTool(call.function.name, args);
+    }
+
     // ★ 高级 TS 工具 → 本地执行
     if (isAdvancedTool(call.function.name)) {
       return await executeAdvancedTool(call, this.getToolExecContext());

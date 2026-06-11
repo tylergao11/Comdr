@@ -550,14 +550,14 @@ suite4.test('PromptConstructor.build State Window 内容', () => {
     allowedTools: ['file_edit'],
   };
 
-  const messages = pc.build(session, [], route, anchor);
-  // 检查 L7 中的 context suffix（原 L4+L5 已合并到用户消息）
+  const messages = pc.build(session, [], anchor);
+  // 检查 L7 中的 context suffix（State Window 合并到用户消息末尾）
   const userMsg = messages[messages.length - 1]!;
   assertContains(userMsg.content ?? '', '<s>', 'should contain state context');
   assertContains(userMsg.content ?? '', 'src/auth.ts', 'state window path');
   assertContains(userMsg.content ?? '', 'src/app.ts', 'state window path 2');
-  assertContains(userMsg.content ?? '', '<i>', 'should contain intent context');
-  assertContains(userMsg.content ?? '', 'token 验证', 'intent window text');
+  // ★ Intent / Entity / LSP 不再自动注入——编辑器执行器精简
+  assert(!(userMsg.content ?? '').includes('<i>'), 'should NOT inject intent context');
 });
 
 // --- 4c. planner.ts ---

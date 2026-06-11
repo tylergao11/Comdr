@@ -617,17 +617,8 @@ await s6.run();
 const s7 = new TestSuite('prompt.ts — Zone 构造');
 
 import { PromptConstructor, emptyAnchor } from '../packages/engine/src/prompt.js';
-import type { Route } from '../packages/core/src/types.js';
 // NOTE: SessionState & StructuredSummary in suite 2; ToolDefinition in suite 4
-import { MESSAGE_ROLE, THINKING_TYPE, THINKING_EFFORT, TASK_TYPE } from '../packages/core/src/index.js';
-
-function mockRoute(): Route {
-  return {
-    taskType: TASK_TYPE.QUERY,
-    thinking: { type: THINKING_TYPE.DISABLED },
-    allowedTools: ['file_read', 'file_grep'],
-  };
-}
+import { MESSAGE_ROLE } from '../packages/core/src/index.js';
 
 function mockPromptSession(): SessionState {
   return {
@@ -655,13 +646,13 @@ const MINIMAL_TOOLS: ToolDefinition[] = [{
 
 s7.test('build 返回 non-empty messages', () => {
   const pc = new PromptConstructor();
-  const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, mockRoute(), emptyAnchor());
+  const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, emptyAnchor());
   assert(messages.length > 0, 'should return messages');
 });
 
 s7.test('L1 System Prompt 在最前面', () => {
   const pc = new PromptConstructor();
-  const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, mockRoute(), emptyAnchor());
+  const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, emptyAnchor());
   assertEq(messages[0]!.role, MESSAGE_ROLE.SYSTEM, 'first message is system prompt');
 });
 
@@ -669,7 +660,7 @@ s7.test('L1.x worldModelContext 在静态区', () => {
   const pc = new PromptConstructor();
   pc.setWorldModelContext('relevant world model content');
 
-  const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, mockRoute(), emptyAnchor());
+  const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, emptyAnchor());
   const worldModelMsg = messages.find(
     (m) => m.role === 'system' && m.content?.includes('<world>'),
   );
@@ -680,33 +671,23 @@ s7.test('L1.x worldModelContext 在静态区', () => {
 s7.test('L1.x 不设置时不注入', () => {
   const pc = new PromptConstructor();
   // 不调 setWorldModelContext——应该没有 <world>
-  const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, mockRoute(), emptyAnchor());
+  const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, emptyAnchor());
   const worldModelMsg = messages.find(
     (m) => m.content?.includes('<world>'),
   );
   assert(worldModelMsg === undefined, 'should NOT have world_model_context when not set');
 });
 
-s7.test('L4.5 entityContext 在动态区', () => {
+s7.test('L4.5 Entity/Compact 不注入——编辑器执行器精简', () => {
   const pc = new PromptConstructor();
-  pc.setEntityContext('- function `loginHandler` in src/auth.ts');
 
-  const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, mockRoute(), emptyAnchor());
-  const entityMsg = messages.find(
-    (m) => m.content?.includes('<e>'),
-  );
-  assert(entityMsg !== undefined, 'should have relevant_entities');
-});
-
-s7.test('L4.5 compactSummary 在动态区', () => {
-  const pc = new PromptConstructor();
-  pc.setCompactSummary('Goal: fix login. Files: modified src/auth.ts');
-
-  const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, mockRoute(), emptyAnchor());
-  const summaryMsg = messages.find(
-    (m) => m.content?.includes('<c>'),
-  );
-  assert(summaryMsg !== undefined, 'should have compacted_summary');
+  const messages = pc.build(mockPromptSession(), MINIMAL_TOOLS, emptyAnchor());
+  // ★ Entity Context / Compact Summary / Intent Window / LSP 不再自动注入
+  const userMsg = messages[messages.length - 1]!;
+  assert(!(userMsg.content ?? '').includes('<e>'), 'should NOT inject entity context');
+  assert(!(userMsg.content ?? '').includes('<c>'), 'should NOT inject compact summary');
+  assert(!(userMsg.content ?? '').includes('<i>'), 'should NOT inject intent window');
+  assert(!(userMsg.content ?? '').includes('<lsp>'), 'should NOT inject LSP context');
 });
 
 s7.test('静态区在 build 间不变，动态区变', () => {
@@ -714,17 +695,17 @@ s7.test('静态区在 build 间不变，动态区变', () => {
   pc.setComdrMd('test COMDR.md');
   pc.setWorldModelContext('test world model');
 
-  const route1 = mockRoute();
   const session = mockPromptSession();
 
-  const msgs1 = pc.build(session, MINIMAL_TOOLS, route1, emptyAnchor());
-  // 更新动态数据
-  pc.setEntityContext('new entities');
-  pc.setCompactSummary('new summary');
-  const msgs2 = pc.build(session, MINIMAL_TOOLS, route1, emptyAnchor());
+  const msgs1 = pc.build(session, MINIMAL_TOOLS, emptyAnchor());
+  // 更新动态数据（State Window 变化不应影响静态区）
+  session.stateWindow = [
+    { key: 'file:src/new.ts', text: 'added after build 1', turn: 2 },
+  ];
+  const msgs2 = pc.build(session, MINIMAL_TOOLS, emptyAnchor());
 
   // ★ 静态区已合并为 2 条消息（L1 System Prompt + L2 merged context）
-  // entity/compact 现在注入到 L7 用户消息，不影响静态区
+  // State Window 注入到 L7 用户消息，不影响静态区
   const static1 = msgs1.slice(0, 2).map(m => m.content);
   const static2 = msgs2.slice(0, 2).map(m => m.content);
   for (let i = 0; i < static1.length; i++) {
