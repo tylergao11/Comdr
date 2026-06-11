@@ -504,3 +504,76 @@ export interface ContractVerification {
  * 每个 Agent 模块必须导出的契约自检函数
  */
 export type ContractVerifier = () => ContractVerification;
+
+// ============================================================================
+// Contract F: 子智能体 → 主引擎
+// ============================================================================
+
+/**
+ * 子智能体清单——主引擎发现和注册的依据。
+ *
+ * @contract
+ *   实现者: 各子智能体包（@comdr/audit、@comdr/cocos-engine 等）
+ *   消费者: Agent 4（@comdr/engine）
+ */
+export interface SubAgentManifest {
+  /** 唯一标识，如 "audit"、"cocos-engine" */
+  name: string;
+  /** 一句话描述——LLM 选择子智能体时的依据 */
+  description: string;
+  /** 语义版本 */
+  version: string;
+  /** 工具名前缀——子智能体的工具注册为 "name__toolName" */
+  toolPrefix: string;
+}
+
+/**
+ * 子智能体契约——任何子智能体包必须导出 createSubAgent() 工厂函数。
+ *
+ * 设计原则:
+ *   - 子智能体是工具提供者，不是独立进程。
+ *   - 主引擎通过 ISubAgent 接口发现工具并分发调用。
+ *   - 子智能体内部可以是无状态函数（audit）或有状态 Gateway（cocos-engine）。
+ *
+ * @contract
+ *   实现者: 各子智能体包
+ *   消费者: Agent 4 的 SubAgentRegistry
+ */
+export interface ISubAgent {
+  /** 清单信息 */
+  readonly manifest: SubAgentManifest;
+
+  /** 返回子智能体提供的工具定义列表 */
+  getTools(): import('./types.js').ToolDefinition[];
+
+  /**
+   * 执行工具调用。
+   *
+   * @param toolName  工具名（不含前缀——registry 已剥离）
+   * @param args      工具参数
+   * @returns         工具执行结果
+   */
+  executeTool(
+    toolName: string,
+    args: Record<string, unknown>,
+  ): Promise<import('./types.js').ToolResult>;
+}
+
+/**
+ * 子智能体工具执行结果——executeTool() 返回。
+ * 不含 callId/toolName——由 SubAgentRegistry 填充。
+ */
+export interface SubAgentToolResult {
+  ok: boolean;
+  content: string | null;
+  errorCategory?: import('./types.js').ErrorCategory;
+}
+
+/**
+ * 子智能体工厂函数签名——每个子智能体包必须导出。
+ *
+ * @example
+ *   // 在 @comdr/audit 中:
+ *   export const createSubAgent: SubAgentFactory = (config) => new AuditSubAgent(config);
+ */
+export type SubAgentFactory = (config: Record<string, unknown>) => ISubAgent;

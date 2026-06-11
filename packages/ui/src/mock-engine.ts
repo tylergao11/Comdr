@@ -363,8 +363,8 @@ export class MockEngine implements IEngine {
       outcome: null,
       messages: [],
       stateWindow: [
-        { key: 'file:src/auth.ts', text: 'added validateToken()', turn: 1 },
-        { key: 'file:src/app.ts', text: 'refactored main loop', turn: 2 },
+        { key: 'file:src/auth.ts', text: 'added validateToken()', turn: 1, searches: [], successCount: 1, failCount: 0 },
+        { key: 'file:src/app.ts', text: 'refactored main loop', turn: 2, searches: [], successCount: 1, failCount: 0 },
       ],
       intentWindow: [
         { key: 'file:src/auth.ts', why: '添加 token 验证逻辑', turn: 1 },

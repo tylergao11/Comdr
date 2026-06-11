@@ -175,8 +175,3 @@ export const ADVANCED_TOOLS: ToolDefinition[] = [
   SHELL_TEST,
   TASK_SPAWN,
 ];
-
-/** 高级工具名 → 定义映射（用于工具执行分发） */
-export const ADVANCED_TOOL_MAP: ReadonlyMap<string, ToolDefinition> = new Map(
-  ADVANCED_TOOLS.map((t) => [t.name, t]),
-);

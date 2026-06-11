@@ -22,11 +22,6 @@ import type {
   SkillManifest,
 } from '@comdr/core/types';
 import { TOOL_PERMISSION, SYSTEM } from '@comdr/core';
-import {
-  tokenize,
-  BM25Scorer,
-  contextualPrefix,
-} from './retrieval.js';
 import { ADVANCED_TOOLS } from './tools/advanced-tools.js';
 
 // ============================================================================
@@ -54,13 +49,6 @@ export class SkillsLoader {
   /** 已注入正文的 skill 集合 */
   private expandedSkills: Set<string> = new Set();
 
-  /**
-   * ★ BM25 语义检索索引。
-   * 对 skill 名称 + description + triggers 建索引，用于 trigger 关键词不匹配时的降级。
-   */
-  private semanticIndex: BM25Scorer | null = null;
-  private semanticDocTokens: Map<string, Map<string, number>> = new Map();
-
   // --------------------------------------------------------------------------
   // 静态 skill 管理
   // --------------------------------------------------------------------------
@@ -70,7 +58,6 @@ export class SkillsLoader {
    */
   registerSkill(manifest: SkillManifest): void {
     this.registry.set(manifest.name, manifest);
-    this.rebuildSemanticIndex();
   }
 
   /**
@@ -125,9 +112,6 @@ export class SkillsLoader {
       body: body ?? null,
       createdAt: Date.now(),
     });
-
-    // ★ 重建语义索引——确保运行时 skill 可被 BM25 语义检索召回
-    this.rebuildSemanticIndex();
   }
 
   /**
@@ -135,7 +119,6 @@ export class SkillsLoader {
    */
   unregisterRuntimeSkill(name: string): void {
     this.runtimeSkills.delete(name);
-    this.rebuildSemanticIndex();
   }
 
   // --------------------------------------------------------------------------
@@ -189,46 +172,8 @@ export class SkillsLoader {
     return tools;
   }
 
-  /**
-   * 获取活跃工具名列表（用于 planner route 过滤）
-   * @phase2 预留——route 当前使用 ALL_TOOLS_SENTINEL，未按名称过滤
-   */
-  activeToolNames(): string[] {
-    return this.activeTools().map((t) => t.name);
-  }
-
-  /**
-   * 判断是否为 skill 工具（静态或运行时）
-   * @phase2 预留——Engine 当前不区分工具来源
-   */
-  isSkillTool(toolName: string): boolean {
-    return toolName.startsWith('skill__') || toolName.startsWith('runtime__');
-  }
-
-  /**
-   * 判断是否为静态 skill
-   * @phase2 预留——渐进式展开实现后使用
-   */
-  isStaticSkill(toolName: string): boolean {
-    return toolName.startsWith('skill__');
-  }
-
-  /**
-   * 提取 skill 名（去除前缀）
-   * @phase2 预留——skill 调用处理器使用
-   */
-  extractSkillName(toolName: string): string {
-    return toolName.replace(/^(skill__|runtime__)/, '');
-  }
-
-  /**
-   * 获取静态 skill manifest（用于渐进式展开）
-   * @phase2 预留——Engine 展开 skill 正文时使用
-   */
-  getSkillManifest(toolName: string): SkillManifest | undefined {
-    const name = this.extractSkillName(toolName);
-    return this.registry.get(name);
-  }
+  // @phase2 预留方法已删除——activeToolNames/isSkillTool/isStaticSkill/extractSkillName/getSkillManifest。
+  // 渐进式 skill 展开在需要时重新实现。
 
   // --------------------------------------------------------------------------
   // Skills 文件系统扫描
@@ -257,8 +202,6 @@ export class SkillsLoader {
     if (!existsSync(dirPath)) return 0;
 
     this._scanRecursive(dirPath, dirPath);
-    // ★ 扫描完成后重建 BM25 语义索引
-    this.rebuildSemanticIndex();
     return this.registry.size;
   }
 
@@ -458,119 +401,7 @@ export class SkillsLoader {
     return result;
   }
 
-  /**
-   * ★ 基于 triggers 关键词匹配，自动展开匹配的静态 skill。
-   *
-   * 检查用户输入中是否包含任何 skill 的触发词——
-   * 命中则自动 expandSkill()，使下一轮的 tool definition 包含完整正文。
-   *
-   * 若关键词无匹配 → 降级到 BM25 语义检索。
-   *
-   * @param userInput  用户当前输入
-   * @returns          被自动展开的 skill 名列表
-   */
-  matchTriggers(userInput: string): string[] {
-    const inputLower = userInput.toLowerCase();
-    const matched: string[] = [];
-
-    // 策略 1: 关键词精确匹配
-    for (const [name, skill] of this.registry) {
-      if (this.expandedSkills.has(name)) continue;
-      for (const trigger of skill.triggers) {
-        if (inputLower.includes(trigger.toLowerCase())) {
-          this.expandSkill(name);
-          matched.push(name);
-          break;
-        }
-      }
-    }
-
-    // 策略 2: ★ BM25 语义降级——关键词没命中但语义相关
-    if (matched.length === 0 && this.semanticIndex) {
-      const semanticMatches = this.retrieveSemantically(
-        userInput,
-        SYSTEM.SKILLS_RETRIEVAL_TOPK,
-      );
-      for (const { name } of semanticMatches) {
-        if (!this.expandedSkills.has(name)) {
-          this.expandSkill(name);
-          matched.push(name);
-        }
-      }
-    }
-
-    return matched;
-  }
-
-  /**
-   * ★ BM25 语义检索——当 trigger 关键词不匹配时降级调用。
-   *
-   * 用 BM25 + Contextual Prefix 对 skill 描述建索引，
-   * 按用户输入语义匹配最相关的 skill。
-   *
-   * @param input  用户输入
-   * @param topK   返回最相关 K 个
-   * @returns      按 BM25 score 降序排列，仅返回 score > 阈值的
-   */
-  retrieveSemantically(
-    input: string,
-    topK: number = SYSTEM.SKILLS_RETRIEVAL_TOPK,
-  ): Array<{ name: string; score: number }> {
-    if (!this.semanticIndex) return [];
-
-    const queryTokens = tokenize(input);
-
-    const scored: Array<{ name: string; score: number }> = [];
-    for (const [name, docTokens] of this.semanticDocTokens) {
-      const score = this.semanticIndex.score(queryTokens, docTokens);
-      if (score >= SYSTEM.SKILLS_SEMANTIC_THRESHOLD) {
-        scored.push({ name, score });
-      }
-    }
-
-    scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, topK);
-  }
-
-  /**
-   * ★ 重建 BM25 语义索引（registerSkill 后调用）。
-   */
-  private rebuildSemanticIndex(): void {
-    const totalSkills = this.registry.size + this.runtimeSkills.size;
-    if (totalSkills === 0) {
-      this.semanticIndex = null;
-      this.semanticDocTokens.clear();
-      return;
-    }
-
-    const bm25 = new BM25Scorer();
-    const docTokens = new Map<string, Map<string, number>>();
-
-    // ★ 索引静态 skill (registry)
-    for (const [name, skill] of this.registry) {
-      const text = contextualPrefix(
-        `${skill.description} ${skill.triggers.join(' ')}`,
-        { source: `skill:${name}` },
-      );
-      const tokens = tokenize(text);
-      bm25.addDocument(tokens);
-      docTokens.set(name, tokens);
-    }
-
-    // ★ 索引运行时 skill (runtimeSkills)
-    for (const [name, skill] of this.runtimeSkills) {
-      const text = contextualPrefix(
-        skill.definition.description,
-        { source: `runtime:${name}` },
-      );
-      const tokens = tokenize(text);
-      bm25.addDocument(tokens);
-      docTokens.set(name, tokens);
-    }
-
-    this.semanticIndex = bm25;
-    this.semanticDocTokens = docTokens;
-  }
+  // matchTriggers + BM25 语义检索已删除——LLM 自己决定何时调用 skill 工具。
 
   // --------------------------------------------------------------------------
   // 生命周期
@@ -582,25 +413,9 @@ export class SkillsLoader {
   reset(): void {
     this.runtimeSkills.clear();
     this.expandedSkills.clear();
-    this.semanticIndex = null;
-    this.semanticDocTokens.clear();
   }
 
-  /**
-   * 获取统计信息
-   * @phase2 预留——调试面板 / TUI status 行使用
-   */
-  getStats(): {
-    staticSkills: number;
-    runtimeSkills: number;
-    expandedSkills: number;
-  } {
-    return {
-      staticSkills: this.registry.size,
-      runtimeSkills: this.runtimeSkills.size,
-      expandedSkills: this.expandedSkills.size,
-    };
-  }
+  // getStats() 已删除——@phase2 预留，调试面板/TUI 在需要时重新实现。
 }
 
 // ============================================================================

@@ -11,7 +11,7 @@ import type { ToolCall, ToolResult, ErrorCategory } from '@comdr/core/types';
 import { SYSTEM, RUN_MODE, ERROR_CATEGORY } from '@comdr/core';
 import type { EpisodicMemory } from '../memory/episodic.js';
 import type { SemanticMemory } from '../memory/semantic.js';
-import type { ToolRetriever } from '../tool-retriever.js';
+
 import type { INativeTools } from '@comdr/core/contracts';
 import { safeParseArgs } from '../utils.js';
 import { BM25Scorer, tokenize, contextualPrefix } from '../retrieval.js';
@@ -28,9 +28,7 @@ export interface ToolExecContext {
   projectPath: string;
   episodicMemory: EpisodicMemory;
   semanticMemory: SemanticMemory;
-  toolRetriever: ToolRetriever;
   nativeTools: INativeTools | null;
-  /** ★ Engine 实例——task_spawn 需要用于 fork 子 Agent */
   engine: Engine;
 }
 
@@ -117,24 +115,16 @@ export async function executeAdvancedTool(
 // §3 各工具实现
 // ============================================================================
 
-/** 1. tool_search — BM25 检索工具描述 */
-/** Helper: return only ok+content (base fields filled by caller) */
+/** 1. tool_search — Embedding 工具检索 */
 type ExecResult = { ok: boolean; content: string; errorCategory?: ErrorCategory };
 
 function execToolSearch(
-  query: string,
-  ctx: ToolExecContext,
+  _query: string,
+  _ctx: ToolExecContext,
 ): ExecResult {
-  if (!query.trim()) {
-    return { ok: true, content: 'No query provided.' };
-  }
-  const results = ctx.toolRetriever.retrieve(query, 5);
-  if (results.length === 0) {
-    return { ok: true, content: 'No matching tools found.' };
-  }
   return {
     ok: true,
-    content: results.map((name) => `- ${name}`).join('\n'),
+    content: 'All available tools are listed in the system prompt. Use any tool directly.',
   };
 }
 

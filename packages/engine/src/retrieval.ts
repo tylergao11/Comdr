@@ -1,13 +1,12 @@
 /**
- * retrieval.ts — 共享检索模块
+ * retrieval.ts — 已废弃
  *
- * 统一的 BM25 + Contextual Prefix 检索基础设施。
- * 替代原先 tool-retriever.ts 和 episodic.ts 中两套独立的 TF-IDF 实现。
+ * ★ @deprecated BM25 检索已被 embed.ts (ONNX embedding) 替代。
+ *   episodic.ts / world-model.ts / tool-retriever.ts 已迁移。
+ *   tokenize / BM25Scorer / contextualPrefix 仅保留供 tools/execute.ts 的
+ *   file_search（本地文件全文搜索——BM25 对此场景仍然适用）。
  *
- * 三层检索架构:
- *   Layer 1: BM25 + Contextual Prefix（稀疏检索）
- *   Layer 2: Graph Traversal（确定性的图查询，在 semantic.ts 中实现）
- *   Layer 3: Direct Injection（无检索，直接注入）
+ * 新代码请使用 embed.ts: embedText() / embedBatch() / cosineSimilarity()
  *
  * @agent Agent 4 — 此文件由 Agent 4 维护
  */
@@ -259,52 +258,5 @@ export function l2Normalize(vec: number[]): void {
   }
 }
 
-// ============================================================================
-// §5 稀疏向量工具（tool-retriever 用）
-// ============================================================================
-
-/**
- * 稀疏向量: token → weight
- */
-export type SparseVector = Map<string, number>;
-
-/**
- * 计算两个稀疏向量的余弦相似度。
- * 假设 docVec 已 L2 归一化到 norm=1。
- *
- * @param queryVec  查询向量（已归一化或提供 norm）
- * @param docVec    文档向量（已预归一化到 norm=1）
- * @param qNorm     查询向量的 L2 norm（可选——若已预计算则传入避免重复计算）
- */
-export function sparseCosineSimilarity(
-  queryVec: SparseVector,
-  docVec: SparseVector,
-  qNorm?: number,
-): number {
-  let dot = 0;
-  for (const [token, qw] of queryVec) {
-    const dw = docVec.get(token);
-    if (dw !== undefined) {
-      dot += qw * dw;
-    }
-  }
-  const norm = qNorm ?? Math.sqrt(
-    [...queryVec.values()].reduce((sum, w) => sum + w * w, 0),
-  );
-  if (norm === 0) return 0;
-  return dot / norm;
-}
-
-/**
- * 将稀疏向量 L2 归一化（原地修改）。
- */
-export function sparseL2Normalize(vec: SparseVector): void {
-  const norm = Math.sqrt(
-    [...vec.values()].reduce((sum, w) => sum + w * w, 0),
-  );
-  if (norm > 0) {
-    for (const [token, w] of vec) {
-      vec.set(token, w / norm);
-    }
-  }
-}
+// §5 已删除——SparseVector 工具随 BM25 退役。
+// 密集向量 cosineSimilarity 保留（§4），用于 embedding 检索。

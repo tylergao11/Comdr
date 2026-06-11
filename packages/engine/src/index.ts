@@ -33,10 +33,14 @@
  * @agent Agent 4 — 此文件由 Agent 4 维护
  */
 
-// ===== 主入口 =====
+// ============================================================================
+// §1 Public API — 外部包（ui、vscode）唯一导入
+// ============================================================================
 export { Engine, createEngine } from './loop.js';
 
-// ===== 子系统（供测试和高级组合使用） =====
+// ============================================================================
+// §2 Internal — 测试和高级组合使用
+// ============================================================================
 export { ReasoningManager } from './reasoning.js';
 export { PromptConstructor, emptyAnchor, anchorFromWindows } from './prompt.js';
 export { ContextManager } from './context.js';
@@ -52,7 +56,6 @@ export {
   summarizeSegmentText,
   summarizeDiff,
   deriveStableKey,
-  extractIntent,
   smartDisplayTruncate,
 } from './smart-truncate.js';
 
@@ -60,8 +63,7 @@ export {
 export { WorkingMemory } from './memory/working.js';
 export { EpisodicMemory, createEpisodicMemory } from './memory/episodic.js';
 export { SemanticMemory, createSemanticMemory } from './memory/semantic.js';
-export { ProceduralMemory } from './memory/procedural.js';
-export type { ProceduralPattern } from './memory/procedural.js';
+// ProceduralMemory 已删除——跨项目模式提取属于猜 LLM 行为。
 
 // ===== 自检管线 =====
 export { builtinRules, siblingConsistencyRule, fileSizeGuardRule } from './self-check.js';
@@ -79,18 +81,25 @@ export type { MCPToolResult } from './mcp-client.js';
 export { discoverComdrMd, discoverAndRetrieve, buildLSPWorldChunks, extractKeyFiles } from './world-model.js';
 export type { WorldModelChunk, WorldModelResult } from './world-model.js';
 
-// ===== 检索模块（BM25 + Contextual Prefix） =====
+// ===== Trigram 检索（当前主力——零模型、零正则） =====
+// ★ 迁入 @comdr/core 后以此处为统一出口
+export {
+  textToVector,
+  textsToVectors,
+  cosineSimilarity,
+  TrigramIndex,
+} from '@comdr/core';
+export type { IndexedDoc } from '@comdr/core';
+
+// ===== 旧 BM25 模块（@deprecated——仅 file_search 使用） =====
 export {
   tokenize,
   BM25Scorer,
   contextualPrefix,
-  hashToDim,
-  cosineSimilarity,
   l2Normalize,
 } from './retrieval.js';
 
-// ===== 工具检索 =====
-export { ToolRetriever, createToolRetriever } from './tool-retriever.js';
 export { generateRepoMap } from './repo-map.js';
 export { runSubAgent, fanOut, pipeline } from './subagent.js';
 export type { SubAgentOpts, SubAgentResult } from './subagent.js';
+export { SubAgentRegistry } from './subagent-registry.js';

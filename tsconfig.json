@@ -4,6 +4,8 @@
     { "path": "packages/core" },
     { "path": "packages/llm" },
     { "path": "packages/engine" },
+    { "path": "packages/audit" },
+    { "path": "packages/cocos-engine" },
     { "path": "packages/ui" },
     { "path": "packages/vscode" }
   ]

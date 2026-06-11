@@ -91,6 +91,7 @@ export class SemanticMemory {
     nodes: Map<string, SemanticNode>;
     edges: SemanticEdge[];
   };
+  // Node embedding 缓存已移除——trigram textToVector() 是纯函数，无需缓存。
 
   constructor() {
     this.semanticGraph = { nodes: new Map(), edges: [] };
@@ -159,8 +160,8 @@ export class SemanticMemory {
   }
 
   /**
-   * 注册符号定义（tree-sitter 解析后调用）
-   * TODO: Phase 4 接入 tree-sitter
+   * 注册符号定义（bootstrap 解析后调用）。
+   * ★ 原标记 @phase4 tree-sitter 预留，但实际已被 loop.ts bootstrap 使用。
    */
   registerSymbol(
     name: string,
@@ -171,8 +172,6 @@ export class SemanticMemory {
     const id = `${filePath}#${name}`;
     this.upsertNode(this.semanticGraph, id, type, name, filePath, location);
     this.upsertNode(this.entityGraph, id, type, name, filePath, location);
-
-    // 自动建立 file → symbol 的 defines 边
     const fileId = `file:${filePath}`;
     if (this.entityGraph.nodes.has(fileId)) {
       this.addEdge(this.entityGraph, fileId, id, 'defines');
@@ -180,8 +179,7 @@ export class SemanticMemory {
   }
 
   /**
-   * 注册符号引用（import/调用关系）
-   * TODO: Phase 4 接入 tree-sitter
+   * 注册符号引用（bootstrap 解析后调用）。
    */
   registerReference(
     fromName: string,
@@ -195,10 +193,6 @@ export class SemanticMemory {
     this.addEdge(this.entityGraph, fromId, toId, refType);
   }
 
-  // --------------------------------------------------------------------------
-  // 查询接口
-  // --------------------------------------------------------------------------
-
   /**
    * 查询文件的时间线
    */
@@ -207,8 +201,8 @@ export class SemanticMemory {
   }
 
   /**
-   * 查询符号的定义位置
-   * @phase4 预留——tree-sitter 解析填充节点后可用
+   * 查询符号的定义位置。
+   * ★ 原标记 @phase4 预留，但实际已被 tools/execute.ts SYMBOL_FIND 使用。
    */
   findDefinition(name: string): SemanticNode | undefined {
     for (const [, node] of this.semanticGraph.nodes) {
@@ -220,8 +214,7 @@ export class SemanticMemory {
   }
 
   /**
-   * 查询文件的依赖关系（被谁 import/调用）
-   * @phase4 预留——entity graph 填充边后可用
+   * 查询文件的依赖关系（被谁 import/调用）。
    */
   getDependents(filePath: string): string[] {
     const fileId = `file:${filePath}`;
@@ -252,7 +245,7 @@ export class SemanticMemory {
     const candidates = this.extractCandidates(input);
     if (candidates.length === 0) return '';
 
-    // Step 1: 在 Semantic + Entity Graph 中匹配
+    // Step 1: 子串匹配（快速召回）
     const matchedNodes: SemanticNode[] = [];
     const allNodes = [
       ...this.semanticGraph.nodes.values(),
@@ -274,6 +267,9 @@ export class SemanticMemory {
         }
       }
     }
+
+    // ★ 重排序已删——子串召回够做首轮引导，LLM 用搜索工具自己深化。
+    // 只保留 BFS 邻居扩展。
 
     // Step 2: BFS 找邻居（合并两个图的边）
     const allEdges = [

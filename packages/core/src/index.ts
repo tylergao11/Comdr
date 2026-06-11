@@ -52,6 +52,10 @@ export type {
   ILSPBridge,
   ContractVerification,
   ContractVerifier,
+  ISubAgent,
+  SubAgentManifest,
+  SubAgentFactory,
+  SubAgentToolResult,
 } from './contracts.js';
 
 // ===== 契约错误类（runtime） =====
@@ -74,6 +78,19 @@ export {
   EventLogger,
   createEventLogger,
 } from './logging.js';
+
+// ===== Trigram 向量检索（零依赖纯函数——engine + audit 共用） =====
+export {
+  textToVector,
+  textsToVectors,
+  cosineSimilarity,
+  TrigramIndex,
+  TRIGRAM_DEFAULT_DIMS,
+} from './trigram.js';
+export type { IndexedDoc } from './trigram.js';
+
+// ===== 反馈机制 =====
+export { computeCredit } from './types.js';
 
 // ===== 通用工具函数 =====
 

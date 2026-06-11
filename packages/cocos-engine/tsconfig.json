@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "verbatimModuleSyntax": false,
+    "noUncheckedIndexedAccess": false,
+    "isolatedModules": false
+  },
+  "include": ["src/**/*.ts"],
+  "references": [
+    { "path": "../core" }
+  ]
+}

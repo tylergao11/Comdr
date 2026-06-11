@@ -285,23 +285,7 @@ export interface ToolExecuteOptions {
   timeoutMs: number;
 }
 
-/**
- * Agent 3 返回的执行结果（原生层 → 已合并进 ToolResult）
- *
- * @deprecated 使用 ToolResult 代替。INativeTools.execute() 现在直接返回 ToolResult。
- *   此类型保留仅用于文档引用，不要在新代码中导入。
- *   移除时间线: Phase 2 重构时删除。
- * @contract Agent 3 → Agent 4（仅文档引用）
- */
-export interface ToolExecuteResult {
-  ok: boolean;
-  content: string | null;
-  diffSummary?: string;
-  snapshotId?: string;
-  /** 结构化错误分类——工具错误的唯一分类维度 */
-  errorCategory?: ErrorCategory;
-}
-
+// ToolExecuteResult 已删除——INativeTools.execute() 直接返回 ToolResult。
 // ============================================================================
 // §4 MCP Server 状态（共享 UI 类型）
 // ============================================================================
@@ -474,8 +458,21 @@ export interface StateEntry {
   text: string;
   /** 创建轮次 */
   turn: number;
-  /** ★ 重要性级别——用于加权淘汰（非纯 LRU） */
-  importance?: ImportanceLevel;
+  /** ★ 关联的搜索词——LLM 用 file_grep/file_search 搜过的 query */
+  searches: string[];
+  /** ★ 该文件上的操作成功次数 */
+  successCount: number;
+  /** ★ 该文件上的操作失败次数 */
+  failCount: number;
+}
+
+/**
+ * ★ 计算信用分——高信用保留、低信用淘汰、负信用不注入。
+ *   credit = successCount * 2 - failCount * 3 + recency
+ */
+export function computeCredit(entry: StateEntry, currentTurn: number): number {
+  const recency = 1.0 - (currentTurn - entry.turn) / 10; // 0..1, 越近越高
+  return entry.successCount * 2 - entry.failCount * 3 + recency;
 }
 
 /**
@@ -490,8 +487,6 @@ export interface IntentEntry {
   why: string;
   /** 创建轮次 */
   turn: number;
-  /** ★ 重要性级别——用于加权淘汰 */
-  importance?: ImportanceLevel;
 }
 
 // ============================================================================
@@ -698,35 +693,8 @@ export type TaskType =
   | 'architect'
   | 'orchestrate';
 
-/**
- * 任务规划——Phase 2 层级任务分解
- *
- * ★ Phase 1（当前）：使用单层 Route 做工具过滤 + thinking 模式选择。
- *   规划器只返回 Route，不分解为多步骤。
- *
- * ★ Phase 2（规划中）：将用户输入分解为 PlanStep[]，
- *   按 dependencies 顺序执行，每步可有独立的 taskType 和工具白名单。
- *
- * @contract Agent 4 内部使用（Phase 2 预留）
- */
-export interface Plan {
-  goal: string;
-  steps: PlanStep[];
-  /** 步骤间依赖: stepIndex → [依赖的 stepIndex]。★ Record 而非 Map——保证 JSON 序列化不丢失 */
-  dependencies: Record<number, number[]>;
-  estimatedTokens: number;
-}
-
-export interface PlanStep {
-  index: number;
-  description: string;
-  taskType: TaskType;
-  /** 预估所需工具 */
-  toolsNeeded: string[];
-  /** 完成标准: 一句话描述 */
-  completionCriterion: string;
-}
-
+// Plan/PlanStep 已删除——Phase 2 层级任务分解过度设计。
+// LLM 自己规划步骤，编排层不替 LLM 做任务分解。
 // ============================================================================
 // §12 Skills 系统
 // ============================================================================
@@ -792,15 +760,8 @@ export interface TokenUsage {
 // §15 路由与终止系统
 // ============================================================================
 
-/**
- * 任务路由结果——规划器输出
- * @contract Agent 4 内部使用
- */
-export interface Route {
-  taskType: TaskType;
-  thinking: ThinkingConfig;
-  allowedTools: string[];
-}
+// Route 已删除——keyword-based MODE_RULES 退役。
+// ThinkingConfig 直接由 TaskPlanner.defaultThinking() 返回。
 
 /**
  * 终止原因——10 种引擎退出路径
@@ -877,6 +838,8 @@ export interface EpisodeSummary {
   id: string;
   timestamp: string;
   task: string;
+  /** ★ 任务类型——用于 Task-Type-Aware 检索 boost */
+  taskType?: TaskType;
   outcome: string | null;
   /** 结构化摘要（重用 context.ts 输出） */
   structuredSummary: StructuredSummary | null;

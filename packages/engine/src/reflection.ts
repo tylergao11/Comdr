@@ -22,14 +22,12 @@ import type {
   ToolResult,
   Message,
   SessionState,
-  Route,
   LSPDiagnostic,
   DiagnosticSnapshot,
 } from '@comdr/core/types';
 import type { IDeepSeekClient } from '@comdr/core/contracts';
 import {
   SYSTEM,
-  ALL_TOOLS_SENTINEL,
   MESSAGE_ROLE,
   THINKING_TYPE,
   THINKING_EFFORT,
@@ -125,15 +123,16 @@ export class ReflectionEngine {
   /**
    * 规则驱动的执行前预判（不调 LLM）
    *
-   * 检查三项:
+   * 检查:
    *   1. 循环检测: 同一 tool + 同一 args 连续 ≥3 次 → abort
-   *   2. 范围漂移: 操作超出当前 task 定义的范围 → warning
-   *   3. 空调用: tool name 或 args 为空 → skip
+   *   2. 空调用: tool name 或 args 为空 → skip
+   *
+   * ★ 范围漂移检测已删除——依赖已删除的 keyword-based MODE_RULES。
+   *   工具全量发送后，范围漂移检测是永久 no-op。
    */
   intra(
     call: ToolCall,
     session: SessionState,
-    route: Route,
   ): IntraReflection {
     const signature = this.callSignature(call);
 
@@ -156,29 +155,6 @@ export class ReflectionEngine {
       };
     }
 
-    // 检查 2: 范围漂移（★ 升级制：连续3轮 → abort）
-    const scopeDrift = this.detectScopeDrift(call, route);
-    if (scopeDrift) {
-      this.scopeDriftCount++;
-      if (this.scopeDriftCount >= SYSTEM.LOOP_DETECTION_THRESHOLD) {
-        return {
-          skip: true,
-          skipReason: REFLECTION_MESSAGES.SCOPE_DRIFT_ESCALATED,
-          abort: true,
-          abortReason: TERMINATION_REASON.SCOPE_DRIFT,
-          loopDetected: false,
-          scopeDrift: true,
-          warning: REFLECTION_MESSAGES.SCOPE_DRIFT_ESCALATED,
-        };
-      }
-      return {
-        skip: false,
-        abort: false,
-        loopDetected: false,
-        scopeDrift: true,
-        warning: REFLECTION_MESSAGES.SCOPE_DRIFT,
-      };
-    }
     // Reset scope drift counter on clean turn
     this.scopeDriftCount = 0;
 
@@ -240,15 +216,7 @@ export class ReflectionEngine {
     return false;
   }
 
-  /**
-   * 检测范围漂移：
-   *   - 操作的文件路径是否与当前任务类型匹配
-   *   - 当前实现：简单检查——非 all 模式下的工具名是否在允许列表中
-   */
-  private detectScopeDrift(call: ToolCall, route: Route): boolean {
-    if (route.allowedTools.includes(ALL_TOOLS_SENTINEL)) return false;
-    return !route.allowedTools.includes(call.function.name);
-  }
+  // detectScopeDrift 已删除——Route 不再包含 allowedTools，工具全量发送。
 
   // --------------------------------------------------------------------------
   // Inter-reflection（执行后审查）

@@ -18,7 +18,6 @@ export {
   SYMBOL_FIND,
   SHELL_TEST,
   ADVANCED_TOOLS,
-  ADVANCED_TOOL_MAP,
 } from './advanced-tools.js';
 
 export { isAdvancedTool, executeAdvancedTool } from './execute.js';
