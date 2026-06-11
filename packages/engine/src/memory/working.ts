@@ -16,7 +16,16 @@
  */
 
 import type { StateEntry, IntentEntry, SessionState, ToolCall, ToolResult } from '@comdr/core/types';
-import { SYSTEM, computeCredit } from '@comdr/core';
+import { SYSTEM } from '@comdr/core';
+
+/**
+ * 计算信用分——高信用保留、低信用淘汰、负信用不注入。
+ *   credit = successCount * 2 - failCount * 3 + recency
+ */
+function computeCredit(entry: StateEntry, currentTurn: number): number {
+  const recency = 1.0 - (currentTurn - entry.turn) / 10;
+  return entry.successCount * 2 - entry.failCount * 3 + recency;
+}
 import { safeParseArgs } from '../utils.js';
 import { deriveStableKey } from '../smart-truncate.js';
 
@@ -141,50 +150,6 @@ export class WorkingMemory {
       git_add: 'add', git_commit: 'commit', git_revert: 'revert',
     };
     return map[toolName] ?? toolName.replace(/_/g, '');
-  }
-
-  // --------------------------------------------------------------------------
-  // Intent Window
-  // --------------------------------------------------------------------------
-
-  updateIntentWindow(call: ToolCall, result: ToolResult, session: SessionState): void {
-    const key = this.deriveKey(call);
-    const why = this.buildIntent(call, result);
-    const entry: IntentEntry = { key, why, turn: session.turn };
-
-    if (this.intentMap.has(key)) {
-      this.intentMap.delete(key);
-    } else if (this.intentMap.size >= SYSTEM.MAX_INTENT_WINDOW_SIZE) {
-      const first = this.intentMap.keys().next().value;
-      if (first) this.intentMap.delete(first);
-    }
-    this.intentMap.set(key, entry);
-  }
-
-  private buildIntent(call: ToolCall, result: ToolResult): string {
-    const args = safeParseArgs(call.function.arguments);
-    const path = typeof args.path === 'string' ? args.path : undefined;
-    const verb = this.toolVerb(call.function.name);
-    const base = path ? `${verb}: ${path}` : `${call.function.name}`;
-    return result.ok ? base : `❌ ${base}`;
-  }
-
-  private toolVerb(toolName: string): string {
-    const verbMap: Record<string, string> = {
-      file_read: 'read', file_write: 'write', file_edit: 'edit',
-      file_delete: 'delete', file_ls: 'list', file_glob: 'search',
-      file_grep: 'search', shell_bash: 'run', shell_exec: 'run',
-      git_status: 'status', git_diff: 'diff', git_log: 'log',
-      git_add: 'stage', git_commit: 'commit', git_revert: 'revert',
-      lsp_symbols: 'find symbols', lsp_diagnostics: 'check diagnostics',
-      lsp_structure: 'analyze structure',
-    };
-    if (verbMap[toolName]) return verbMap[toolName];
-    if (toolName.startsWith('mcp__')) {
-      const clean = toolName.replace(/^mcp__/, '').replace(/__/g, ' → ');
-      return `call ${clean}`;
-    }
-    return toolName.replace(/_/g, ' ');
   }
 
   // --------------------------------------------------------------------------

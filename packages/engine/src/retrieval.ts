@@ -1,12 +1,8 @@
 /**
- * retrieval.ts — 已废弃
+ * retrieval.ts — BM25 全文检索
  *
- * ★ @deprecated BM25 检索已被 embed.ts (ONNX embedding) 替代。
- *   episodic.ts / world-model.ts / tool-retriever.ts 已迁移。
- *   tokenize / BM25Scorer / contextualPrefix 仅保留供 tools/execute.ts 的
- *   file_search（本地文件全文搜索——BM25 对此场景仍然适用）。
- *
- * 新代码请使用 embed.ts: embedText() / embedBatch() / cosineSimilarity()
+ * ★ file_search 使用的 BM25 关键词检索引擎。
+ *   episodic / world-model / tool_search 使用词级匹配。
  *
  * @agent Agent 4 — 此文件由 Agent 4 维护
  */

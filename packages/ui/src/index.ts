@@ -1,8 +1,7 @@
 /**
  * @comdr/ui — Agent 5（交互层）
  *
- * 提供三种交互入口：
- *   - TUI 终端界面（基于 Ink + React）
+ * 提供两种交互入口：
  *   - MCP Server（JSON-RPC 2.0 over stdio）
  *   - HTTP/WebSocket Server（IDE 集成）
  *
@@ -12,10 +11,6 @@
  *
  * @agent Agent 5 — 此文件是包的公开 API 入口
  */
-
-// ===== TUI =====
-import { startTUI, streamToCLI } from './tui/index.js';
-export { startTUI, streamToCLI };
 
 // ===== MCP Server =====
 import {
@@ -49,31 +44,22 @@ import type { ContractVerifier, ContractVerification } from '@comdr/core/contrac
  *
  * 验证条件：
  *   1. 所有公开函数可被 import
- *   2. TUI 启动不抛异常（需要有终端环境）
- *   3. MCP Server 能正确处理 JSON-RPC
- *   4. App Server 能绑定端口
- *
- * 注意：TUI 需要在真实终端中测试，
- * Contract C 的完整验证依赖 Agent 4 提供真实 IEngine。
+ *   2. MCP Server 能正确处理 JSON-RPC
+ *   3. App Server 能绑定端口
  */
 export const verifyContract: ContractVerifier = (): ContractVerification => {
   const failures: string[] = [];
 
-  // 检查运行时导出是否存在
   if (typeof startMCPServer !== 'function') {
     failures.push('startMCPServer not exported');
   }
   if (typeof startAppServer !== 'function') {
     failures.push('startAppServer not exported');
   }
-  if (typeof startTUI !== 'function') {
-    failures.push('startTUI not exported');
-  }
   if (typeof createMCPHandler !== 'function') {
     failures.push('createMCPHandler not exported');
   }
 
-  // 检查常量导出
   if (!TOOL_DEFINITION || TOOL_DEFINITION.name !== 'comdr-code') {
     failures.push('TOOL_DEFINITION incorrect or missing');
   }

@@ -11,7 +11,7 @@
  */
 
 import * as vscode from 'vscode';
-import { Engine, createEngine } from '@comdr/engine';
+import { Engine, createEngine, registerBuiltinSubAgents } from '@comdr/engine';
 import { loadConfig, type AgentConfig } from '@comdr/core';
 import { DeepSeekClient } from '@comdr/llm';
 import type { IDeepSeekClient, IShadowWorkspace, ILSPBridge } from '@comdr/core/contracts';
@@ -137,6 +137,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         : undefined;
       engineInstance = createEngine(llm, config, null, null, contextLLM);
       engine = engineInstance;
+
+      // ★ 注册内置子智能体
+      await registerBuiltinSubAgents(engineInstance);
       debugLog('Engine created OK');
     } else {
       debugLog('Skipping Engine creation — no valid config, will show setup UI');
@@ -147,6 +150,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     // 5. 创建 LSP Bridge
     const lspBridge: ILSPBridge = new LSPBridge(shadowWS);
+
+    // ★ 连接 LSP Bridge → Engine self-correct 管线
+    if (engine) {
+      engine.setLSPBridge(lspBridge);
+    }
 
     // 6. 创建 Shadow Workspace Orchestrator
     new ShadowWorkspaceOrchestrator(shadowWS, projectPath);
@@ -181,6 +189,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const newLlm = new DeepSeekClient(mergedConfig.llm);
           const newEngine = createEngine(newLlm, mergedConfig, null, null);
           engine = newEngine;
+
+          // ★ 连接 LSP Bridge
+          newEngine.setLSPBridge(lspBridge);
+
+          // ★ 注册内置子智能体
+          await registerBuiltinSubAgents(newEngine);
           return newEngine;
         }
       : null;

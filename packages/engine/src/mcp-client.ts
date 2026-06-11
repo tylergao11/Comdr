@@ -133,10 +133,17 @@ export class MCPClient {
         status.error = err.message;
       });
 
-      // stdout 数据收集
+      // stdout 数据收集（带 1MB 上限防 OOM）
       if (proc.stdout) {
         proc.stdout.on('data', (chunk: Buffer) => {
           const buf = this.buffers.get(cfg.name) ?? '';
+          // ★ 超过 1MB 上限 → 断开连接，防止恶意/故障 server 撑爆内存
+          if (buf.length > 1_000_000) {
+            status.status = SERVER_STATUS.ERROR;
+            status.error = `stdout buffer exceeded 1MB limit (${buf.length} bytes). Disconnecting.`;
+            proc.kill();
+            return;
+          }
           const newBuf = buf + chunk.toString('utf-8');
           this.buffers.set(cfg.name, newBuf);
           this.tryParseResponses(cfg.name);

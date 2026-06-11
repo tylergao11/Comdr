@@ -41,6 +41,12 @@ export {
   LSP_SEVERITY,
 } from './types.js';
 
+// ===== Tool Blueprint 常量 =====
+export {
+  EMPTY_LAYER_COUNTS,
+  TOOL_EXPLORE_NAME,
+} from './tool-blueprint.js';
+
 // ===== 契约接口 =====
 export type {
   IDeepSeekClient,
@@ -57,6 +63,19 @@ export type {
   SubAgentFactory,
   SubAgentToolResult,
 } from './contracts.js';
+
+// ===== Tool Blueprint 类型 =====
+export type {
+  BlueprintLayer,
+  ToolDomain,
+  ToolEffect,
+  BlueprintEdgeType,
+  ToolBlueprintNode,
+  ToolBlueprintEdge,
+  ToolBlueprint,
+  ToolBlueprintExpansion,
+  BlueprintCompiler,
+} from './tool-blueprint.js';
 
 // ===== 契约错误类（runtime） =====
 export {
@@ -79,18 +98,8 @@ export {
   createEventLogger,
 } from './logging.js';
 
-// ===== Trigram 向量检索（零依赖纯函数——engine + audit 共用） =====
-export {
-  textToVector,
-  textsToVectors,
-  cosineSimilarity,
-  TrigramIndex,
-  TRIGRAM_DEFAULT_DIMS,
-} from './trigram.js';
-export type { IndexedDoc } from './trigram.js';
-
 // ===== 反馈机制 =====
-export { computeCredit } from './types.js';
+// computeCredit moved to @comdr/engine memory/working.ts
 
 // ===== 通用工具函数 =====
 

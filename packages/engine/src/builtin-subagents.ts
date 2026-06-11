@@ -28,7 +28,6 @@ import type { ISubAgent } from '@comdr/core/contracts';
 export async function registerBuiltinSubAgents(engine: IEngine): Promise<void> {
   const results = await Promise.allSettled([
     registerAudit(engine),
-    registerCocosEngine(engine),
   ]);
 
   for (const result of results) {
@@ -58,18 +57,5 @@ async function registerAudit(engine: IEngine): Promise<void> {
     process.stderr.write(`[comdr] sub-agent registered: ${agent.manifest.name} v${agent.manifest.version}\n`);
   } catch (err) {
     process.stderr.write(`[comdr] audit sub-agent unavailable: ${(err as Error).message}\n`);
-  }
-}
-
-async function registerCocosEngine(engine: IEngine): Promise<void> {
-  try {
-    const { createSubAgent } = await import('@comdr/cocos-engine');
-    const agent: ISubAgent = createSubAgent({
-      projectRoot: (engine as any).projectRoot || process.cwd(),
-    });
-    engine.registerSubAgent(agent);
-    process.stderr.write(`[comdr] sub-agent registered: ${agent.manifest.name} v${agent.manifest.version}\n`);
-  } catch (err) {
-    process.stderr.write(`[comdr] cocos-engine sub-agent unavailable: ${(err as Error).message}\n`);
   }
 }

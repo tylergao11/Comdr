@@ -59,15 +59,14 @@ export class SessionStore {
 
     let json = JSON.stringify(session, null, 2);
     if (json.length > MAX_SESSION_FILE_SIZE && session.messages.length > 0) {
-      // 裁剪旧的大内容：保留最近 N 条完整输出。
-      // ★ tool/assistant/user 三类消息均需处理，防止用户输入过长导致文件超限。
+      // ★ 深拷贝 messages 再截断——绝不能原地篡改运行时消息
       const KEEP = SYSTEM.SESSION_KEEP_TOOL_RESULTS;
-      const messages = session.messages;
+      const trimmedMessages = session.messages.map((m) => ({ ...m, content: m.content }));
       let toolResultCount = 0;
       let assistantCount = 0;
       let userCount = 0;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i]!;
+      for (let i = trimmedMessages.length - 1; i >= 0; i--) {
+        const msg = trimmedMessages[i]!;
         if (!msg.content || msg.content.length <= SYSTEM.SESSION_TRIM_CONTENT_THRESHOLD) continue;
 
         if (msg.role === 'tool') {
@@ -78,7 +77,6 @@ export class SessionStore {
         } else if (msg.role === 'assistant') {
           assistantCount++;
           if (assistantCount > KEEP) {
-            // ★ assistant 消息同样使用 summarizeToolOutput（保留语义），而非硬截断
             msg.content = summarizeToolOutput(msg.content, undefined, SYSTEM.SESSION_TRIM_CONTENT_THRESHOLD);
           }
         } else if (msg.role === 'user') {
@@ -88,7 +86,7 @@ export class SessionStore {
           }
         }
       }
-      json = JSON.stringify(session, null, 2);
+      json = JSON.stringify({ ...session, messages: trimmedMessages }, null, 2);
       if (json.length > MAX_SESSION_FILE_SIZE) {
         // 依然过大 → 写警告但不阻止保存
         console.warn(

@@ -19,7 +19,9 @@
   "dependencies": {
     "@comdr/core": "workspace:*",
     "@comdr/llm": "workspace:*",
-    "@comdr/tools": "workspace:*"
+    "@comdr/tools": "workspace:*",
+    "@comdr/audit": "workspace:*",
+    "@comdr/cocos-engine": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.8.0"

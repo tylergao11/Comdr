@@ -228,9 +228,23 @@ export interface IEngine {
   resumeSession(sessionId: string): Promise<SessionState>;
 
   /**
+   * ★ 注册子智能体。外部在 Engine 启动后调用。
+   *   子智能体工具以 `prefix__toolName` 格式暴露给 LLM。
+   */
+  registerSubAgent(agent: ISubAgent): void;
+
+  /**
    * 中断当前执行
    */
   abort(): void;
+
+  /**
+   * ★ 工具确认——LLM 调用了需要审批的工具，UI 让用户确认后回调。
+   *
+   * @param callId  工具调用 ID（来自 AgentEventConfirmRequest.callId）
+   * @param approved  true=批准执行，false=拒绝（工具跳过）
+   */
+  confirm(callId: string, approved: boolean): void;
 }
 
 // ============================================================================
@@ -525,6 +539,31 @@ export interface SubAgentManifest {
   version: string;
   /** 工具名前缀——子智能体的工具注册为 "name__toolName" */
   toolPrefix: string;
+
+  /**
+   * ★ 可选——工具拓扑元数据。
+   *
+   * Key = 工具名（不含前缀——编译器自动补 prefix）。
+   * 子 agent 声明自身工具与主工具世界的关系，编译器在 Blueprint 中解析边。
+   *
+   * 不提供时 → 编译器使用默认分类（operate/mcp/network）。
+   */
+  toolTopology?: Record<string, {
+    /** 所在层（默认 operate） */
+    layer?: import('./tool-blueprint.js').BlueprintLayer;
+    /** 功能域（默认 subagent） */
+    domain?: import('./tool-blueprint.js').ToolDomain;
+    /** 工具效果（默认 network） */
+    effect?: import('./tool-blueprint.js').ToolEffect;
+    /** 消费哪些工具的输出（工具名，自动补同 agent 前缀） */
+    consumes?: string[];
+    /** 哪些工具能验证此工具的结果 */
+    verifiedBy?: string[];
+    /** 替代工具 */
+    alternatives?: string[];
+    /** 工作流提示 */
+    workflowHints?: string[];
+  }>;
 }
 
 /**

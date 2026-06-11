@@ -371,6 +371,7 @@ impl Tool for GitAddTool {
             "type": "object",
             "properties": {
                 "files": {
+                    "type": ["string", "array"],
                     "description": "File path(s) to stage. String for single file, array for multiple."
                 }
             },

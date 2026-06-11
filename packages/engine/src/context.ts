@@ -187,30 +187,6 @@ export class ContextManager {
     });
   }
 
-  /**
-   * 从 messages 中推断 tool result 对应的工具名。
-   * 通过 tool_call_id 反向查找前面的 assistant + tool_calls 消息。
-   */
-  private inferToolName(messages: Message[], toolMsg: Message): string {
-    const callId = toolMsg.tool_call_id;
-    if (!callId) return 'unknown';
-    // 往前找包含此 callId 的 assistant 消息
-    for (let i = messages.indexOf(toolMsg) - 1; i >= 0; i--) {
-      const msg = messages[i]!;
-      if (msg.role === MESSAGE_ROLE.ASSISTANT && msg.tool_calls) {
-        for (const tc of msg.tool_calls) {
-          if (tc.id === callId) return tc.function.name;
-        }
-      }
-    }
-    return 'unknown';
-  }
-
-  /** 机械截断 tool result——超过阈值就截首行。 */
-  private summarizeToolResult(content: string): string {
-    return summarizeToolOutput(content);
-  }
-
   // --------------------------------------------------------------------------
   // Stage 2: Anchor — 结构化锚定摘要
   // --------------------------------------------------------------------------
@@ -714,4 +690,6 @@ function findLast<T>(
  * Fallback system prompt（压缩后使用，不含完整规则）
  */
 const SYSTEM_PROMPT_FALLBACK =
-  'You are Comdr, a coding agent. Continue working on the task.';
+  'You are Comdr, a coding agent. Continue working on the task.\n' +
+  'Use file_read (defaults to summary), file_edit, file_write, file_grep, file_glob, shell_bash, and other tools.\n' +
+  'Call tool_explore if you need to rediscover tool details.';

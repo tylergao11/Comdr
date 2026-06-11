@@ -336,6 +336,13 @@ function readCached(filePath: string, ctx: CheckContext): string | null {
   }
 }
 
+/**
+ * ★ 清除文件缓存——write/edit 操作后调用，确保 self-check 读到新内容而非旧缓存。
+ */
+export function invalidateFileCache(filePath: string, ctx: CheckContext): void {
+  ctx.fileCache.delete(filePath);
+}
+
 // ============================================================================
 // §6 内置规则
 // ============================================================================

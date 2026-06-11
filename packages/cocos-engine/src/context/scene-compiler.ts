@@ -105,6 +105,18 @@ export function compileSceneTree(
     fileIdMap.set(n.fileId, n);
   }
 
+  // 3b. 建立 parent map: child fileId → parent fileId（focus 模式回溯祖先链用）
+  const parentMap = new Map<string, string>();
+  for (const raw of objs) {
+    if (raw.__type__ !== 'cc.Node' || raw.__deleted__) continue;
+    if (!raw._parent) continue;
+    const childFid = getFileIdFromNode(raw, idMap);
+    const parentRaw = idMap.get(raw._parent.__id__);
+    if (!parentRaw || !childFid) continue;
+    const parentFid = getFileIdFromNode(parentRaw, idMap);
+    if (parentFid) parentMap.set(childFid, parentFid);
+  }
+
   // 4. 找根节点（_parent 为 null 或 __id__ 为 1 的 Node）
   let roots = nodes.filter((n) => {
     const raw = findNodeRaw(objs, n.fileId, idMap);
@@ -120,20 +132,40 @@ export function compileSceneTree(
     });
   }
 
-  // 5. 如果有 focus，重新定根
+  // 5. 如果有 focus，构建祖先链 + 焦点子树
   let rootNodes = roots;
+  let focusChain: NodeInfo[] | undefined;
   if (focus && fileIdMap.has(focus)) {
-    // TODO: 实现 focus 模式 — 返回祖先链 + 子树
-    // 当前版本：直接从 focus 节点开始
     const focused = fileIdMap.get(focus)!;
-    rootNodes = [focused];
+
+    // 5a. 回溯祖先链（从 focus 往上走到根）
+    const chain: NodeInfo[] = [focused];
+    let current = focus;
+    while (parentMap.has(current)) {
+      const parentFid = parentMap.get(current)!;
+      const parentNode = fileIdMap.get(parentFid);
+      if (!parentNode || chain.some((n) => n.fileId === parentNode.fileId)) break; // 防止环
+      chain.unshift(parentNode);
+      current = parentFid;
+    }
+
+    // 5b. 构建骨架树：每层祖先只保留链上下一个子节点，其余剪枝
+    //   最顶层祖先 → ... → focus（完整展开）
+    for (let i = 0; i < chain.length - 1; i++) {
+      const ancestor = chain[i]!;
+      const descendant = chain[i + 1]!;
+      ancestor.children = [descendant];
+    }
+    rootNodes = [chain[0]!];
+    focusChain = chain;
   }
 
   if (rootNodes.length === 0) return undefined;
 
   // 6. 编译为 CompiledNode 树
   const root = rootNodes[0];
-  const compiled = compileNode(root, 0, depth, detail);
+  const focusDepth = focusChain ? focusChain.length - 1 : undefined;
+  const compiled = compileNode(root, 0, depth, detail, focusDepth);
   return compiled;
 }
 
@@ -294,19 +326,27 @@ function stripUnderscore(name: string): string {
   return name.startsWith('_') ? name.slice(1) : name;
 }
 
-/** 递归编译 CompiledNode */
+/**
+ * 递归编译 CompiledNode。
+ *
+ * @param focusDepth  焦点节点所在的深度——祖先层（depth < focusDepth）只给骨架
+ */
 function compileNode(
   info: NodeInfo,
   depth: number,
   maxDepth: number | 'all',
   detail: 'structure' | 'full',
+  focusDepth?: number,
 ): CompiledNode {
+  // ★ focus 模式：祖先节点 → skeleton（仅名字 + 组件类型，无属性值）
+  const isAncestor = focusDepth !== undefined && depth < focusDepth;
+  const effectiveDetail = isAncestor ? 'structure' : detail;
+
   const compiledComps: CompiledComponentSummary[] = info.components.map((c) => ({
     type: c.type,
-    keyProps: detail === 'full' ? c.props : {},
+    keyProps: effectiveDetail === 'full' ? c.props : {},
   }));
 
-  // 构建路径（编译时由父级注入，此处为根调用）
   const compiled: CompiledNode = {
     fileId: info.fileId,
     name: info.name,
@@ -322,7 +362,7 @@ function compileNode(
 
   if (shouldDescend) {
     for (const child of info.children) {
-      compiled.children.push(compileNode(child, childDepth, maxDepth, detail));
+      compiled.children.push(compileNode(child, childDepth, maxDepth, detail, focusDepth));
     }
   }
 

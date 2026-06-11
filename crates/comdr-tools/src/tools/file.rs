@@ -6,12 +6,115 @@
 ///   - `grep` must handle large codebases efficiently
 ///   - `read` supports summary mode (symbol list) and selector mode (symbol extraction)
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use crate::tools::{Tool, ToolContext, ToolOutput, ToolPermission};
 
+/// ★ Compute an 8-char hex anchor hash from text content.
+/// Normalizes (trim + collapse whitespace) before hashing so the anchor
+/// is robust to minor formatting differences.
+fn compute_anchor(text: &str) -> String {
+    let normalized: String = text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    normalized.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
+}
+
+// ============================================================================
+// Anchor table — session-level hash → (path, text) mapping
+// ============================================================================
+
+#[derive(Clone)]
+struct AnchorEntry {
+    path: String,
+    text: String,
+}
+
+static ANCHOR_TABLE: std::sync::LazyLock<Mutex<HashMap<String, AnchorEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn store_anchor(path: &str, text: &str) -> String {
+    let hash = compute_anchor(text);
+    let mut table = ANCHOR_TABLE.lock().unwrap();
+    table.insert(hash.clone(), AnchorEntry {
+        path: path.to_string(),
+        text: text.to_string(),
+    });
+    hash
+}
+
+fn resolve_anchor(hash: &str) -> Option<AnchorEntry> {
+    let table = ANCHOR_TABLE.lock().unwrap();
+    table.get(hash).cloned()
+}
+
+fn clear_anchors_for_file(path: &str) {
+    let mut table = ANCHOR_TABLE.lock().unwrap();
+    table.retain(|_, entry| entry.path != path);
+}
+
 /// Default max grep results returned.
 const DEFAULT_MAX_RESULTS: usize = 250;
+
+/// ★ Resolve path: if relative, join with project root. Otherwise use as-is.
+/// This lets LLM use 'README.md' instead of guessing absolute paths from training data.
+fn resolve_path(path: &str, project_root: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    // Already absolute: starts with / or contains drive letter (C:)
+    if normalized.starts_with('/') || normalized.chars().nth(1) == Some(':') {
+        return normalized;
+    }
+    // Relative → join with project root
+    let root = project_root.replace('\\', "/").trim_end_matches('/').to_string();
+    format!("{}/{}", root, normalized.trim_start_matches('/'))
+}
+
+/// ★ Validate and resolve path — used by destructive tools (write, edit, delete).
+/// Resolves the path against project_root, then canonicalizes to detect
+/// path traversal attacks (symlinks, .. components escaping project root).
+///
+/// For new files that don't exist yet: canonicalizes the parent directory,
+/// joins the filename, and checks the result is within project_root.
+fn validate_and_resolve_path(raw_path: &str, project_root: &str) -> Result<String, String> {
+    let resolved = resolve_path(raw_path, project_root);
+    let path = std::path::Path::new(&resolved);
+    let root = std::path::Path::new(project_root);
+
+    let canonical_root = std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf());
+
+    let canonical_path = if path.exists() {
+        std::fs::canonicalize(path)
+    } else if let Some(parent) = path.parent() {
+        if parent.exists() {
+            std::fs::canonicalize(parent)
+                .map(|cp| cp.join(path.file_name().unwrap_or_default()))
+        } else {
+            // Parent doesn't exist either — create_dir_all will handle it later.
+            // Textual check: resolved path must start with canonical root.
+            Ok(path.to_path_buf())
+        }
+    } else {
+        return Err("invalid path: no parent directory".to_string())
+    }.map_err(|e| format!("failed to resolve path: {}", e))?;
+
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(format!(
+            "Path traversal blocked: '{}' resolves outside project root",
+            raw_path
+        ));
+    }
+
+    Ok(canonical_path.to_string_lossy().replace('\\', "/"))
+}
+
 /// Default context lines for selector mode (±N lines around target).
 const SELECTOR_CONTEXT_LINES: usize = 10;
 use serde_json::Value;
@@ -39,7 +142,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file. Modes: 'full' (default, supports offset/limit), 'summary' (structured symbol list — functions, classes, imports), 'selector' (specific symbol definition with ±10 context lines). Use summary for large files to save context, selector to jump to a function/class."
+        "Read a file. Defaults to 'summary' (skeleton: symbol list). Use 'full' for complete file content, 'blueprint' for AOCI-style overview with dependencies, 'selector' to jump to a specific symbol. offset/limit works in all modes. Path can be relative to project root (e.g. 'README.md', 'src/main.ts')."
     }
 
     fn parameters(&self) -> Value {
@@ -48,25 +151,27 @@ impl Tool for FileReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the file to read"
+                    "description": "Path to the file. Absolute or relative to project root (e.g. 'README.md')"
                 },
                 "mode": {
                     "type": "string",
-                    "description": "Read mode: 'full' (default), 'summary' (symbol list), 'selector' (specific symbol), 'blueprint' (AOCI-style structured overview: imports, exports, dependencies)",
-                    "enum": ["full", "summary", "selector", "blueprint"],
-                    "default": "full"
+                    "description": "Read mode: 'summary' (default, skeleton), 'full' (complete file), 'blueprint' (dependencies), 'selector' (specific symbol). offset/limit works in all modes.",
+                    "enum": ["summary", "full", "blueprint", "selector"],
+                    "default": "summary"
                 },
                 "symbol": {
                     "type": "string",
                     "description": "Symbol name for selector mode (e.g. 'loginHandler', 'AuthService')"
                 },
                 "offset": {
-                    "type": "number",
-                    "description": "Line number to start reading from (0-indexed, full mode)"
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Line number to start reading from (0-indexed, all modes)"
                 },
                 "limit": {
-                    "type": "number",
-                    "description": "Maximum lines to read (full mode)"
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum lines to read (all modes)"
                 }
             },
             "required": ["path"]
@@ -81,15 +186,16 @@ impl Tool for FileReadTool {
         5000
     }
 
-    fn execute(&self, args: &Value, _ctx: &ToolContext) -> ToolOutput {
+    fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return ToolOutput::err("file_write", "SCHEMA_INVALID", &[], None),
         };
-        let path = normalize_path(path);
-        let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("full");
+        let path = resolve_path(path, &ctx.project_path);
+        let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("summary");
 
         match mode {
+            "full" => exec_full(&path, args),
             "blueprint" => exec_blueprint(&path),
             "summary" => exec_summary(&path),
             "selector" => {
@@ -99,7 +205,7 @@ impl Tool for FileReadTool {
                 };
                 exec_selector(&path, symbol)
             }
-            _ => exec_full(&path, args), // "full" — existing behavior
+            other => ToolOutput::err("file_read", "SCHEMA_INVALID", &[("mode", other)], Some("Unknown mode. Valid: full, summary, blueprint, selector")),
         }
     }
 }
@@ -169,7 +275,7 @@ fn exec_summary(path: &str) -> ToolOutput {
         Err(e) => return ToolOutput::err("file_read", "EXECUTION_FAILED", &[("path", path)], Some(&e.to_string())),
     };
 
-    let lang = match language_from_ext(path) {
+    let lang = match crate::symbols::language_from_ext(path) {
         Some(l) => l,
         None => {
             let total = content.lines().count();
@@ -179,6 +285,7 @@ fn exec_summary(path: &str) -> ToolOutput {
     };
     let (symbols, references) = extract_symbols(path, &content, lang);
     let total_lines = content.lines().count();
+    let all_lines: Vec<&str> = content.lines().collect();
 
     let mut out = format!("File: {} ({} lines, {} symbols)\n\n", path, total_lines, symbols.len());
 
@@ -188,10 +295,18 @@ fn exec_summary(path: &str) -> ToolOutput {
         out.push_str("## Exports\n");
         for s in &exports {
             let loc = s.location.as_ref().map(|l| format!(" @ {}", l)).unwrap_or_default();
-            out.push_str(&format!("- {}() {}  {}{}\n",
+            // Read 3 lines from the symbol's location for anchor hashing
+            let line_num = s.location.as_ref()
+                .and_then(|loc| loc.split(':').last()?.parse::<usize>().ok())
+                .unwrap_or(1);
+            let end = (line_num + 2).min(all_lines.len());
+            let code_text: String = all_lines[line_num.saturating_sub(1)..end].join("\n");
+            let anchor = store_anchor(path, &code_text);
+            out.push_str(&format!("- {}() {}  {}{} [{}]\n",
                 s.name, loc,
                 if s.kind == "class" || s.kind == "interface" { format!("[{}] ", s.kind) } else { String::new() },
                 if s.exported { "[exported]" } else { "" },
+                anchor,
             ));
         }
         out.push('\n');
@@ -203,7 +318,13 @@ fn exec_summary(path: &str) -> ToolOutput {
         out.push_str("## Internal\n");
         for s in &internal {
             let loc = s.location.as_ref().map(|l| format!(" @ {}", l)).unwrap_or_default();
-            out.push_str(&format!("- {}() {}{}\n", s.name, loc, s.kind));
+            let line_num = s.location.as_ref()
+                .and_then(|loc| loc.split(':').last()?.parse::<usize>().ok())
+                .unwrap_or(1);
+            let end = (line_num + 2).min(all_lines.len());
+            let code_text: String = all_lines[line_num.saturating_sub(1)..end].join("\n");
+            let anchor = store_anchor(path, &code_text);
+            out.push_str(&format!("- {}() {} {} [{}]\n", s.name, loc, s.kind, anchor));
         }
         out.push('\n');
     }
@@ -227,7 +348,7 @@ fn exec_selector(path: &str, symbol_name: &str) -> ToolOutput {
         Err(e) => return ToolOutput::err("file_read", "EXECUTION_FAILED", &[("path", path)], Some(&e.to_string())),
     };
 
-    let lang = match language_from_ext(path) {
+    let lang = match crate::symbols::language_from_ext(path) {
         Some(l) => l,
         None => return ToolOutput::err("file_read", "EXECUTION_FAILED", &[("path", path)], Some("unsupported file type")),
     };
@@ -263,11 +384,12 @@ fn exec_selector(path: &str, symbol_name: &str) -> ToolOutput {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let _header = format!(
+    let header = format!(
         "File: {} | Symbol: {}() @ line {} (lines {}-{} of {})\n\n",
         path, symbol_name, line_num, start + 1, end, total,
     );
-    ToolOutput::ok("file_read", &[("path", path), ("mode", "selector"), ("symbol", symbol_name)], Some(&output))
+    let out = format!("{}{}", header, output);
+    ToolOutput::ok("file_read", &[("path", path), ("mode", "selector"), ("symbol", symbol_name)], Some(&out))
 }
 
 // ============================================================================
@@ -283,7 +405,7 @@ fn exec_blueprint(path: &str) -> ToolOutput {
         Err(e) => return ToolOutput::err("file_read", "EXECUTION_FAILED", &[("path", path)], Some(&e.to_string())),
     };
 
-    let lang = match language_from_ext(path) {
+    let lang = match crate::symbols::language_from_ext(path) {
         Some(l) => l,
         None => {
             // Unsupported → fall back to summary
@@ -296,6 +418,7 @@ fn exec_blueprint(path: &str) -> ToolOutput {
     let (symbols, references) = extract_symbols(path, &content, lang);
     let total_lines = content.lines().count();
     let total = symbols.len();
+    let bp_lines: Vec<&str> = content.lines().collect();
 
     let mut out = format!("## Blueprint: {} ({} lines, {} symbols)\n", path, total_lines, total);
 
@@ -317,7 +440,13 @@ fn exec_blueprint(path: &str) -> ToolOutput {
         out.push_str("\n📤 Public API:\n");
         for s in &exported {
             let loc = s.location.as_ref().map(|l| format!(" @{}", l.split(':').last().unwrap_or("?"))).unwrap_or_default();
-            out.push_str(&format!("  - {}{}{}\n", s.name, kind_tag(&s.kind), loc));
+            let line_num = s.location.as_ref()
+                .and_then(|loc| loc.split(':').last()?.parse::<usize>().ok())
+                .unwrap_or(1);
+            let end = (line_num + 2).min(bp_lines.len());
+            let code_text: String = bp_lines[line_num.saturating_sub(1)..end].join("\n");
+            let anchor = store_anchor(path, &code_text);
+            out.push_str(&format!("  - {}{}{} [{}]\n", s.name, kind_tag(&s.kind), loc, anchor));
         }
     }
 
@@ -327,7 +456,13 @@ fn exec_blueprint(path: &str) -> ToolOutput {
         out.push_str("\n🔒 Internals:\n");
         for s in &internal {
             let loc = s.location.as_ref().map(|l| format!(" @{}", l.split(':').last().unwrap_or("?"))).unwrap_or_default();
-            out.push_str(&format!("  - {}{}{}\n", s.name, kind_tag(&s.kind), loc));
+            let line_num = s.location.as_ref()
+                .and_then(|loc| loc.split(':').last()?.parse::<usize>().ok())
+                .unwrap_or(1);
+            let end = (line_num + 2).min(bp_lines.len());
+            let code_text: String = bp_lines[line_num.saturating_sub(1)..end].join("\n");
+            let anchor = store_anchor(path, &code_text);
+            out.push_str(&format!("  - {}{}{} [{}]\n", s.name, kind_tag(&s.kind), loc, anchor));
         }
     }
 
@@ -382,127 +517,39 @@ struct FileReference {
     to_file: Option<String>,
 }
 
-/// Detect language from file extension (same logic as bootstrap.rs).
-fn language_from_ext(path: &str) -> Option<&'static str> {
-    if path.ends_with(".ts") || path.ends_with(".tsx") || path.ends_with(".js") || path.ends_with(".jsx") || path.ends_with(".mjs") {
-        Some("typescript")
-    } else if path.ends_with(".py") {
-        Some("python")
-    } else if path.ends_with(".rs") {
-        Some("rust")
-    } else {
-        None
-    }
-}
+/// Convert tree-sitter extracted symbols to internal FileSymbol format.
+fn extract_symbols(path: &str, source: &str, lang: crate::symbols::SourceLanguage) -> (Vec<FileSymbol>, Vec<FileReference>) {
+    use crate::symbols;
 
-/// Cached regex patterns for symbol extraction.
-mod regex_cache {
-    use regex::Regex;
-    use std::sync::OnceLock;
+    let (extracted_syms, extracted_refs) = symbols::extract(source, lang);
 
-    macro_rules! cached_regex {
-        ($name:ident, $pattern:expr) => {
-            pub fn $name() -> &'static Regex {
-                static RE: OnceLock<Regex> = OnceLock::new();
-                RE.get_or_init(|| Regex::new($pattern).unwrap())
+    let symbols: Vec<FileSymbol> = extracted_syms
+        .into_iter()
+        .map(|s| {
+            let kind = match s.kind.as_str() {
+                "function" | "method" => "function",
+                "class" | "struct" | "enum" => "class",
+                "interface" | "trait" | "type" => "interface",
+                "variable" | "constant" => "variable",
+                "module" | "impl" => "module",
+                other => other,
+            };
+            FileSymbol {
+                name: s.name,
+                kind: kind.to_string(),
+                location: Some(format!("{}:{}", path, s.line + 1)),
+                exported: s.exported,
             }
-        };
-    }
+        })
+        .collect();
 
-    cached_regex!(re_export_ts, r"export\s+(?:async\s+)?(?:function|class|interface|const|let|var|type|enum)\s+(\w+)");
-    cached_regex!(re_func_ts, r"^(?:async\s+)?(?:function|class|interface)\s+(\w+)");
-    cached_regex!(re_const_ts, r"^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=");
-    cached_regex!(re_import_named_ts, r#"import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]"#);
-    cached_regex!(re_import_default_ts, r#"import\s+(\w+)\s+from\s+['"]([^'"]+)['"]"#);
-    cached_regex!(re_def_py, r"def\s+(\w+)\s*\(");
-    cached_regex!(re_class_py, r"class\s+(\w+)\s*[:(]");
-    cached_regex!(re_from_import_py, r"from\s+(\S+)\s+import\s+(.+)");
-    cached_regex!(re_fn_rs, r"(?:pub(?:\s*\(\s*crate\s*\))?\s+)?(?:async\s+)?fn\s+(\w+)\s*[<(]");
-    cached_regex!(re_struct_rs, r"(?:pub\s+)?struct\s+(\w+)");
-    cached_regex!(re_enum_rs, r"(?:pub\s+)?enum\s+(\w+)");
-    cached_regex!(re_trait_rs, r"(?:pub\s+)?trait\s+(\w+)");
-}
-
-/// Extract symbols and references from source using regex (same patterns as bootstrap.rs).
-fn extract_symbols(path: &str, source: &str, lang: &str) -> (Vec<FileSymbol>, Vec<FileReference>) {
-    let mut symbols = Vec::new();
-    let mut references = Vec::new();
-    let lines: Vec<&str> = source.lines().collect();
-
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("#[") {
-            continue;
-        }
-        let line_num = i + 1;
-        let loc = Some(format!("{}:{}", path, line_num));
-
-        match lang {
-            "typescript" => {
-                if let Some(caps) = regex_cache::re_export_ts().captures(trimmed) {
-                    let kind = if trimmed.contains("function") || trimmed.contains("async") { "function" }
-                        else if trimmed.contains("class") { "class" }
-                        else if trimmed.contains("interface") { "interface" }
-                        else if trimmed.contains("type") || trimmed.contains("enum") { "class" }
-                        else { "variable" };
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: kind.to_string(), location: loc.clone(), exported: true });
-                    continue;
-                }
-                if let Some(caps) = regex_cache::re_func_ts().captures(trimmed) {
-                    let kind = if trimmed.contains("function") { "function" } else if trimmed.contains("class") { "class" } else { "interface" };
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: kind.to_string(), location: loc.clone(), exported: false });
-                }
-                if let Some(caps) = regex_cache::re_const_ts().captures(trimmed) {
-                    let name = caps[1].to_string();
-                    if !symbols.iter().any(|s: &FileSymbol| s.name == name) {
-                        symbols.push(FileSymbol { name, kind: "variable".to_string(), location: loc.clone(), exported: trimmed.starts_with("export") });
-                    }
-                }
-                if let Some(caps) = regex_cache::re_import_named_ts().captures(trimmed) {
-                    for name in caps[1].split(',').map(|s| s.trim()) {
-                        references.push(FileReference { from_name: name.to_string(), to_file: Some(caps[2].to_string()) });
-                    }
-                }
-                if let Some(caps) = regex_cache::re_import_default_ts().captures(trimmed) {
-                    references.push(FileReference { from_name: caps[1].to_string(), to_file: Some(caps[2].to_string()) });
-                }
-            }
-            "python" => {
-                if let Some(caps) = regex_cache::re_def_py().captures(trimmed) {
-                    let name = caps[1].to_string();
-                    if !name.starts_with('_') || name == "__init__" {
-                        symbols.push(FileSymbol { name, kind: "function".to_string(), location: loc.clone(), exported: !trimmed.starts_with('_') });
-                    }
-                }
-                if let Some(caps) = regex_cache::re_class_py().captures(trimmed) {
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "class".to_string(), location: loc.clone(), exported: true });
-                }
-                if let Some(caps) = regex_cache::re_from_import_py().captures(trimmed) {
-                    for name in caps[2].split(',').map(|s| s.split(" as ").next().unwrap_or(s).trim()) {
-                        references.push(FileReference { from_name: name.to_string(), to_file: Some(caps[1].to_string()) });
-                    }
-                }
-            }
-            "rust" => {
-                if let Some(caps) = regex_cache::re_fn_rs().captures(trimmed) {
-                    let is_pub = trimmed.contains("pub ");
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "function".to_string(), location: loc.clone(), exported: is_pub });
-                }
-                if let Some(caps) = regex_cache::re_struct_rs().captures(trimmed) {
-                    let is_pub = trimmed.contains("pub ");
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "class".to_string(), location: loc.clone(), exported: is_pub });
-                }
-                if let Some(caps) = regex_cache::re_enum_rs().captures(trimmed) {
-                    let is_pub = trimmed.contains("pub ");
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "class".to_string(), location: loc.clone(), exported: is_pub });
-                }
-                if let Some(caps) = regex_cache::re_trait_rs().captures(trimmed) {
-                    symbols.push(FileSymbol { name: caps[1].to_string(), kind: "interface".to_string(), location: loc.clone(), exported: true });
-                }
-            }
-            _ => {}
-        }
-    }
+    let references: Vec<FileReference> = extracted_refs
+        .into_iter()
+        .map(|r| FileReference {
+            from_name: r.name,
+            to_file: Some(r.source),
+        })
+        .collect();
 
     (symbols, references)
 }
@@ -528,7 +575,7 @@ impl Tool for FileWriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the file to write"
+                    "description": "Path to the file. Absolute or relative to project root (e.g. 'src/main.ts')"
                 },
                 "content": {
                     "type": "string",
@@ -547,8 +594,8 @@ impl Tool for FileWriteTool {
         10000
     }
 
-    fn execute(&self, args: &Value, _ctx: &ToolContext) -> ToolOutput {
-        let path = match args.get("path").and_then(|v| v.as_str()) {
+    fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
+        let raw_path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return ToolOutput::err("file_write", "SCHEMA_INVALID", &[], None),
         };
@@ -557,7 +604,10 @@ impl Tool for FileWriteTool {
             None => return ToolOutput::err("file_write", "SCHEMA_INVALID", &[], None),
         };
 
-        let path = normalize_path(path);
+        let path = match validate_and_resolve_path(raw_path, &ctx.project_path) {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::err("file_write", "PERMISSION_DENIED", &[("path", raw_path)], Some(&e)),
+        };
 
         // Ensure parent directory exists
         if let Some(parent) = std::path::Path::new(&path).parent() {
@@ -571,7 +621,10 @@ impl Tool for FileWriteTool {
         let tmp_path = format!("{}.comdr-tmp-{}", path, std::process::id());
         match std::fs::write(&tmp_path, content) {
             Ok(()) => match std::fs::rename(&tmp_path, &path) {
-                Ok(()) => ToolOutput::ok("file_write", &[("path", &path), ("bytes", &content.len().to_string())], None),
+                Ok(()) => {
+                    clear_anchors_for_file(&path);
+                    ToolOutput::ok("file_write", &[("path", &path), ("bytes", &content.len().to_string())], None)
+                }
                 Err(e) => {
                     // Best-effort: clean up temp file after failed rename.
                     if let Err(rm_err) = std::fs::remove_file(&tmp_path) {
@@ -603,7 +656,7 @@ impl Tool for FileEditTool {
     }
 
     fn description(&self) -> &str {
-        "Replace a string in a file. old_string must match exactly once."
+        "Replace a string in a file. old_string must match exactly once. Use 'anchor' (hash shown in file_read output) instead of old_string for more reliable matching."
     }
 
     fn parameters(&self) -> Value {
@@ -612,11 +665,11 @@ impl Tool for FileEditTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the file to edit"
+                    "description": "Path to the file. Absolute or relative to project root"
                 },
                 "old_string": {
                     "type": "string",
-                    "description": "Exact string to replace"
+                    "description": "Exact string to replace. Required unless 'anchor' is provided."
                 },
                 "new_string": {
                     "type": "string",
@@ -626,9 +679,13 @@ impl Tool for FileEditTool {
                     "type": "boolean",
                     "description": "Replace all occurrences (default: false)",
                     "default": false
+                },
+                "anchor": {
+                    "type": "string",
+                    "description": "Hash anchor from file_read output (e.g. 'a3f8c201'). Resolves to the original text — more reliable than copying old_string exactly."
                 }
             },
-            "required": ["path", "old_string", "new_string"]
+            "required": ["path", "new_string"]
         })
     }
 
@@ -640,13 +697,9 @@ impl Tool for FileEditTool {
         10000
     }
 
-    fn execute(&self, args: &Value, _ctx: &ToolContext) -> ToolOutput {
-        let path = match args.get("path").and_then(|v| v.as_str()) {
+    fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
+        let raw_path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
-            None => return ToolOutput::err("file_write", "SCHEMA_INVALID", &[], None),
-        };
-        let old_string = match args.get("old_string").and_then(|v| v.as_str()) {
-            Some(s) => s,
             None => return ToolOutput::err("file_edit", "SCHEMA_INVALID", &[], None),
         };
         let new_string = match args.get("new_string").and_then(|v| v.as_str()) {
@@ -658,7 +711,39 @@ impl Tool for FileEditTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let path = normalize_path(path);
+        let anchor_hash = args.get("anchor").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+
+        // ★ Resolve old_string: anchor takes priority, fallback to explicit old_string
+        let old_string: String = if let Some(hash) = anchor_hash {
+            match resolve_anchor(hash) {
+                Some(entry) => {
+                    if entry.path != raw_path {
+                        return ToolOutput::err("file_edit", "ANCHOR_MISMATCH",
+                            &[("anchor", hash), ("expected_path", &entry.path), ("got_path", raw_path)],
+                            Some("Anchor belongs to a different file. Re-read the file to get fresh anchors."),
+                        );
+                    }
+                    entry.text
+                }
+                None => {
+                    return ToolOutput::err("file_edit", "ANCHOR_NOT_FOUND",
+                        &[("anchor", hash)],
+                        Some("Anchor not found (may have expired after file modification). Re-read the file with file_read to get fresh anchors."),
+                    );
+                }
+            }
+        } else {
+            match args.get("old_string").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return ToolOutput::err("file_edit", "SCHEMA_INVALID", &[],
+                    Some("Either 'old_string' or 'anchor' is required.")),
+            }
+        };
+
+        let path = match validate_and_resolve_path(raw_path, &ctx.project_path) {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::err("file_edit", "PERMISSION_DENIED", &[("path", raw_path)], Some(&e)),
+        };
 
         let original = match std::fs::read_to_string(&path) {
             Ok(c) => c,
@@ -671,7 +756,7 @@ impl Tool for FileEditTool {
             return ToolOutput::err("file_edit", "SCHEMA_INVALID", &[], None);
         }
 
-        let occurrences = original.matches(old_string).count();
+        let occurrences = original.matches(&old_string as &str).count();
 
         if occurrences == 0 {
             return ToolOutput::err("file_edit", "EXECUTION_FAILED", &[("path", &path)], Some("old_string not found"));
@@ -682,13 +767,14 @@ impl Tool for FileEditTool {
         }
 
         let modified = if replace_all {
-            original.replace(old_string, new_string)
+            original.replace(&old_string as &str, new_string)
         } else {
-            original.replacen(old_string, new_string, 1)
+            original.replacen(&old_string as &str, new_string, 1)
         };
 
         match std::fs::write(&path, &modified) {
             Ok(()) => {
+                clear_anchors_for_file(&path);
                 let replaced_count = if replace_all { occurrences } else { 1 };
                 ToolOutput::ok("file_edit", &[("path", &path), ("replaced", &replaced_count.to_string())], None)
             }
@@ -733,16 +819,22 @@ impl Tool for FileDeleteTool {
         5000
     }
 
-    fn execute(&self, args: &Value, _ctx: &ToolContext) -> ToolOutput {
-        let path = match args.get("path").and_then(|v| v.as_str()) {
+    fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
+        let raw_path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
-            None => return ToolOutput::err("file_write", "SCHEMA_INVALID", &[], None),
+            None => return ToolOutput::err("file_delete", "SCHEMA_INVALID", &[], None),
         };
 
-        let path = normalize_path(path);
+        let path = match validate_and_resolve_path(raw_path, &ctx.project_path) {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::err("file_delete", "PERMISSION_DENIED", &[("path", raw_path)], Some(&e)),
+        };
 
         match std::fs::remove_file(&path) {
-            Ok(()) => ToolOutput::ok("file_delete", &[("path", &path)], None),
+            Ok(()) => {
+                clear_anchors_for_file(&path);
+                ToolOutput::ok("file_delete", &[("path", &path)], None)
+            }
             Err(e) => ToolOutput::err("file_delete", "EXECUTION_FAILED", &[("path", &path)], Some(&e.to_string())),
         }
     }
@@ -808,10 +900,12 @@ impl Tool for FileGlobTool {
             .to_string_lossy()
             .replace('\\', "/");
 
+        const MAX_GLOB: usize = 200;
         let results: Vec<String> = match glob::glob(&full_pattern) {
             Ok(paths) => paths
                 .filter_map(|entry| entry.ok())
                 .map(|p| normalize_path(&p.to_string_lossy()))
+                .take(MAX_GLOB + 1) // ★ 只取 MAX+1，用 +1 检测是否还有更多
                 .collect(),
             Err(e) => {
                 return ToolOutput::err("file_glob", "EXECUTION_FAILED", &[], Some(&e.to_string()))
@@ -821,7 +915,16 @@ impl Tool for FileGlobTool {
         if results.is_empty() {
             ToolOutput::ok("file_glob", &[("matched", "0")], None)
         } else {
-            ToolOutput::ok("file_glob", &[("matched", &results.len().to_string())], Some(&results.join("\n")))
+            const MAX_GLOB_RESULTS: usize = 200;
+            let total = results.len();
+            let truncated: String = if total > MAX_GLOB_RESULTS {
+                let mut out: String = results[..MAX_GLOB_RESULTS].join("\n");
+                out.push_str(&format!("\n... and {} more files ({} total, use more specific pattern)", total - MAX_GLOB_RESULTS, total));
+                out
+            } else {
+                results.join("\n")
+            };
+            ToolOutput::ok("file_glob", &[("matched", &total.to_string())], Some(&truncated))
         }
     }
 }
@@ -858,7 +961,8 @@ impl Tool for FileGrepTool {
                     "description": "Filter files by glob pattern (e.g. '*.rs', '*.ts')"
                 },
                 "max_results": {
-                    "type": "number",
+                    "type": "integer",
+                    "minimum": 1,
                     "description": "Maximum number of matching lines to return (default: 250)"
                 }
             },
@@ -877,7 +981,7 @@ impl Tool for FileGrepTool {
     fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolOutput {
         let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
             Some(p) => p,
-            None => return ToolOutput::err("file_glob", "SCHEMA_INVALID", &[], None),
+            None => return ToolOutput::err("file_grep", "SCHEMA_INVALID", &[], None),
         };
 
         let regex = match regex::Regex::new(pattern) {
@@ -909,7 +1013,16 @@ impl Tool for FileGrepTool {
             vec![search_root.to_path_buf()]
         } else if search_root.is_dir() {
             walkdir::WalkDir::new(search_root)
+                .max_depth(20) // ★ 防止深层嵌套目录无限遍历
                 .into_iter()
+                .filter_entry(|e| {
+                    // ★ 跳过常见巨型目录，避免扫描 node_modules/.git 等
+                    let name = e.file_name().to_string_lossy();
+                    !(name == "node_modules" || name == ".git" || name == "target"
+                      || name == "dist" || name == "build" || name == ".next"
+                      || name == "__pycache__" || name == ".venv" || name == "venv"
+                      || name == "coverage" || name == ".nyc_output")
+                })
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().is_file())
                 .filter(|e| {

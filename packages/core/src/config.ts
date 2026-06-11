@@ -34,8 +34,41 @@ import {
   THINKING_EFFORT,
   PERMISSION_MODE as PERM_MODE,
   MODEL_ROLE,
+  SYSTEM,
 } from './types.js';
 import { ConfigValidationError } from './contracts.js';
+
+// ============================================================================
+// §0 不可热更新字段列表
+// ============================================================================
+
+/**
+ * Contract D: 以下字段在 reload 时不可变更。
+ * LLM 客户端 / MCP 连接已按旧配置实例化，修改后不会生效。
+ */
+const IMMUTABLE_ON_RELOAD_PATHS: Array<{
+  path: string;
+  label: string;
+}> = [
+  { path: 'llm.apiKey', label: 'llm.api_key' },
+  { path: 'llm.baseUrl', label: 'llm.base_url' },
+  { path: 'llm.model', label: 'llm.model' },
+  { path: 'llm.maxTokens', label: 'llm.max_tokens' },
+  { path: 'llm.thinking', label: 'llm.thinking' },
+  { path: 'project.mcpServers', label: 'project.mcp_servers' },
+  { path: 'project.projectPath', label: 'project path' },
+];
+
+/** 从嵌套对象取值（支持 a.b.c 路径） */
+function deepGet(obj: unknown, path: string): unknown {
+  const keys = path.split('.');
+  let current: unknown = obj;
+  for (const key of keys) {
+    if (current == null || typeof current !== 'object') return undefined;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current;
+}
 
 // ============================================================================
 // §1 默认值（README 定义）
@@ -51,14 +84,14 @@ const DEFAULTS: AgentConfig = {
   },
   project: {
     projectPath: '',
-    skillsDir: 'skills',
+    skillsDir: SYSTEM.DEFAULT_SKILLS_DIR,
     mcpServers: [],
     comdrMdPath: 'COMDR.md',
     contextModel: undefined, // ★ 显式 undefined → downstream 用 ?? MODEL_ROLE.CONTEXT 回退
   },
   agent: {
-    maxTurns: 50,
-    tokenBudget: 200_000,
+    maxTurns: SYSTEM.DEFAULT_MAX_TURNS,
+    tokenBudget: SYSTEM.DEFAULT_TOKEN_BUDGET,
     permissionMode: PERM_MODE.CONFIRM_DESTRUCTIVE,
   },
 };
@@ -144,11 +177,47 @@ export function loadConfig(projectPath: string): AgentConfig {
 }
 
 /**
- * 重新加载（热更新，仅非破坏性字段）
- * 当前简化实现: 完全重新加载。
+ * 重新加载（热更新，仅非破坏性字段）。
+ *
+ * ☆ Contract D: 可热更新 agent.* + project.comdrMdPath + project.contextModel。
+ *    不可热更新 llm.* / project.mcpServers / project.projectPath —— 需要重启引擎。
+ *
+ * @param projectPath  项目路径
+ * @param oldConfig    当前正在使用的配置——用于检测不可热更新字段是否被改动
+ * @returns 新配置（仅可变字段来自磁盘，不可变字段保留旧的）
+ * @throws ConfigValidationError 当不可热更新字段被磁盘上的值修改时
  */
-export function reloadConfig(projectPath: string): AgentConfig {
-  return loadConfig(projectPath);
+export function reloadConfig(
+  projectPath: string,
+  oldConfig?: AgentConfig,
+): AgentConfig {
+  const newConfig = loadConfig(projectPath);
+
+  if (oldConfig) {
+    // ★ 校验不可热更新字段：如果磁盘上的值与当前运行中的值不同 → throw
+    const violations: string[] = [];
+    for (const { path, label } of IMMUTABLE_ON_RELOAD_PATHS) {
+      const oldVal = JSON.stringify(deepGet(oldConfig, path));
+      const newVal = JSON.stringify(deepGet(newConfig, path));
+      if (oldVal !== newVal) {
+        violations.push(`  - ${label}: was ${oldVal}, changed to ${newVal}`);
+      }
+    }
+    if (violations.length > 0) {
+      throw new ConfigValidationError(
+        `Cannot hot-reload immutable fields. Restart the engine for these changes to take effect.`,
+        violations,
+      );
+    }
+  }
+
+  // ★ 只将可变字段应用到新配置，不可变字段保留旧的（oldConfig === undefined 时全量）
+  const result = oldConfig ? {
+    ...newConfig,
+    llm: { ...newConfig.llm },
+  } : newConfig;
+
+  return result;
 }
 
 // ============================================================================
@@ -357,12 +426,24 @@ function validateConfig(config: AgentConfig): void {
 // ============================================================================
 
 /**
- * IConfigLoader 的实现实例
- * 外部使用者可通过此工厂函数创建绑定到特定 projectPath 的 loader
+ * IConfigLoader 的实现实例。
+ * 外部使用者可通过此工厂函数创建绑定到特定 projectPath 的 loader。
+ * reload 时自动比对不可热更新字段，防止用户误改后静默不生效。
  */
 export function createConfigLoader(projectPath: string) {
+  let current: AgentConfig | undefined;
+
   return {
-    load: () => loadConfig(projectPath),
-    reload: () => reloadConfig(projectPath),
+    load: (overridePath?: string) => {
+      const cfg = loadConfig(overridePath ?? projectPath);
+      current = cfg;
+      return cfg;
+    },
+    reload: () => {
+      const prev = current;
+      const cfg = reloadConfig(projectPath, prev);
+      current = cfg;
+      return cfg;
+    },
   };
 }

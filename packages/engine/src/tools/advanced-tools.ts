@@ -9,6 +9,7 @@
 import type { ToolDefinition } from '@comdr/core/types';
 import { TOOL_PERMISSION } from '@comdr/core';
 import { createTool } from './tool-factory.js';
+import { TOOL_EXPLORE_DEF } from '../tool-blueprint/index.js';
 
 // ============================================================================
 // §1 定义
@@ -166,12 +167,44 @@ export const TASK_SPAWN: ToolDefinition = createTool({
 // §2 批量导出
 // ============================================================================
 
-/** 所有高级工具（6 个） */
+/**
+ * 5a. repo_query — 依赖图查询
+ * 复用: SemanticMemory.getDependents() + getDependencies() + getTopImported()
+ * 用途: LLM 想知道"谁依赖这个文件"或"哪些文件是核心枢纽"时直接查图，不用 grep 盲搜
+ */
+export const REPO_QUERY: ToolDefinition = createTool({
+  name: 'repo_query',
+  description:
+    'Query the project dependency graph. Actions: "hubs" (most-imported files), ' +
+    '"dependents" (who imports a file), "dependencies" (what a file imports), "find" (where a symbol is defined). ' +
+    'Use this to understand project structure without guessing — much faster than grepping blindly.',
+  params: {
+    action: {
+      type: 'string',
+      description: 'Query action: "hubs", "dependents", "dependencies", or "find".',
+      required: true,
+    },
+    file: {
+      type: 'string',
+      description: 'File path for dependents/dependencies queries.',
+    },
+    symbol: {
+      type: 'string',
+      description: 'Symbol name for find action.',
+    },
+  },
+  permission: 'read_only',
+  timeoutMs: 5000,
+});
+
+/** 所有高级工具（8 个） */
 export const ADVANCED_TOOLS: ToolDefinition[] = [
+  TOOL_EXPLORE_DEF,
   TOOL_SEARCH,
   FILE_SEARCH,
   MEMORY_RECALL,
   SYMBOL_FIND,
+  REPO_QUERY,
   SHELL_TEST,
   TASK_SPAWN,
 ];

@@ -13,6 +13,7 @@
  */
 
 import type { ToolDefinition, Message } from '@comdr/core/types';
+import type { ToolBlueprint } from '@comdr/core';
 
 // ============================================================================
 // §1 工具定义序列化（sort_keys 保证一致性）
@@ -63,6 +64,34 @@ function sortedKeys(_key: string, value: unknown): unknown {
     return sorted;
   }
   return value;
+}
+
+/**
+ * ★ 将 ToolBlueprint 序列化为稳定 JSON——用于 fingerprint 计算。
+ *
+ * schema version + nodes/edges sorted by name 保证同输入同输出。
+ * 与 serializeTools 的不变式保证一致——每次调用返回完全相同的字符串。
+ *
+ * @param bp 编译后的蓝图
+ * @returns 稳定排序的 JSON 字符串
+ */
+export function serializeBlueprint(bp: ToolBlueprint): string {
+  // 节点按 name 排序
+  const sortedNodes = [...bp.nodes].sort((a, b) => a.name.localeCompare(b.name));
+  // 边按 from→to→type 排序
+  const sortedEdges = [...bp.edges].sort((a, b) => {
+    const fa = `${a.from}→${a.to}:${a.type}`;
+    const fb = `${b.from}→${b.to}:${b.type}`;
+    return fa.localeCompare(fb);
+  });
+
+  const stable: ToolBlueprint = {
+    ...bp,
+    nodes: sortedNodes,
+    edges: sortedEdges,
+  };
+
+  return JSON.stringify(stable, sortedKeys, 2);
 }
 
 // ============================================================================

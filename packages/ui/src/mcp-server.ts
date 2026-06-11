@@ -288,7 +288,7 @@ export function startMCPServer(opts: MCPServerOptions): void {
             // token 用量由 Engine 内部追踪，不暴露给 MCP 调用方
             break;
           case AGENT_EVENT.MCP_STATUS:
-            // MCP Server 状态仅在 TUI 展示，不通过 MCP 协议回传
+            // MCP Server 状态不通过 MCP 协议回传
             break;
           case AGENT_EVENT.PROGRESS_WARNING:
             parts.push(`\n[WARN: ${event.message}]`);

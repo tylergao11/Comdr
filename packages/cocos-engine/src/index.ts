@@ -74,3 +74,6 @@ export { ExecutionLogger } from './gateway/execution-logger.js';
 
 // ToolCenter
 export { ToolCenter } from './tool-center/tool-center.js';
+
+// SubAgent Adapter
+export { CocosSubAgent, createSubAgent } from './subagent-adapter.js';

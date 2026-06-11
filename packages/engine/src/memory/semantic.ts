@@ -91,7 +91,7 @@ export class SemanticMemory {
     nodes: Map<string, SemanticNode>;
     edges: SemanticEdge[];
   };
-  // Node embedding 缓存已移除——trigram textToVector() 是纯函数，无需缓存。
+  // Node 匹配走子串+词级，无需 embedding 向量缓存。
 
   constructor() {
     this.semanticGraph = { nodes: new Map(), edges: [] };
@@ -221,6 +221,30 @@ export class SemanticMemory {
     return this.entityGraph.edges
       .filter((e) => e.to === fileId)
       .map((e) => e.from);
+  }
+
+  /**
+   * ★ 查询文件导入了谁（出边）。
+   */
+  getDependencies(filePath: string): string[] {
+    const fileId = `file:${filePath}`;
+    return this.entityGraph.edges
+      .filter((e) => e.from === fileId)
+      .map((e) => e.to);
+  }
+
+  /**
+   * ★ Hub 检测——被 import 最多的 Top-K 文件。
+   */
+  getTopImported(topK: number = 10): Array<{ path: string; count: number }> {
+    const counts = new Map<string, number>();
+    for (const edge of this.entityGraph.edges) {
+      counts.set(edge.to, (counts.get(edge.to) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, topK)
+      .map(([path, count]) => ({ path, count }));
   }
 
   /**
@@ -614,16 +638,18 @@ export class SemanticMemory {
       for (const e of d.entity?.edges ?? []) {
         this.addEdge(this.entityGraph, e.from, e.to, e.type);
       }
+      // ★ 稳定序列化：sorted keys 保证不同 V8 版本/对象创建顺序下 key 顺序一致
+      const stableStringify = (obj: unknown) => JSON.stringify(obj, Object.keys(obj as object).sort());
       // Append temporal + causal（去重——防止重复 deserialize 导致条目翻倍）
-      const existingTemporal = new Set(this.temporalGraph.map((e) => JSON.stringify(e)));
+      const existingTemporal = new Set(this.temporalGraph.map((e) => stableStringify(e)));
       for (const entry of d.temporal ?? []) {
-        if (!existingTemporal.has(JSON.stringify(entry))) {
+        if (!existingTemporal.has(stableStringify(entry))) {
           this.temporalGraph.push(entry);
         }
       }
-      const existingCausal = new Set(this.causalGraph.map((e) => JSON.stringify(e)));
+      const existingCausal = new Set(this.causalGraph.map((e) => stableStringify(e)));
       for (const entry of d.causal ?? []) {
-        if (!existingCausal.has(JSON.stringify(entry))) {
+        if (!existingCausal.has(stableStringify(entry))) {
           this.causalGraph.push(entry);
         }
       }

@@ -286,8 +286,9 @@ fn run_test(
         // Rust: `cargo test -- <module>`
         runner.command_template.clone()
     } else {
-        // Node/Python/Go: replace {file} placeholder
-        runner.command_template.replace("{file}", test_file)
+        // ★ Escape file path for shell: wrap in quotes, escape internal quotes
+        let escaped = format!("\"{}\"", test_file.replace('"', "\\\""));
+        runner.command_template.replace("{file}", &escaped)
     };
 
     // Choose shell based on platform

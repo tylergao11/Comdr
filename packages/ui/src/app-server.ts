@@ -12,7 +12,7 @@
  *   ws://host:port/ws   — 流式推送 AgentEvent（逐事件推送 JSON）
  *
  * HTTP 解析使用 Node.js 内置 http 模块（零外部依赖）。
- * 此模块设计为独立运行，不依赖 TUI / MCP Server。
+ * 此模块设计为独立运行。
  *
  * @agent Agent 5 — HTTP/WebSocket 入口
  */

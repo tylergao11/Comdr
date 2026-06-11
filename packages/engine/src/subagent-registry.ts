@@ -113,6 +113,14 @@ export class SubAgentRegistry {
   }
 
   /**
+   * ★ 获取所有已注册子智能体实例。
+   * Blueprint 编译器用此方法获取 manifest（含可选 toolTopology）。
+   */
+  getManifests(): ISubAgent[] {
+    return [...this.agents.values()];
+  }
+
+  /**
    * 子智能体数量。
    */
   get size(): number {

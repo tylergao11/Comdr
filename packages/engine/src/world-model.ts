@@ -1,7 +1,7 @@
 /**
  * world-model.ts — COMDR.md 多源发现 + 分块检索
  *
- * ★ Trigram 向量检索替代 BM25。零模型、零正则。
+ * ★ 词级匹配检索——COMDR.md 通常 5~20 个 chunk，子串匹配够用且零延迟。
  *
  * 来源优先级:
  *   1. ~/.comdr/COMDR.md            — 用户全局偏好
@@ -17,7 +17,6 @@ import { homedir } from 'node:os';
 import { SYSTEM } from '@comdr/core';
 import type { ILSPBridge } from '@comdr/core/contracts';
 import type { LSPFileContext } from '@comdr/core/types';
-import { textToVector, cosineSimilarity } from './trigram-index.js';
 
 // ============================================================================
 // §1 类型
@@ -74,44 +73,38 @@ function chunkByHeading(text: string, source: string): WorldModelChunk[] {
 }
 
 // ============================================================================
-// §3 检索缓存
+// §3 检索——词级匹配
 // ============================================================================
 
-interface CachedRetriever {
-  chunks: WorldModelChunk[];
-  vectors: Float32Array[];
-  totalChars: number;
-}
-
-const retrieverCache = new Map<string, CachedRetriever>();
-
-function getOrCreateRetriever(
-  chunks: WorldModelChunk[],
-  projectPath: string,
-): CachedRetriever {
-  const cached = retrieverCache.get(projectPath);
-  if (cached && cached.chunks === chunks) return cached;
-
-  const vectors = chunks.map((c) => textToVector(c.retrievalText));
-  const totalChars = chunks.reduce((sum, c) => sum + c.content.length, 0);
-  const entry: CachedRetriever = { chunks, vectors, totalChars };
-  retrieverCache.set(projectPath, entry);
-  return entry;
-}
-
+/**
+ * ★ 词级匹配检索——COMDR.md 通常只有 5~20 个 chunk，
+ *   同步子串匹配零延迟，不需要 embedding 异步推理。
+ */
 function retrieveChunks(
   query: string,
-  retriever: CachedRetriever,
+  chunks: WorldModelChunk[],
   topK: number,
 ): WorldModelChunk[] {
-  const { chunks, vectors } = retriever;
   if (chunks.length === 0) return [];
   if (chunks.length === 1) return [chunks[0]!];
 
-  const queryVec = textToVector(query);
+  const queryLower = query.toLowerCase();
+  const queryWords = queryLower.split(/\s+/).filter((w) => w.length > 1);
 
-  return chunks
-    .map((chunk, i) => ({ chunk, score: cosineSimilarity(queryVec, vectors[i]!) }))
+  const scored = chunks.map((chunk) => {
+    const haystack = chunk.retrievalText.toLowerCase();
+    let score = 0;
+    // 全 query 子串命中 = 高权重
+    if (haystack.includes(queryLower)) score += 10;
+    // 每个词命中 +1
+    for (const word of queryWords) {
+      if (haystack.includes(word)) score += 1;
+    }
+    return { chunk, score };
+  });
+
+  return scored
+    .filter((s) => s.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, topK)
     .map((s) => s.chunk);
@@ -121,26 +114,26 @@ function retrieveChunks(
 // §4 发现 + 检索
 // ============================================================================
 
-export function discoverAndRetrieve(
+export async function discoverAndRetrieve(
   input: string,
   projectPath: string,
   comdrMdPath: string = 'COMDR.md',
-): WorldModelResult {
+): Promise<WorldModelResult> {
   const { fullText, chunks } = discoverAllSources(projectPath, comdrMdPath);
 
   if (!fullText || chunks.length === 0) {
     return { fullText: '', relevantChunks: [], didChunk: false };
   }
 
-  const retriever = getOrCreateRetriever(chunks, projectPath);
-  if (retriever.totalChars < SYSTEM.WORLD_MODEL_CHUNK_MIN_CHARS) {
+  const totalChars = chunks.reduce((sum, c) => sum + c.content.length, 0);
+  if (totalChars < SYSTEM.WORLD_MODEL_CHUNK_MIN_CHARS) {
     return { fullText, relevantChunks: [], didChunk: false };
   }
   if (chunks.length <= 1) {
     return { fullText, relevantChunks: [], didChunk: false };
   }
 
-  const relevantChunks = retrieveChunks(input, retriever, SYSTEM.WORLD_MODEL_RETRIEVAL_TOPK);
+  const relevantChunks = retrieveChunks(input, chunks, SYSTEM.WORLD_MODEL_RETRIEVAL_TOPK);
   return { fullText, relevantChunks, didChunk: true };
 }
 

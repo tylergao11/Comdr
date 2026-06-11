@@ -25,6 +25,7 @@ use std::sync::OnceLock;
 mod bootstrap;
 mod sdb;
 mod snapshot;
+mod symbols;
 mod tools;
 mod utils;
 
@@ -118,7 +119,7 @@ pub struct JsToolDefinition {
 ///   3. Pre-snapshot (if destructive + snapshot_enabled)
 ///   4. Execute (with timeout)
 ///   5. Diff Validate (if destructive)
-///   6. Test Feedback (placeholder)
+///   6. Test Feedback — auto-discover test file, detect runner, execute, parse results
 ///
 /// @contract Contract B: Agent 3 → Agent 4
 #[napi]
@@ -159,7 +160,7 @@ pub fn list_tools() -> Vec<JsToolDefinition> {
 
 /// Bootstrap: scan project directory and extract symbols + references.
 ///
-/// Zero LLM calls — pure regex-based static analysis.
+/// Zero LLM calls — tree-sitter AST analysis.
 /// Supports TypeScript/JavaScript, Python, and Rust.
 /// Results feed into Semantic Memory's four graphs.
 ///

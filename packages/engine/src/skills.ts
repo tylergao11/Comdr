@@ -415,7 +415,7 @@ export class SkillsLoader {
     this.expandedSkills.clear();
   }
 
-  // getStats() 已删除——@phase2 预留，调试面板/TUI 在需要时重新实现。
+  // getStats() 已删除——@phase2 预留，在需要时重新实现。
 }
 
 // ============================================================================

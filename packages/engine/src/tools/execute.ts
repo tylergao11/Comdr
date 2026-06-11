@@ -8,6 +8,7 @@
  */
 
 import type { ToolCall, ToolResult, ErrorCategory } from '@comdr/core/types';
+import type { ToolBlueprint } from '@comdr/core';
 import { SYSTEM, RUN_MODE, ERROR_CATEGORY } from '@comdr/core';
 import type { EpisodicMemory } from '../memory/episodic.js';
 import type { SemanticMemory } from '../memory/semantic.js';
@@ -17,6 +18,7 @@ import { safeParseArgs } from '../utils.js';
 import { BM25Scorer, tokenize, contextualPrefix } from '../retrieval.js';
 import { readFileSync, existsSync, statSync, readdirSync } from 'node:fs';
 import { join, extname } from 'node:path';
+import { expandTool, formatExpansion } from '../tool-blueprint/index.js';
 
 // ============================================================================
 // §1 执行上下文
@@ -30,6 +32,10 @@ export interface ToolExecContext {
   semanticMemory: SemanticMemory;
   nativeTools: INativeTools | null;
   engine: Engine;
+  /** ★ Tool Blueprint — tool_explore 查询使用 */
+  blueprint?: ToolBlueprint;
+  /** ★ 原始工具列表 — tool_explore 展开时查找完整定义 */
+  allTools?: import('@comdr/core/types').ToolDefinition[];
 }
 
 // ============================================================================
@@ -43,9 +49,11 @@ export function isAdvancedTool(toolName: string): boolean {
 
 const ADVANCED_TOOL_NAMES: ReadonlySet<string> = new Set([
   'tool_search',
+  'tool_explore',
   'file_search',
   'memory_recall',
   'symbol_find',
+  'repo_query',
   'shell_test',
   'task_spawn',
 ]);
@@ -66,18 +74,27 @@ export async function executeAdvancedTool(
 
   try {
     switch (call.function.name) {
+      case 'tool_explore':
+        return { ...base, ...execToolExplore(String(args.name ?? ''), ctx) };
       case 'tool_search':
         return { ...base, ...execToolSearch(String(args.query ?? ''), ctx) };
       case 'file_search':
-        return { ...base, ...execFileSearch(
+        return { ...base, ...(await execFileSearch(
           String(args.query ?? ''),
           typeof args.topK === 'number' ? args.topK : 5,
           ctx,
-        ) };
+        )) };
       case 'memory_recall':
-        return { ...base, ...execMemoryRecall(String(args.query ?? ''), ctx) };
+        return { ...base, ...await execMemoryRecall(String(args.query ?? ''), ctx) };
       case 'symbol_find':
         return { ...base, ...execSymbolFind(String(args.name ?? ''), ctx) };
+      case 'repo_query':
+        return { ...base, ...execRepoQuery(
+          String(args.action ?? 'hubs'),
+          typeof args.file === 'string' ? args.file : undefined,
+          typeof args.symbol === 'string' ? args.symbol : undefined,
+          ctx,
+        ) };
       case 'task_spawn':
         return { ...base, ...(await execTaskSpawn(
           String(args.prompt ?? ''),
@@ -118,34 +135,105 @@ export async function executeAdvancedTool(
 /** 1. tool_search — Embedding 工具检索 */
 type ExecResult = { ok: boolean; content: string; errorCategory?: ErrorCategory };
 
-function execToolSearch(
-  _query: string,
-  _ctx: ToolExecContext,
+/** ★ tool_explore — Blueprint 世界模型 drill-down */
+function execToolExplore(
+  toolName: string,
+  ctx: ToolExecContext,
 ): ExecResult {
+  const name = toolName.trim();
+  if (!name) {
+    return { ok: false, content: 'tool_explore requires a tool name. Try "file_edit", "audit__scan", etc.', errorCategory: 'execution_error' };
+  }
+
+  const blueprint = ctx.blueprint;
+  const tools = ctx.allTools;
+
+  if (!blueprint || !tools) {
+    return { ok: false, content: 'Tool blueprint not available. Tools may not have been compiled yet.', errorCategory: 'execution_error' };
+  }
+
+  const expansion = expandTool(name, tools, blueprint);
+  if (!expansion) {
+    // 尝试模糊匹配——给出最接近的工具名提示
+    const candidates = blueprint.nodes
+      .map((n) => n.name)
+      .filter((n) => n.includes(name) || name.includes(n))
+      .slice(0, 5);
+    const hint = candidates.length > 0
+      ? ` Did you mean: ${candidates.join(', ')}?`
+      : '';
+    return {
+      ok: false,
+      content: `Tool "${name}" not found in blueprint.${hint}\nUse names exactly as shown in the blueprint — try the short names (e.g. "file_edit" not "edit").`,
+      errorCategory: 'execution_error',
+    };
+  }
+
   return {
     ok: true,
-    content: 'All available tools are listed in the system prompt. Use any tool directly.',
+    content: formatExpansion(expansion),
   };
 }
 
-/** 2. file_search — BM25 对文件内容建索引 + 检索 */
-function execFileSearch(
+function execToolSearch(
+  query: string,
+  ctx: ToolExecContext,
+): ExecResult {
+  const q = query.trim();
+  if (!q) return { ok: true, content: 'No query provided. Describe what you want to do (e.g. "edit a file" or "run a shell command").' };
+
+  const tools = ctx.allTools;
+  if (!tools || tools.length === 0) {
+    return { ok: false, content: 'No tools available to search.', errorCategory: 'execution_error' };
+  }
+
+  // ★ 子串 + 词级匹配——30~50 个工具，同步跑 <1ms，不需要 embedding
+  const queryLower = q.toLowerCase();
+  const queryWords = queryLower.split(/\s+/).filter((w) => w.length > 1);
+
+  const matches = tools
+    .map((t) => {
+      const haystack = `${t.name} ${t.description}`.toLowerCase();
+      let score = 0;
+      // 全 query 子串命中 = 高权重
+      if (haystack.includes(queryLower)) score += 10;
+      // 每个词命中 +1
+      for (const word of queryWords) {
+        if (haystack.includes(word)) score += 1;
+      }
+      return { tool: t, score };
+    })
+    .filter((m) => m.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8);
+
+  if (matches.length === 0) {
+    return { ok: true, content: `No tools matching "${q}". Try describing what you want to do (e.g. "find files by content" instead of "grep").` };
+  }
+
+  const lines = matches.map((m, idx) => {
+    const desc = m.tool.description.length > 120
+      ? m.tool.description.slice(0, 117) + '...' : m.tool.description;
+    return `${idx + 1}. score=${m.score} | ${m.tool.name} — ${desc}`;
+  });
+  return { ok: true, content: `Tools matching "${q}":\n${lines.join('\n')}\n\nUse tool_explore("name") for full details on any tool.` };
+}
+
+/** 2. file_search — BM25 关键词检索 */
+async function execFileSearch(
   query: string,
   topK: number,
   ctx: ToolExecContext,
-): ExecResult {
+): Promise<ExecResult> {
   const q = query.trim();
   if (!q) return { ok: true, content: 'No query provided.' };
 
   const files = scanProjectFiles(ctx.projectPath, SYSTEM.SCAN_PROJECT_MAX_FILES);
-  if (files.length === 0) {
-    return { ok: true, content: 'No files found to search.' };
-  }
+  if (files.length === 0) return { ok: true, content: 'No files found to search.' };
 
   const bm25 = new BM25Scorer();
   const docTokens: Map<string, number>[] = [];
   const docPaths: string[] = [];
-
   for (const file of files.slice(0, SYSTEM.SCAN_PROJECT_MAX_FILES / 2)) {
     try {
       const text = readFileSync(file, 'utf-8').slice(0, SYSTEM.FILE_INDEX_TRUNCATE_CHARS);
@@ -153,49 +241,30 @@ function execFileSearch(
       bm25.addDocument(tokens);
       docTokens.push(tokens);
       docPaths.push(file);
-    } catch {
-      // 跳过不可读文件
-    }
+    } catch { /* skip */ }
   }
-
-  if (docPaths.length === 0) {
-    return { ok: true, content: 'No readable files found.' };
-  }
+  if (docPaths.length === 0) return { ok: true, content: 'No readable files found.' };
 
   const queryTokens = tokenize(q);
   const scored = docPaths
-    .map((path, i) => ({
-      path,
-      score: bm25.score(queryTokens, docTokens[i]!),
-    }))
+    .map((path, i) => ({ path, score: bm25.score(queryTokens, docTokens[i]!) }))
     .filter((s) => s.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, topK);
-
-  if (scored.length === 0) {
-    return { ok: true, content: 'No matching files found.' };
-  }
-
-  const lines = scored.map((s, idx) => {
-    const prefix = contextualPrefix(
-      `score=${s.score.toFixed(2)}`,
-      { source: s.path },
-    );
-    return `${idx + 1}. ${prefix}`;
-  });
-
+  if (scored.length === 0) return { ok: true, content: 'No matching files found.' };
+  const lines = scored.map((s, idx) => `${idx + 1}. score=${s.score.toFixed(2)} | ${s.path}`);
   return { ok: true, content: `Found ${scored.length} matching file(s):\n${lines.join('\n')}` };
 }
 
 /** 3. memory_recall — EpisodicMemory 检索 */
-function execMemoryRecall(
+async function execMemoryRecall(
   query: string,
   ctx: ToolExecContext,
-): ExecResult {
+): Promise<ExecResult> {
   const q = query.trim();
   if (!q) return { ok: true, content: 'No query provided.' };
 
-  const results = ctx.episodicMemory.retrieve(q, 5);
+  const results = await ctx.episodicMemory.retrieve(q, 5);
   if (results.length === 0) {
     return { ok: true, content: 'No matching past sessions found.' };
   }
@@ -242,6 +311,48 @@ function execSymbolFind(
   }
 
   return { ok: true, content: parts.join('\n') };
+}
+
+/** 5a. repo_query — 依赖图查询 */
+function execRepoQuery(
+  action: string,
+  file?: string,
+  symbol?: string,
+  ctx?: ToolExecContext,
+): ExecResult {
+  const sem = ctx?.semanticMemory;
+  if (!sem) return { ok: false, content: 'Semantic memory not available.' };
+
+  switch (action) {
+    case 'hubs': {
+      // Top imported files (hub nodes)
+      const hubs = sem.getTopImported?.(10) ?? [];
+      if (hubs.length === 0) return { ok: true, content: 'No dependency data available.' };
+      const lines = ['Top hub files (most imported):'];
+      for (const h of hubs) lines.push(`  - ${h.path} ← ${h.count} importers`);
+      return { ok: true, content: lines.join('\n') };
+    }
+    case 'dependents': {
+      if (!file) return { ok: false, content: 'repo_query dependents requires "file" parameter.' };
+      const deps = sem.getDependents(file);
+      if (deps.length === 0) return { ok: true, content: `No files import "${file}".` };
+      return { ok: true, content: `${deps.length} files import "${file}":\n${deps.slice(0, 20).map((d) => `  - ${d}`).join('\n')}` };
+    }
+    case 'dependencies': {
+      if (!file) return { ok: false, content: 'repo_query dependencies requires "file" parameter.' };
+      const deps = sem.getDependencies?.(file) ?? [];
+      if (deps.length === 0) return { ok: true, content: `"${file}" imports nothing tracked.` };
+      return { ok: true, content: `"${file}" imports:\n${deps.slice(0, 20).map((d) => `  - ${d}`).join('\n')}` };
+    }
+    case 'find': {
+      if (!symbol) return { ok: false, content: 'repo_query find requires "symbol" parameter.' };
+      const def = sem.findDefinition(symbol);
+      if (!def) return { ok: true, content: `Symbol "${symbol}" not found.` };
+      return { ok: true, content: `${def.type} \`${def.name}\` defined in ${def.path}${def.location ? ` @${def.location}` : ''}` };
+    }
+    default:
+      return { ok: false, content: `Unknown action "${action}". Valid: hubs, dependents, dependencies, find.` };
+  }
 }
 
 /** 5. shell_test — 通过 NativeTools 执行测试 */

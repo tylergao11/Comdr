@@ -16,6 +16,7 @@ export {
   FILE_SEARCH,
   MEMORY_RECALL,
   SYMBOL_FIND,
+  REPO_QUERY,
   SHELL_TEST,
   ADVANCED_TOOLS,
 } from './advanced-tools.js';

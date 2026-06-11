@@ -42,7 +42,7 @@ export { Engine, createEngine } from './loop.js';
 // §2 Internal — 测试和高级组合使用
 // ============================================================================
 export { ReasoningManager } from './reasoning.js';
-export { PromptConstructor, emptyAnchor, anchorFromWindows } from './prompt.js';
+export { PromptConstructor, anchorFromWindows } from './prompt.js';
 export { ContextManager } from './context.js';
 export { TaskPlanner } from './planner.js';
 export { ReflectionEngine } from './reflection.js';
@@ -61,8 +61,12 @@ export {
 
 // ===== 记忆系统 =====
 export { WorkingMemory } from './memory/working.js';
-export { EpisodicMemory, createEpisodicMemory } from './memory/episodic.js';
-export { SemanticMemory, createSemanticMemory } from './memory/semantic.js';
+export { EpisodicMemory } from './memory/episodic.js';
+export { SemanticMemory } from './memory/semantic.js';
+export { ToolExperienceMemory } from './memory/tool-experience.js';
+export type { ToolExperience } from './memory/tool-experience.js';
+export { SkillEvolution } from './memory/skill-evolution.js';
+export type { EvolvedSkill } from './memory/skill-evolution.js';
 // ProceduralMemory 已删除——跨项目模式提取属于猜 LLM 行为。
 
 // ===== 自检管线 =====
@@ -70,7 +74,7 @@ export { builtinRules, siblingConsistencyRule, fileSizeGuardRule } from './self-
 export type { CheckRule, CheckIssue, CheckContext } from './self-check.js';
 
 // ===== 持久化 =====
-export { SessionStore, createSessionStore } from './persistence.js';
+export { SessionStore } from './persistence.js';
 
 // ===== MCP 集成 =====
 export { MCPClient, createMCPClient } from './mcp-client.js';
@@ -81,25 +85,15 @@ export type { MCPToolResult } from './mcp-client.js';
 export { discoverComdrMd, discoverAndRetrieve, buildLSPWorldChunks, extractKeyFiles } from './world-model.js';
 export type { WorldModelChunk, WorldModelResult } from './world-model.js';
 
-// ===== Trigram 检索（当前主力——零模型、零正则） =====
-// ★ 迁入 @comdr/core 后以此处为统一出口
-export {
-  textToVector,
-  textsToVectors,
-  cosineSimilarity,
-  TrigramIndex,
-} from '@comdr/core';
-export type { IndexedDoc } from '@comdr/core';
-
-// ===== 旧 BM25 模块（@deprecated——仅 file_search 使用） =====
+// ===== BM25 模块（file_search 使用） =====
 export {
   tokenize,
   BM25Scorer,
   contextualPrefix,
-  l2Normalize,
 } from './retrieval.js';
 
 export { generateRepoMap } from './repo-map.js';
 export { runSubAgent, fanOut, pipeline } from './subagent.js';
 export type { SubAgentOpts, SubAgentResult } from './subagent.js';
 export { SubAgentRegistry } from './subagent-registry.js';
+export { registerBuiltinSubAgents } from './builtin-subagents.js';

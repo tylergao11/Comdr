@@ -2,7 +2,7 @@
  * mock-engine.ts — Mock IEngine 实现
  *
  * 用于 Agent 5 独立开发和测试。生成仿真事件序列，
- * 覆盖所有 AgentEvent 变体，使 TUI/MCP Server 可脱离真实 Engine 运行。
+ * 覆盖所有 AgentEvent 变体，使 MCP Server 可脱离真实 Engine 运行。
  *
  * @agent Agent 5 — 此文件仅用于开发/测试，不进生产构建
  */
@@ -523,11 +523,19 @@ export class MockEngine implements IEngine {
     this.aborted = true;
   }
 
+  confirm(_callId: string, _approved: boolean): void {
+    // Mock — auto-approve in test mode
+  }
+
+  registerSubAgent(_agent: import('@comdr/core/contracts').ISubAgent): void {
+    // Mock — no-op
+  }
+
 }
 
 /**
  * 创建 mock engine 实例
  */
 export function createMockEngine(): IEngine {
-  return new MockEngine() as unknown as IEngine;
+  return new MockEngine();
 }

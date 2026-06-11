@@ -8,6 +8,8 @@
   "references": [
     { "path": "../core" },
     { "path": "../llm" },
-    { "path": "../tools" }
+    { "path": "../tools" },
+    { "path": "../audit" },
+    { "path": "../cocos-engine" }
   ]
 }

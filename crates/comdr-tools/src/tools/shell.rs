@@ -249,9 +249,22 @@ fn has_command_injection_risk(cmd: &str) -> bool {
         }
     }
 
-    // Reject commands with suspicious semicolon-chaining of destructive ops
-    if lower.contains(';') {
-        let parts: Vec<&str> = cmd.split(';').collect();
+    // Reject commands with suspicious chaining of destructive ops
+    // ★ Check both ; and && chaining
+    let chain_separator = if lower.contains(';') {
+        Some(';')
+    } else if lower.contains("&&") {
+        Some('&')
+    } else {
+        None
+    };
+
+    if let Some(sep) = chain_separator {
+        let parts: Vec<&str> = if sep == ';' {
+            cmd.split(';').collect()
+        } else {
+            cmd.split("&&").collect()
+        };
         let mut has_destructive = false;
         let destructive_commands = [
             "rm ", "shutdown", "reboot", "mkfs", "dd ", "format",
@@ -269,6 +282,24 @@ fn has_command_injection_risk(cmd: &str) -> bool {
         if has_destructive && parts.len() >= 2 {
             return true; // Multiple chained commands with destructive ops
         }
+    }
+
+    // ★ Command substitution: $(...) or backticks
+    if lower.contains("$(") || cmd.contains('`') {
+        return true;
+    }
+
+    // ★ Pipe to shell interpreter
+    if lower.contains("| bash") || lower.contains("| sh")
+        || lower.contains("|bash") || lower.contains("|sh")
+        || lower.contains("|zsh") || lower.contains("| fish")
+    {
+        return true;
+    }
+
+    // ★ eval / source abuse
+    if lower.trim().starts_with("eval ") || lower.trim().starts_with("source ") {
+        return true;
     }
 
     false

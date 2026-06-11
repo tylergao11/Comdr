@@ -100,8 +100,9 @@ export class EventLogger {
 
     // 加标记行
     kept.unshift(
+      // ★ 用 `__comdr_meta` type 避免污染 AgentEvent 可辨识联合类型
       JSON.stringify({
-        type: 'system',
+        type: '__comdr_meta',
         event: 'log_rotation',
         originalLines: lines.length,
         keptLines: kept.length,

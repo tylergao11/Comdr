@@ -23,6 +23,7 @@ export { isReasonerModel } from './client.js';
 // ===== 前缀缓存工具 =====
 export {
   serializeTools,
+  serializeBlueprint,
   buildSystemPromptPrefix,
   validateMessageHistoryIntegrity,
   computeCacheHitRate,

@@ -155,11 +155,12 @@ impl ToolRegistry {
         }
     }
 
-    /// Register a tool. Panics if a tool with the same name is already registered.
+    /// Register a tool. Logs warning and skips if a tool with the same name is already registered.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         let name = tool.name().to_string();
         if self.tools.contains_key(&name) {
-            panic!("ToolRegistry: duplicate tool name '{}'", name);
+            eprintln!("[ToolRegistry] WARNING: duplicate tool name '{}' — skipping second registration", name);
+            return;
         }
         self.tools.insert(name, tool);
     }

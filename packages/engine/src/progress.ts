@@ -174,11 +174,15 @@ export class ProgressMeter {
       const text = result.content;
 
       // 格式 1: "N/M tests passed|failed" 或 "N/M passed|failed|passing|failing"
+      // ★ 归一化: (pass - fail) / total → 0/1 和 0/100 都给出 -1，不再同罚分
       let match = text.match(/(\d+)\s*\/\s*(\d+)\s*(?:tests?\s*)?(?:passed|failed|passing|failing)/i);
       if (match) {
         const pass = parseInt(match[1]!, 10);
         const total = parseInt(match[2]!, 10);
-        delta += pass - (total - pass);
+        const fail = total - pass;
+        if (total > 0) {
+          delta += (pass - fail) / total;
+        }
         continue;
       }
 
@@ -188,7 +192,10 @@ export class ProgressMeter {
       if (passMatch || failMatch) {
         const p = passMatch ? parseInt(passMatch[1]!, 10) : 0;
         const f = failMatch ? parseInt(failMatch[1]!, 10) : 0;
-        delta += p - f;
+        const total = p + f;
+        if (total > 0) {
+          delta += (p - f) / total;
+        }
       }
     }
     return delta;

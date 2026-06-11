@@ -1,12 +1,11 @@
 /**
  * memory/episodic.ts — 情景记忆
  *
- * ★ 检索: 字符 trigram 向量 + cosine similarity（零模型、零正则）。
- *   查询扩展: 外部 flash LLM 将中文扩展为英文检索词（可选优化）。
+ * ★ 检索: 词级匹配——跨会话 <100 条摘要，子串+词匹配零延迟。
  *
  * 职责:
- *   1. 会话结束 → consolidate → EpisodeSummary + trigram vector
- *   2. 新会话开始 → retrieve → trigram cosine similarity
+ *   1. 会话结束 → consolidate → EpisodeSummary
+ *   2. 新会话开始 → retrieve → 词级匹配
  *   3. 跨会话反思 → reflect → 每 N 个会话触发
  *
  * @agent Agent 4 — 此文件由 Agent 4 维护
@@ -20,8 +19,30 @@ import type {
 } from '@comdr/core/types';
 import { SYSTEM, MESSAGE_ROLE, THINKING_TYPE } from '@comdr/core';
 import type { IDeepSeekClient } from '@comdr/core/contracts';
-import { textToVector, cosineSimilarity } from '../trigram-index.js';
 import { extractAndParseJSON } from '../utils.js';
+
+// ============================================================================
+// §0 类型
+// ============================================================================
+
+export interface MetaEpisode {
+  id: string;
+  type: 'merged';
+  mergedFiles: string[];
+  commonDecisions: string[];
+  tasks: string[];
+  occurrenceCount: number;
+  firstSeen: string;
+  lastSeen: string;
+}
+
+function shareFiles(a: EpisodeSummary, b: EpisodeSummary): boolean {
+  const filesA = new Set(
+    (a.structuredSummary?.fileModifications ?? []).map((f) => f.path),
+  );
+  const filesB = b.structuredSummary?.fileModifications ?? [];
+  return filesB.some((f) => filesA.has(f.path));
+}
 
 // ============================================================================
 // §1 EpisodicMemory 类
@@ -40,12 +61,12 @@ export class EpisodicMemory {
   // --------------------------------------------------------------------------
 
   /**
-   * 会话结束时生成摘要 + trigram vector。
+   * 会话结束时生成摘要。
    */
-  consolidate(
+  async consolidate(
     session: SessionState,
     structuredSummary: StructuredSummary | null,
-  ): EpisodeSummary {
+  ): Promise<EpisodeSummary> {
     const summary: EpisodeSummary = {
       id: session.id,
       timestamp: new Date().toISOString(),
@@ -56,20 +77,22 @@ export class EpisodicMemory {
       turns: session.turn,
     };
 
-    const text = serializeForEmbedding(summary);
-    summary.embedding = Array.from(textToVector(text));
-
     this.pendingStore.set(summary.id, summary);
     return summary;
   }
 
-  /** 合并 pendingStore → store */
+  /** 合并 pendingStore → store + 触发跨会话合并 */
   commit(): void {
     for (const [id, summary] of this.pendingStore) {
       this.store.set(id, summary);
     }
     this.pendingStore.clear();
     this.sessionsSinceReflection++;
+
+    // ★ 每积累 10 个会话后尝试合并相似条目
+    if (this.store.size >= 10) {
+      this.merge();
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -77,31 +100,28 @@ export class EpisodicMemory {
   // --------------------------------------------------------------------------
 
   /**
-   * ★ Trigram 向量检索。
-   *
-   * @param userInput    用户输入（可经 QueryExpander 扩展）
-   * @param topK         top-K
-   * @param taskType     同类型历史加权
-   * @param episodeBoost boost 系数
+   * ★ 词级匹配检索——<100 条摘要，同步子串匹配零延迟。
    */
-  retrieve(
+  async retrieve(
     userInput: string,
     topK: number = SYSTEM.EPISODIC_RETRIEVAL_TOPK,
-  ): EpisodeSummary[] {
+  ): Promise<EpisodeSummary[]> {
     if (this.store.size === 0) return [];
 
-    const queryVec = textToVector(userInput);
+    const queryLower = userInput.toLowerCase();
+    const queryWords = queryLower.split(/\s+/).filter((w) => w.length > 1);
 
     const scored = [...this.store.values()]
       .map((ep) => {
-        if (!ep.embedding || ep.embedding.length === 0) {
-          return { episode: ep, score: 0 };
+        const haystack = serializeForScoring(ep).toLowerCase();
+        let score = 0;
+        if (haystack.includes(queryLower)) score += 10;
+        for (const word of queryWords) {
+          if (haystack.includes(word)) score += 1;
         }
-        return {
-          episode: ep,
-          score: cosineSimilarity(queryVec, new Float32Array(ep.embedding)),
-        };
+        return { episode: ep, score };
       })
+      .filter((s) => s.score > 0)
       .sort((a, b) => b.score - a.score)
       .slice(0, topK);
 
@@ -118,7 +138,7 @@ export class EpisodicMemory {
   ): Promise<ReflectionEntry[]> {
     if (recentSessions.length === 0) return [];
 
-    const sessionTexts = recentSessions.map((s) => serializeForEmbedding(s));
+    const sessionTexts = recentSessions.map((s) => serializeForScoring(s));
     const prompt = [
       'Analyze coding sessions. Identify repeated failure modes, successful strategies,',
       'and frequently co-modified files.',
@@ -145,19 +165,14 @@ export class EpisodicMemory {
     }
   }
 
-  getReflections(): ReflectionEntry[] {
-    return []; // 由外部持久化层管理
-  }
-
   // --------------------------------------------------------------------------
   // 持久化
   // --------------------------------------------------------------------------
 
   serialize(): { episodes: string; reflections: string } {
     const all = [...this.store.values(), ...this.pendingStore.values()];
-    const summaries = all.map(({ embedding: _, ...rest }) => rest);
     return {
-      episodes: JSON.stringify(summaries),
+      episodes: JSON.stringify(all),
       reflections: JSON.stringify([]),
     };
   }
@@ -171,6 +186,77 @@ export class EpisodicMemory {
       }
     } catch {
       // 静默降级
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // merge() — 跨会话合并
+  // --------------------------------------------------------------------------
+
+  /**
+   * ★ 将相似会话合并为元条目，减少存储膨胀。
+   *
+   * 合并策略:
+   *   1. 按共享文件分组——两个 session 操作了 >= 1 个相同文件 → 候选合并
+   *   2. 合并组中提取共性: 共同文件路径 + 共同决策
+   *   3. 原始条目被替换为 MetaEpisode——保留 count + 代表性摘要
+   */
+  merge(): void {
+    const entries = [...this.store.values()];
+    if (entries.length < 3) return;
+
+    const merged = new Set<string>();
+    const metaEpisodes: MetaEpisode[] = [];
+
+    for (let i = 0; i < entries.length; i++) {
+      if (merged.has(entries[i]!.id)) continue;
+      const group: EpisodeSummary[] = [entries[i]!];
+
+      for (let j = i + 1; j < entries.length; j++) {
+        if (merged.has(entries[j]!.id)) continue;
+        if (shareFiles(entries[i]!, entries[j]!)) {
+          group.push(entries[j]!);
+        }
+      }
+
+      if (group.length >= 2) {
+        const allFiles = new Set<string>();
+        const allDecisions = new Map<string, number>();
+        for (const ep of group) {
+          merged.add(ep.id);
+          for (const f of ep.structuredSummary?.fileModifications ?? []) {
+            allFiles.add(f.path);
+          }
+          for (const d of ep.structuredSummary?.decisions ?? []) {
+            const key = d.what;
+            allDecisions.set(key, (allDecisions.get(key) ?? 0) + 1);
+          }
+        }
+
+        const commonDecisions = [...allDecisions.entries()]
+          .filter(([, count]) => count >= 2)
+          .map(([what]) => what);
+
+        const timestamps = group.map((e) => e.timestamp).sort();
+        const meta: MetaEpisode = {
+          id: `merged-${group[0]!.id}`,
+          type: 'merged',
+          mergedFiles: [...allFiles],
+          commonDecisions,
+          tasks: group.map((e) => e.task),
+          occurrenceCount: group.length,
+          firstSeen: timestamps[0] ?? '',
+          lastSeen: timestamps[timestamps.length - 1] ?? '',
+        };
+        metaEpisodes.push(meta);
+      }
+    }
+
+    for (const id of merged) {
+      this.store.delete(id);
+    }
+    for (const meta of metaEpisodes) {
+      (this.store as Map<string, any>).set(meta.id, meta);
     }
   }
 }
@@ -192,11 +278,16 @@ export function createEpisodicMemory(data?: {
 // §3 辅助
 // ============================================================================
 
-function serializeForEmbedding(summary: EpisodeSummary): string {
+function serializeForScoring(summary: EpisodeSummary): string {
   const parts: string[] = [summary.task];
   if (summary.structuredSummary?.sessionIntent) {
     parts.push(summary.structuredSummary.sessionIntent);
   }
   if (summary.outcome) parts.push(summary.outcome);
+  // Include file modifications and decisions for richer matching
+  const files = summary.structuredSummary?.fileModifications?.map((f) => f.path) ?? [];
+  if (files.length > 0) parts.push(files.join(' '));
+  const decisions = summary.structuredSummary?.decisions?.map((d) => d.what) ?? [];
+  if (decisions.length > 0) parts.push(decisions.join(' '));
   return parts.join(' | ');
 }

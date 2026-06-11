@@ -1,17 +1,16 @@
 /// LSP tool implementations — symbol search, diagnostics, code structure.
 ///
-/// Uses regex-based parsing for initial implementation.
-/// Full tree-sitter integration is planned as a follow-up for richer AST queries.
+/// Uses tree-sitter AST parsing for accurate symbol extraction and diagnostics.
 ///
 /// Current capabilities:
 ///   - `lsp_symbols`  — search for function/class/interface definitions by name
-///   - `lsp_diagnostics` — basic file existence and syntax check
+///   - `lsp_diagnostics` — syntax errors via tree-sitter ERROR nodes + TODO/FIXME detection
 ///   - `lsp_structure`   — extract code outline (imports, functions, classes)
 
 use std::sync::Arc;
 
+use crate::symbols::{self, SourceLanguage};
 use crate::tools::{Tool, ToolContext, ToolOutput, ToolPermission};
-use regex::Regex;
 use serde_json::Value;
 use std::fs;
 
@@ -20,35 +19,6 @@ pub fn register_all(registry: &mut crate::tools::ToolRegistry) {
     registry.register(Arc::new(LspSymbolsTool));
     registry.register(Arc::new(LspDiagnosticsTool));
     registry.register(Arc::new(LspStructureTool));
-}
-
-// ============================================================================
-// Language detection
-// ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Language {
-    TypeScript,
-    JavaScript,
-    Rust,
-    Python,
-    Unknown,
-}
-
-impl Language {
-    fn from_path(path: &str) -> Self {
-        if path.ends_with(".ts") || path.ends_with(".tsx") {
-            Language::TypeScript
-        } else if path.ends_with(".js") || path.ends_with(".jsx") {
-            Language::JavaScript
-        } else if path.ends_with(".rs") {
-            Language::Rust
-        } else if path.ends_with(".py") {
-            Language::Python
-        } else {
-            Language::Unknown
-        }
-    }
 }
 
 // ============================================================================
@@ -98,7 +68,10 @@ impl Tool for LspSymbolsTool {
         };
 
         let file_path = normalize_path(file_path);
-        let lang = Language::from_path(&file_path);
+        let lang = match symbols::language_from_ext(&file_path) {
+            Some(l) => l,
+            None => return ToolOutput::error("EXECUTION_FAILED", format!("Unsupported file type: '{}'", file_path)),
+        };
         let query = args.get("query").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
 
         let content = match fs::read_to_string(&file_path) {
@@ -111,7 +84,7 @@ impl Tool for LspSymbolsTool {
             }
         };
 
-        let symbols = extract_symbols(&content, lang, &file_path);
+        let symbols = extract_symbols(&content, lang);
 
         let filtered: Vec<&Symbol> = if let Some(ref q) = query {
             symbols
@@ -185,7 +158,7 @@ impl Tool for LspDiagnosticsTool {
         };
 
         let file_path = normalize_path(file_path);
-        let lang = Language::from_path(&file_path);
+        let lang = symbols::language_from_ext(&file_path);
 
         let content = match fs::read_to_string(&file_path) {
             Ok(c) => c,
@@ -257,7 +230,10 @@ impl Tool for LspStructureTool {
         };
 
         let file_path = normalize_path(file_path);
-        let lang = Language::from_path(&file_path);
+        let lang = match symbols::language_from_ext(&file_path) {
+            Some(l) => l,
+            None => return ToolOutput::success(format!("Unsupported file type: '{}'", file_path)),
+        };
 
         let content = match fs::read_to_string(&file_path) {
             Ok(c) => c,
@@ -303,7 +279,7 @@ impl Tool for LspStructureTool {
 }
 
 // ============================================================================
-// Symbol extraction
+// Symbol extraction (tree-sitter based)
 // ============================================================================
 
 #[derive(Debug, Clone)]
@@ -318,177 +294,32 @@ struct FileStructure {
     symbols: Vec<Symbol>,
 }
 
-fn extract_symbols(content: &str, lang: Language, _file_path: &str) -> Vec<Symbol> {
-    let mut symbols = Vec::new();
-
-    for (line_num, line) in content.lines().enumerate() {
-        let trimmed = line.trim();
-
-        match lang {
-            Language::TypeScript | Language::JavaScript => {
-                // function declarations
-                if let Some(cap) = func_decl_ts().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "function".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-                // class declarations
-                if let Some(cap) = class_decl_ts().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "class".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-                // interface declarations
-                if let Some(cap) = interface_decl_ts().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "interface".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-                // const/let/var at top level
-                if let Some(cap) = const_decl_ts().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "variable".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-                // type declarations
-                if let Some(cap) = type_decl_ts().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "type".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-            }
-            Language::Rust => {
-                // fn declarations
-                if let Some(cap) = fn_decl_rs().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "function".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-                // struct declarations
-                if let Some(cap) = struct_decl_rs().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "struct".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-                // enum declarations
-                if let Some(cap) = enum_decl_rs().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "enum".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-                // trait declarations
-                if let Some(cap) = trait_decl_rs().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "trait".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-                // impl blocks
-                if let Some(cap) = impl_decl_rs().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "impl".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-                // mod declarations
-                if let Some(cap) = mod_decl_rs().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "module".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-            }
-            Language::Python => {
-                // def (function)
-                if let Some(cap) = func_decl_py().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "function".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-                // class
-                if let Some(cap) = class_decl_py().captures(trimmed) {
-                    symbols.push(Symbol {
-                        name: cap[1].to_string(),
-                        kind: "class".to_string(),
-                        line: line_num,
-                    });
-                    continue;
-                }
-            }
-            Language::Unknown => {}
-        }
-    }
-
-    symbols
+/// Extract symbols using tree-sitter AST.
+fn extract_symbols(content: &str, lang: SourceLanguage) -> Vec<Symbol> {
+    let (extracted, _) = symbols::extract(content, lang);
+    extracted
+        .into_iter()
+        .map(|s| Symbol {
+            name: s.name,
+            kind: s.kind,
+            line: s.line,
+        })
+        .collect()
 }
 
-fn extract_structure(content: &str, lang: Language) -> FileStructure {
-    let symbols = extract_symbols(content, lang, "");
+/// Extract imports using tree-sitter AST (returns raw import lines).
+fn extract_imports(content: &str, lang: SourceLanguage) -> Vec<String> {
+    symbols::extract_imports(content, lang)
+}
+
+fn extract_structure(content: &str, lang: SourceLanguage) -> FileStructure {
+    let symbols = extract_symbols(content, lang);
     let imports = extract_imports(content, lang);
 
     FileStructure {
         imports: if imports.is_empty() { None } else { Some(imports) },
         symbols,
     }
-}
-
-fn extract_imports(content: &str, lang: Language) -> Vec<String> {
-    let mut imports = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        match lang {
-            Language::TypeScript | Language::JavaScript => {
-                if trimmed.starts_with("import ") || trimmed.starts_with("export ") && trimmed.contains(" from ") {
-                    imports.push(trimmed.to_string());
-                }
-            }
-            Language::Rust => {
-                if trimmed.starts_with("use ") {
-                    imports.push(trimmed.to_string());
-                }
-            }
-            Language::Python => {
-                if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
-                    imports.push(trimmed.to_string());
-                }
-            }
-            Language::Unknown => {}
-        }
-    }
-    imports
 }
 
 #[derive(Debug)]
@@ -498,12 +329,12 @@ struct Diagnostic {
     message: String,
 }
 
-fn check_diagnostics(content: &str, lang: Language) -> Vec<Diagnostic> {
+/// Run diagnostics using tree-sitter error nodes + TODO/FIXME detection.
+fn check_diagnostics(content: &str, lang: Option<SourceLanguage>) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     // Common checks across all languages
     for (i, line) in content.lines().enumerate() {
-        // Detect common issues
         if line.contains("TODO") || line.contains("FIXME") {
             diagnostics.push(Diagnostic {
                 line: i,
@@ -513,125 +344,19 @@ fn check_diagnostics(content: &str, lang: Language) -> Vec<Diagnostic> {
         }
     }
 
-    // Language-specific basic checks
-    match lang {
-        Language::TypeScript | Language::JavaScript => {
-            // Check for unbalanced brackets
-            let open_braces = content.matches('{').count();
-            let close_braces = content.matches('}').count();
-            if open_braces != close_braces {
-                diagnostics.push(Diagnostic {
-                    line: 0,
-                    severity: "error".to_string(),
-                    message: format!(
-                        "Unbalanced braces: {} open, {} close",
-                        open_braces, close_braces
-                    ),
-                });
-            }
-            let open_parens = content.matches('(').count();
-            let close_parens = content.matches(')').count();
-            if open_parens != close_parens {
-                diagnostics.push(Diagnostic {
-                    line: 0,
-                    severity: "error".to_string(),
-                    message: format!(
-                        "Unbalanced parentheses: {} open, {} close",
-                        open_parens, close_parens
-                    ),
-                });
-            }
+    // Tree-sitter parse error detection (replaces brace counting)
+    if let Some(lang) = lang {
+        let errors = symbols::find_parse_errors(content, lang);
+        for err in &errors {
+            diagnostics.push(Diagnostic {
+                line: err.line,
+                severity: "error".to_string(),
+                message: err.message.clone(),
+            });
         }
-        Language::Rust => {
-            let open_braces = content.matches('{').count();
-            let close_braces = content.matches('}').count();
-            if open_braces != close_braces {
-                diagnostics.push(Diagnostic {
-                    line: 0,
-                    severity: "error".to_string(),
-                    message: format!(
-                        "Unbalanced braces: {} open, {} close",
-                        open_braces, close_braces
-                    ),
-                });
-            }
-        }
-        _ => {}
     }
 
     diagnostics
-}
-
-// ============================================================================
-// Regex patterns — compiled once via lazy statics
-// ============================================================================
-
-// TypeScript / JavaScript
-fn func_decl_ts() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:export\s+)?(?:async\s+)?function\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
-}
-
-fn class_decl_ts() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:export\s+)?(?:abstract\s+)?class\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
-}
-
-fn interface_decl_ts() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:export\s+)?interface\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
-}
-
-fn const_decl_ts() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:export\s+)?(?:const|let|var)\s+(\w+)\s*[:=]").unwrap()) // static pattern — panic on invalid regex is correct
-}
-
-fn type_decl_ts() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:export\s+)?type\s+(\w+)\s*=").unwrap()) // static pattern — panic on invalid regex is correct
-}
-
-// Rust
-fn fn_decl_rs() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:pub(?:\s*\(\s*crate\s*\))?\s+)?fn\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
-}
-
-fn struct_decl_rs() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:pub\s+)?struct\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
-}
-
-fn enum_decl_rs() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:pub\s+)?enum\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
-}
-
-fn trait_decl_rs() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:pub\s+)?trait\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
-}
-
-fn impl_decl_rs() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"impl\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
-}
-
-fn mod_decl_rs() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:pub\s+)?mod\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
-}
-
-// Python
-fn func_decl_py() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"def\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
-}
-
-fn class_decl_py() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"class\s+(\w+)").unwrap()) // static pattern — panic on invalid regex is correct
 }
 
 // ============================================================================

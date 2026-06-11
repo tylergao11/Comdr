@@ -215,7 +215,10 @@ fn system_time_iso() -> String {
 
 /// Generate a temp path next to the target file for atomic write-then-rename.
 fn tmp_path(target: &Path) -> io::Result<std::path::PathBuf> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let parent = match target.parent() {
+        Some(p) => p,
+        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot snapshot root path")),
+    };
     let filename = target
         .file_name()
         .and_then(|f| f.to_str())

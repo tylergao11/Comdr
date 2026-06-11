@@ -33,9 +33,12 @@ import type {
   SessionState,
   SessionAnchor,
 } from '@comdr/core/types';
+import type { ToolBlueprint } from '@comdr/core';
 import { MESSAGE_ROLE, THINKING_TYPE, THINKING_EFFORT, SYSTEM } from '@comdr/core';
 import { serializeTools } from '@comdr/llm';
 import { buildSystemPromptPrefix } from '@comdr/llm';
+import { serializeBlueprint } from '@comdr/llm';
+import { formatBlueprint } from './tool-blueprint/index.js';
 
 // ============================================================================
 // §1 常量
@@ -59,11 +62,16 @@ export class PromptConstructor {
    */
   private comdrMd: string = '';
 
+  /** ★ L1.5 — Tool Blueprint 拓扑图。同会话内不变 → 缓存友好。 */
+  private blueprint: ToolBlueprint | null = null;
+
   /**
-   * ★ L1.x — World Model 检索到的相关 chunk（格式化文本）。
-   * 同会话内不变（查询依据 = session.currentInput）。
+   * ★ 设置 Tool Blueprint——替代原来的 L2 工具定义 JSON。
+   * Engine 每轮 run() 时调用（同会话内 blueprint 不变，但声明式设置保证一致）。
    */
-  private worldModelContext: string = '';
+  setBlueprint(bp: ToolBlueprint): void {
+    this.blueprint = bp;
+  }
 
   /**
    * 设置项目专属指令内容。Engine 构造时调用。
@@ -73,22 +81,28 @@ export class PromptConstructor {
   }
 
   /**
-   * ★ 设置 World Model 检索到的相关 chunk（L1.x）。
-   * Engine 构造时调用一次，同会话不变。
-   */
-  setWorldModelContext(chunksText: string): void {
-    this.worldModelContext = chunksText;
-  }
-
-  /**
-   * ★ 仓库拓扑图——Aider-style repository map，注入到 L1.5。
-   * 同会话固定 → 缓存友好（除非 file_write 后标记 dirty 重建）。
+   * ★ 仓库拓扑图——Aider-style repository map，注入到 L7 动态区。
+   * 每轮重新生成以支持 PageRank 个性化加权（chat files / active files boost）。
+   * 移到动态区后静态区指纹不再受 repo map 影响。
    */
   private repoMap: string = '';
 
-  /** 设置仓库地图。Engine 构造时调用一次。 */
-  setRepoMap(text: string): void {
+  /** ★ 设置当前轮的仓库地图（每轮动态，带 PageRank 个性化）。Engine 每轮 run() 前调用。 */
+  setRepoMapPerTurn(text: string): void {
     this.repoMap = text;
+  }
+
+  /** @deprecated 使用 setRepoMapPerTurn——repo map 已从静态区移到动态区 */
+  setRepoMap(_text: string): void {
+    // no-op: kept for backward compat
+  }
+
+  /** ★ 项目根目录绝对路径——注入 L1.x 让 LLM 知道在哪操作。同会话不变 → 缓存友好。 */
+  private projectPath: string = '';
+
+  /** 设置项目根目录。Engine 构造时调用一次。 */
+  setProjectPath(path: string): void {
+    this.projectPath = path;
   }
 
 
@@ -113,10 +127,15 @@ export class PromptConstructor {
     const hash = createHash('sha256');
     hash.update(SYSTEM_PROMPT);
     hash.update(this.comdrMd);
-    hash.update(this.worldModelContext);
-    hash.update(serializeTools(tools));
+    hash.update(this.projectPath);
+    // ★ Blueprint 替代原 serializeTools(tools)
+    if (this.blueprint) {
+      hash.update(serializeBlueprint(this.blueprint));
+    } else {
+      hash.update(serializeTools(tools));
+    }
     hash.update(JSON.stringify(anchor));
-    const fingerprint = hash.digest('hex').slice(0, 16);
+    const fingerprint = hash.digest('hex').slice(0, 24); // 96-bit collision resistance
     return {
       fingerprint,
       changed: prevFp !== undefined && prevFp !== fingerprint,
@@ -131,8 +150,13 @@ export class PromptConstructor {
     const hash = createHash('sha256');
     hash.update(SYSTEM_PROMPT);
     hash.update(this.comdrMd);
-    hash.update(this.worldModelContext);
-    hash.update(serializeTools(tools));
+    hash.update(this.projectPath);
+    // ★ Blueprint 替代原 serializeTools(tools)
+    if (this.blueprint) {
+      hash.update(serializeBlueprint(this.blueprint));
+    } else {
+      hash.update(serializeTools(tools));
+    }
     return { fingerprint: hash.digest('hex').slice(0, 16) };
   }
 
@@ -170,14 +194,13 @@ export class PromptConstructor {
     // into ONE system message to save JSON wrapper overhead (~120B).
     const contextBlocks: string[] = [];
     if (this.comdrMd) contextBlocks.push(`<project>\n${this.comdrMd}\n</project>`);
-    if (this.repoMap) contextBlocks.push(this.repoMap);
-    if (this.worldModelContext) contextBlocks.push(`<world>\n${this.worldModelContext}\n</world>`);
-
-    // L3 anchor: relatedHistory + reflections (static within session)
-    const anchorParts: string[] = [];
-    if (anchor.relatedHistory.length > 0) {
-      anchorParts.push('<history>', ...anchor.relatedHistory.map(h => `- ${h}`), '</history>');
+    if (this.projectPath) {
+      contextBlocks.push(`<env>\nWorking directory: ${this.projectPath}\nOS: ${process.platform}\n</env>`);
     }
+    // ★ repoMap 已移到 L7 动态区——支持每轮 PageRank 个性化
+
+    // L3 anchor: reflections (static within session)
+    const anchorParts: string[] = [];
     if (anchor.reflectionSummary) {
       anchorParts.push('<reflection>', anchor.reflectionSummary, '</reflection>');
     }
@@ -187,14 +210,14 @@ export class PromptConstructor {
         return [
           this.buildL1_SystemPrompt(),
           { role: MESSAGE_ROLE.SYSTEM, content: merged },
-          this.buildL2_ToolDefinitions(tools),
+          this.buildL2_Blueprint(tools),
         ];
       }
     }
 
     return [
       this.buildL1_SystemPrompt(),
-      this.buildL2_ToolDefinitions(tools),
+      this.buildL2_Blueprint(tools),
     ];
   }
 
@@ -209,13 +232,23 @@ export class PromptConstructor {
   }
 
   /**
-   * L2: Tool Definitions (sorted keys 保证稳定)
+   * L2: Tool Blueprint（替换原 Tool Definitions JSON）
    *
-   * ★ 使用 serializeTools 保证 JSON.stringify 的 key 顺序稳定，
-   * 每次调用生成完全相同的 JSON 字符串 → DeepSeek 缓存命中
+   * ★ Blueprint 向 LLM 展示工具世界拓扑图——按 layer→domain 分组，含 composability 边。
+   *   骨架优先（~80 行覆盖 30+ 工具），详情走 tool_explore 按需展开。
+   *   序列化内容不含时间戳/动态 ID → DeepSeek 前缀缓存命中。
+   *
+   *   若 blueprint 未设置 → 回退到原 serializeTools JSON。
    */
-  private buildL2_ToolDefinitions(tools: ToolDefinition[]): Message {
-    // 工具定义作为 system 消息注入（前面的 content 会被缓存锚定）
+  private buildL2_Blueprint(tools: ToolDefinition[]): Message {
+    if (this.blueprint) {
+      const bpText = formatBlueprint(this.blueprint);
+      return {
+        role: MESSAGE_ROLE.SYSTEM,
+        content: bpText,
+      };
+    }
+    // Fallback: 原 JSON 格式（blueprint 未编译时）
     const defsText = serializeTools(tools);
     return {
       role: MESSAGE_ROLE.SYSTEM,
@@ -329,9 +362,20 @@ export class PromptConstructor {
    * Intent / Entity / Summary / LSP 的自动注入已移除——他们是通用 coding agent 的包袱。
    */
   private buildContextSuffix(session: SessionState): string | null {
-    if (session.stateWindow.length === 0) return null;
-    const lines = session.stateWindow.map(e => `- [${e.key}] ${e.text}`);
-    return `<s>\n${lines.join('\n')}\n</s>`;
+    const parts: string[] = [];
+
+    // ★ PageRank-personalized repo map（每轮动态，对话文件 boost）
+    if (this.repoMap) {
+      parts.push(this.repoMap);
+    }
+
+    // State Window（执行反馈）
+    if (session.stateWindow.length > 0) {
+      const lines = session.stateWindow.map(e => `- [${e.key}] ${e.text}`);
+      parts.push(`<s>\n${lines.join('\n')}\n</s>`);
+    }
+
+    return parts.length > 0 ? parts.join('\n\n') : null;
   }
 }
 
@@ -356,14 +400,13 @@ export function emptyAnchor(): SessionAnchor {
 export function anchorFromWindows(
   _stateWindow: { key: string; text: string }[],
   _intentWindow: { key: string; why: string }[],
-  relatedHistory: string[] = [],
   reflections?: string[],
 ): SessionAnchor {
-  // ★ stateSummary/intentSummary 已移到 L7 注入，此处保留类型但不再使用
-  // L3 should only contain truly static data (relatedHistory, reflections)
-  // to keep the prefix cache boundary clean.
+  // ★ stateSummary/intentSummary 已移到 L7 注入，此处保留类型但不再使用。
+  // relatedHistory 自动注入已移除——LLM 需要历史时自己调 memory_recall 工具。
+  // L3 only contains reflections (truly static within session).
   return {
-    relatedHistory,
+    relatedHistory: [],
     reflectionSummary: reflections?.length ? reflections.join('\n') : undefined,
   };
 }

@@ -332,6 +332,7 @@ export type AgentEvent =
   | AgentEventThinkingDelta
   | AgentEventToolCall
   | AgentEventToolResult
+  | AgentEventConfirmRequest
   | AgentEventProgressWarning
   | AgentEventSessionStarted
   | AgentEventTurnBegin
@@ -363,6 +364,18 @@ export interface AgentEventToolCall {
 export interface AgentEventToolResult {
   type: 'tool_result';
   result: ToolResult;
+}
+
+export interface AgentEventConfirmRequest {
+  type: 'confirm_request';
+  /** 工具调用 ID——Engine 用此 ID 追踪确认结果 */
+  callId: string;
+  /** 工具名 */
+  toolName: string;
+  /** 工具参数 */
+  args: Record<string, unknown>;
+  /** 提示信息——为什么需要确认 */
+  reason: string;
 }
 
 // ---- 进度事件 ----
@@ -464,15 +477,6 @@ export interface StateEntry {
   successCount: number;
   /** ★ 该文件上的操作失败次数 */
   failCount: number;
-}
-
-/**
- * ★ 计算信用分——高信用保留、低信用淘汰、负信用不注入。
- *   credit = successCount * 2 - failCount * 3 + recency
- */
-export function computeCredit(entry: StateEntry, currentTurn: number): number {
-  const recency = 1.0 - (currentTurn - entry.turn) / 10; // 0..1, 越近越高
-  return entry.successCount * 2 - entry.failCount * 3 + recency;
 }
 
 /**
@@ -927,6 +931,7 @@ export const AGENT_EVENT = {
   THINKING_DELTA: 'thinking_delta',
   TOOL_CALL: 'tool_call',
   TOOL_RESULT: 'tool_result',
+  CONFIRM_REQUEST: 'confirm_request',
   PROGRESS_WARNING: 'progress_warning',
   SESSION_STARTED: 'session_started',
   TURN_BEGIN: 'turn_begin',
